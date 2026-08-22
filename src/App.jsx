@@ -1081,8 +1081,17 @@ export default function App() {
   }
 
   const [activeMenu, setActiveMenu] = useState("chat");
+  const [mobileMenuOpen, setMobileMenuOpen] = useState(false);
   const [activeOutlet, setActiveOutlet] = useState("ALL");
   const [chatOutlet, setChatOutlet] = useState("DS");
+  const [toast, setToast] = useState(null);
+  const toastTimerRef = useRef(null);
+
+  function showToast(message, type = "error") {
+    if (toastTimerRef.current) clearTimeout(toastTimerRef.current);
+    setToast({ message, type });
+    toastTimerRef.current = setTimeout(() => setToast(null), 5000);
+  }
 
   const [messages, setMessages] = useState([
     {
@@ -1682,7 +1691,7 @@ export default function App() {
       setImportResult(null);
     } catch (error) {
       console.error(error);
-      alert(`Gagal menyimpan hasil import: ${error.message}`);
+      showToast(`Gagal menyimpan hasil import: ${error.message}`);
     } finally {
       setImportBusy(false);
     }
@@ -1770,7 +1779,7 @@ export default function App() {
       await refreshData();
     } catch (error) {
       console.error("Gagal hapus resep:", error);
-      alert(`Gagal menghapus resep: ${error.message}`);
+      showToast(`Gagal menghapus resep: ${error.message}`);
     } finally {
       setDeleteBusy(false);
     }
@@ -2248,13 +2257,32 @@ export default function App() {
 
   return (
     <div className="app">
-      <aside className="sidebar">
+      {toast && (
+        <div className={`toast toast-${toast.type}`} role="alert">
+          <span className="toast-icon">{toast.type === "error" ? "⚠️" : "✓"}</span>
+          <span className="toast-message">{toast.message}</span>
+          <button className="toast-close" onClick={() => setToast(null)} aria-label="Tutup notifikasi">✕</button>
+        </div>
+      )}
+
+      {mobileMenuOpen && (
+        <div className="sidebar-backdrop" onClick={() => setMobileMenuOpen(false)} />
+      )}
+
+      <aside className={`sidebar ${mobileMenuOpen ? "mobile-open" : ""}`}>
         <div className="brand">
           <div className="brand-logo">DS</div>
           <div>
             <div className="brand-title">Dolan Sawah AI</div>
             <div className="brand-subtitle">Business Intelligence</div>
           </div>
+          <button
+            className="sidebar-close"
+            onClick={() => setMobileMenuOpen(false)}
+            aria-label="Tutup menu"
+          >
+            ✕
+          </button>
         </div>
 
         <nav className="menu-container">
@@ -2262,7 +2290,14 @@ export default function App() {
             if (item.section) return <div key={`s-${i}`} className="menu-title">{item.section}</div>;
             const active = activeMenu === item.id;
             return (
-              <button key={item.id} className={`menu-item ${active ? "active" : ""}`} onClick={() => setActiveMenu(item.id)}>
+              <button
+                key={item.id}
+                className={`menu-item ${active ? "active" : ""}`}
+                onClick={() => {
+                  setActiveMenu(item.id);
+                  setMobileMenuOpen(false);
+                }}
+              >
                 <span className="menu-icon"><Icon name={item.icon} /></span>
                 <span>{item.label}</span>
               </button>
@@ -2287,6 +2322,16 @@ export default function App() {
 
       <main className="main">
         <header className="topbar">
+          <button
+            className="hamburger-btn"
+            onClick={() => setMobileMenuOpen(true)}
+            aria-label="Buka menu"
+          >
+            <span />
+            <span />
+            <span />
+          </button>
+
           <div>
             <div className="page-title">AI Business Assistant</div>
             <div className="page-description">Dolan Sawah Group — 3 outlet</div>
