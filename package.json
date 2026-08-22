@@ -11,8 +11,8 @@
     "deploy": "vite build && gh-pages -d dist"
   },
   "dependencies": {
-    "@google/genai": "^2.18.0",
     "firebase": "^12.18.0",
+    "openai": "^7.5.0",
     "react": "^19.2.8",
     "react-dom": "^19.2.8",
     "xlsx": "https://cdn.sheetjs.com/xlsx-latest/xlsx-latest.tgz"

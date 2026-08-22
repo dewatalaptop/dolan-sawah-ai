@@ -35,7 +35,7 @@ import { processExcelFile } from "./excelEngine";
 
 import { buildReportWorkbook, downloadReportWorkbook } from "./reportEngine";
 
-import { askGemini, buildReportPrompt } from "./geminiEngine";
+import { askAI, buildReportPrompt } from "./aiEngine";
 
 /* =========================================================
    KONSTANTA
@@ -911,7 +911,7 @@ function analyzeDataQuality(rawData) {
 }
 
 /* =========================================================
-   LAPORAN LOKAL (fallback jika Gemini belum tersambung)
+   LAPORAN LOKAL (fallback jika AI belum tersambung)
    ========================================================= */
 
 function buildLocalReport(question, ctx) {
@@ -1026,11 +1026,11 @@ function buildLocalReport(question, ctx) {
   }
 
   return (
-    "Saya belum menemukan Gemini API key yang aktif (VITE_GEMINI_API_KEY), jadi jawaban ini dihasilkan " +
+    "Saya belum menemukan AI API key yang aktif, jadi jawaban ini dihasilkan " +
     "dari perhitungan lokal saja.\n\n" +
     "Saya bisa menjawab langsung untuk topik: kebutuhan bahan/saran pembelian, variance & waste, " +
     "penjualan, harga bahan, dan pengecekan barang datang. Coba spesifikkan salah satu topik itu, " +
-    "atau sambungkan Gemini API key untuk jawaban bebas."
+    "atau sambungkan AI API key untuk jawaban bebas."
   );
 }
 
@@ -1651,6 +1651,27 @@ export default function App() {
         receivingIssues
       };
 
+      const omzetRataRataPerMenu = Object.fromEntries(
+        Object.entries(avgDailySales).map(([menu, avgQty]) => {
+          const recipe = findRecipeByMenu(menu, rawData.recipes);
+          const price = recipe ? Number(recipe.sellPrice || 0) : 0;
+          return [menu, Math.round(avgQty * price)];
+        })
+      );
+
+      const marginPerMenu = rawData.recipes
+        .filter((r) => Number(r.sellPrice || 0) > 0)
+        .map((r) => {
+          const cost = computeRecipeCost(r, priceHistory);
+          const sellPrice = Number(r.sellPrice || 0);
+          return {
+            menu: r.menuName,
+            harga_jual: sellPrice,
+            estimasi_hpp: cost.complete ? Math.round(cost.totalCost) : null,
+            margin: cost.complete ? Math.round(sellPrice - cost.totalCost) : null
+          };
+        });
+
       const contextText = JSON.stringify({
         outlet: activeOutlet,
         tanggal: TODAY,
@@ -1673,15 +1694,18 @@ export default function App() {
           satuan: x.base
         })),
         rata_rata_penjualan_harian: avgDailySales,
+        omzet_rata_rata_harian_per_menu: omzetRataRataPerMenu,
+        total_omzet_tercatat: Math.round(computeRevenue(filteredData.sales, rawData.recipes)),
+        margin_per_menu: marginPerMenu,
         selisih_barang_datang: receivingIssues.slice(0, 10)
       });
 
       let answerText;
       let usedFallback = false;
       try {
-        answerText = await askGemini(buildReportPrompt(text, contextText));
+        answerText = await askAI(buildReportPrompt(text, contextText));
       } catch (error) {
-        console.warn("Gemini fallback:", error.message);
+        console.warn("AI fallback:", error.message);
         answerText = buildLocalReport(text, ctx);
         usedFallback = true;
       }
