@@ -6,7 +6,6 @@
 export const COLLECTIONS = {
   ITEMS: "master_items",
   RECIPES: "master_recipes",
-  SUPPLIERS: "suppliers",
 
   OPENING_STOCK: "opening_stock",
 
@@ -20,10 +19,22 @@ export const COLLECTIONS = {
   WASTE: "waste",
   ADJUSTMENTS: "adjustments",
 
-  REPORTS: "daily_reports",
-
   CHAT: "chat_messages"
 };
+
+// ============================================================
+// CHAT MESSAGE (riwayat chat, dikelompokkan per tanggal)
+// ============================================================
+
+export function createChatMessage(data = {}) {
+  return {
+    date: data.date || "",
+    role: data.role || "user",
+    text: data.text || "",
+    tags: Array.isArray(data.tags) ? data.tags : [],
+    createdAt: new Date().toISOString()
+  };
+}
 
 // ============================================================
 // ITEM

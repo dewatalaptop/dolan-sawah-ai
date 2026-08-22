@@ -1,5 +1,5 @@
-import { useEffect, useMemo, useRef, useState } from "react";
-import { collection, addDoc, getDocs, query, limit } from "firebase/firestore";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { collection, addDoc, getDocs, query, limit, where } from "firebase/firestore";
 import {
   onAuthStateChanged,
   signInWithEmailAndPassword,
@@ -17,7 +17,8 @@ import {
   createSale,
   createStockOpname,
   createWaste,
-  createAdjustment
+  createAdjustment,
+  createChatMessage
 } from "./dataModel";
 
 import {
@@ -26,7 +27,7 @@ import {
   generateVarianceReport
 } from "./inventoryEngine";
 
-import { saveRecipe, calculateUsageFromSales } from "./recipeEngine";
+import { saveRecipe, updateRecipe, deleteRecipe, calculateUsageFromSales } from "./recipeEngine";
 
 import { getPriceHistory, savePrice } from "./priceEngine";
 
@@ -565,6 +566,32 @@ async function saveRows(collectionName, rows) {
 }
 
 /* =========================================================
+   RIWAYAT CHAT (hybrid: chat hari ini live di memori, histori
+   tersimpan di Firestore per tanggal, bisa dicari kapan saja).
+   ========================================================= */
+
+async function persistChatMessage(date, role, text, tags) {
+  try {
+    await addDoc(
+      collection(db, COLLECTIONS.CHAT),
+      createChatMessage({ date, role, text, tags })
+    );
+  } catch (error) {
+    // Gagal simpan riwayat tidak boleh mengganggu chat yang sedang
+    // berjalan -- cukup dicatat di console.
+    console.error("Gagal menyimpan riwayat chat:", error);
+  }
+}
+
+async function loadChatByDate(date) {
+  const q = query(collection(db, COLLECTIONS.CHAT), where("date", "==", date));
+  const snapshot = await getDocs(q);
+  return snapshot.docs
+    .map((doc) => ({ id: doc.id, ...doc.data() }))
+    .sort((a, b) => String(a.createdAt || "").localeCompare(String(b.createdAt || "")));
+}
+
+/* =========================================================
    BUSINESS LOGIC: NORMALISASI SATUAN UNTUK PERHITUNGAN
    inventoryEngine & recipeEngine menjumlahkan field quantity
    apa adanya tanpa konversi satuan. Supaya kg tidak tercampur
@@ -959,6 +986,7 @@ export default function App() {
   const [loading, setLoading] = useState(false);
   const [systemOnline, setSystemOnline] = useState(false);
   const [dataLoading, setDataLoading] = useState(true);
+  const [dataLoadError, setDataLoadError] = useState("");
 
   const [rawData, setRawData] = useState({
     items: [], recipes: [], openingStock: [], purchases: [],
@@ -969,7 +997,44 @@ export default function App() {
   const [importResult, setImportResult] = useState(null);
   const [importBusy, setImportBusy] = useState(false);
 
+  const [editingRecipeId, setEditingRecipeId] = useState(null);
+  const [editMenuName, setEditMenuName] = useState("");
+  const [editIngredients, setEditIngredients] = useState([]);
+  const [editBusy, setEditBusy] = useState(false);
+  const [editError, setEditError] = useState("");
+  const [deleteConfirmId, setDeleteConfirmId] = useState(null);
+  const [deleteBusy, setDeleteBusy] = useState(false);
+
   const chatRef = useRef(null);
+
+  const [historyOpen, setHistoryOpen] = useState(false);
+  const [historyDate, setHistoryDate] = useState("");
+  const [historyMessages, setHistoryMessages] = useState(null);
+  const [historyLoading, setHistoryLoading] = useState(false);
+  const [historyError, setHistoryError] = useState("");
+
+  async function searchChatHistory() {
+    if (!historyDate) return;
+    setHistoryLoading(true);
+    setHistoryError("");
+    try {
+      const results = await loadChatByDate(historyDate);
+      setHistoryMessages(results);
+    } catch (error) {
+      console.error("Gagal memuat riwayat chat:", error);
+      setHistoryError(error?.message || "Gagal memuat riwayat chat.");
+      setHistoryMessages(null);
+    } finally {
+      setHistoryLoading(false);
+    }
+  }
+
+  function closeHistory() {
+    setHistoryOpen(false);
+    setHistoryDate("");
+    setHistoryMessages(null);
+    setHistoryError("");
+  }
 
   useEffect(() => {
     if (!chatRef.current) return;
@@ -995,10 +1060,33 @@ export default function App() {
     setPriceHistory(prices);
   }
 
+  const loadInitialData = useCallback(() => {
+    queueMicrotask(() => {
+      setDataLoading(true);
+      setDataLoadError("");
+      Promise.all([checkConnection(), refreshData()])
+        .catch((error) => {
+          console.error("Gagal memuat data awal:", error);
+          setDataLoadError(error?.message || "Gagal memuat data dari Firestore.");
+        })
+        .finally(() => setDataLoading(false));
+    });
+  }, []);
+
   useEffect(() => {
     if (!authUser) return;
-    setDataLoading(true);
-    Promise.all([checkConnection(), refreshData()]).finally(() => setDataLoading(false));
+    loadInitialData();
+  }, [authUser, loadInitialData]);
+
+  useEffect(() => {
+    if (!authUser) return;
+    loadChatByDate(TODAY)
+      .then((history) => {
+        if (history.length > 0) {
+          setMessages(history.map((m) => ({ id: m.id, role: m.role, text: m.text, tags: m.tags })));
+        }
+      })
+      .catch((error) => console.error("Gagal memuat chat hari ini:", error));
   }, [authUser]);
 
   /* =======================================================
@@ -1386,6 +1474,7 @@ export default function App() {
 
     setInput("");
     setMessages((prev) => [...prev, { id: `user-${Date.now()}`, role: "user", text }]);
+    persistChatMessage(TODAY, "user", text, []);
     setLoading(true);
 
     try {
@@ -1394,17 +1483,20 @@ export default function App() {
         ...prev,
         { id: `assistant-${Date.now()}`, role: "assistant", text: response.text, tags: response.tags }
       ]);
+      persistChatMessage(TODAY, "assistant", response.text, response.tags || []);
     } catch (error) {
       console.error(error);
+      const errorText = `Terjadi kesalahan saat memproses data.\n\nDetail: ${error?.message || "Unknown error"}`;
       setMessages((prev) => [
         ...prev,
         {
           id: `error-${Date.now()}`,
           role: "assistant",
-          text: `Terjadi kesalahan saat memproses data.\n\nDetail: ${error?.message || "Unknown error"}`,
+          text: errorText,
           tags: ["ERROR"]
         }
       ]);
+      persistChatMessage(TODAY, "assistant", errorText, ["ERROR"]);
     } finally {
       setLoading(false);
     }
@@ -1474,6 +1566,94 @@ export default function App() {
       alert(`Gagal menyimpan hasil import: ${error.message}`);
     } finally {
       setImportBusy(false);
+    }
+  }
+
+  /* =======================================================
+     EDIT / HAPUS RESEP
+     ======================================================= */
+
+  function startEditRecipe(recipe) {
+    setDeleteConfirmId(null);
+    setEditError("");
+    setEditingRecipeId(recipe.id);
+    setEditMenuName(recipe.menuName || "");
+    setEditIngredients(
+      (recipe.ingredients || []).map((ing) => ({
+        itemName: ing.itemName || "",
+        quantity: ing.quantity ?? "",
+        unit: ing.unit || "gram"
+      }))
+    );
+  }
+
+  function cancelEditRecipe() {
+    setEditingRecipeId(null);
+    setEditError("");
+  }
+
+  function updateEditIngredientField(index, field, value) {
+    setEditIngredients((prev) =>
+      prev.map((ing, i) => (i === index ? { ...ing, [field]: value } : ing))
+    );
+  }
+
+  function addEditIngredientRow() {
+    setEditIngredients((prev) => [...prev, { itemName: "", quantity: "", unit: "gram" }]);
+  }
+
+  function removeEditIngredientRow(index) {
+    setEditIngredients((prev) => prev.filter((_, i) => i !== index));
+  }
+
+  async function saveEditRecipe() {
+    setEditError("");
+
+    const cleanedIngredients = editIngredients
+      .map((ing) => ({
+        itemName: String(ing.itemName || "").trim(),
+        quantity: Number(ing.quantity) || 0,
+        unit: String(ing.unit || "").trim() || "gram"
+      }))
+      .filter((ing) => ing.itemName && ing.quantity > 0);
+
+    if (!editMenuName.trim()) {
+      setEditError("Nama menu wajib diisi.");
+      return;
+    }
+
+    if (cleanedIngredients.length === 0) {
+      setEditError("Resep harus punya minimal satu bahan dengan nama dan jumlah valid.");
+      return;
+    }
+
+    setEditBusy(true);
+    try {
+      await updateRecipe(editingRecipeId, {
+        menuName: editMenuName.trim(),
+        ingredients: cleanedIngredients
+      });
+      setEditingRecipeId(null);
+      await refreshData();
+    } catch (error) {
+      console.error("Gagal update resep:", error);
+      setEditError(error?.message || "Gagal menyimpan perubahan.");
+    } finally {
+      setEditBusy(false);
+    }
+  }
+
+  async function confirmDeleteRecipe(id) {
+    setDeleteBusy(true);
+    try {
+      await deleteRecipe(id);
+      setDeleteConfirmId(null);
+      await refreshData();
+    } catch (error) {
+      console.error("Gagal hapus resep:", error);
+      alert(`Gagal menghapus resep: ${error.message}`);
+    } finally {
+      setDeleteBusy(false);
     }
   }
 
@@ -1672,11 +1852,77 @@ export default function App() {
   }
 
   function renderResep() {
+    const editingRecipe = rawData.recipes.find((r) => r.id === editingRecipeId);
+
     return (
       <div className="page">
-        <div className="section-header"><div><h1>Resep</h1><p>Resep yang sudah tersimpan, lengkap dengan bahan per porsi (tampilan baca saja).</p></div></div>
+        <div className="section-header"><div><h1>Resep</h1><p>Resep yang sudah tersimpan, lengkap dengan bahan per porsi. Bisa diedit atau dihapus.</p></div></div>
+
+        {editingRecipe && (
+          <div className="card">
+            <div className="card-title">Edit resep: {editingRecipe.menuName}</div>
+            <div style={{ marginBottom: 12 }}>
+              <label style={{ display: "block", fontSize: 13, color: "#666", marginBottom: 4 }}>Nama menu</label>
+              <input
+                type="text"
+                value={editMenuName}
+                onChange={(e) => setEditMenuName(e.target.value)}
+                style={{ width: "100%", maxWidth: 320, padding: "8px 10px", borderRadius: 8, border: "1px solid #ddd", boxSizing: "border-box" }}
+              />
+            </div>
+
+            <label style={{ display: "block", fontSize: 13, color: "#666", marginBottom: 4 }}>Bahan</label>
+            {editIngredients.map((ing, index) => (
+              <div key={index} style={{ display: "flex", gap: 8, marginBottom: 8, alignItems: "center", flexWrap: "wrap" }}>
+                <input
+                  type="text"
+                  placeholder="Nama bahan"
+                  value={ing.itemName}
+                  onChange={(e) => updateEditIngredientField(index, "itemName", e.target.value)}
+                  style={{ flex: "1 1 160px", padding: "8px 10px", borderRadius: 8, border: "1px solid #ddd" }}
+                />
+                <input
+                  type="number"
+                  placeholder="Jumlah"
+                  value={ing.quantity}
+                  onChange={(e) => updateEditIngredientField(index, "quantity", e.target.value)}
+                  style={{ width: 100, padding: "8px 10px", borderRadius: 8, border: "1px solid #ddd" }}
+                />
+                <input
+                  type="text"
+                  placeholder="Satuan"
+                  value={ing.unit}
+                  onChange={(e) => updateEditIngredientField(index, "unit", e.target.value)}
+                  style={{ width: 100, padding: "8px 10px", borderRadius: 8, border: "1px solid #ddd" }}
+                />
+                <button
+                  onClick={() => removeEditIngredientRow(index)}
+                  style={{ padding: "6px 10px", borderRadius: 8, border: "1px solid #ddd", background: "transparent", color: "#c0392b", cursor: "pointer" }}
+                >
+                  Hapus
+                </button>
+              </div>
+            ))}
+            <button
+              onClick={addEditIngredientRow}
+              style={{ marginBottom: 12, padding: "6px 12px", borderRadius: 8, border: "1px dashed #aaa", background: "transparent", cursor: "pointer" }}
+            >
+              + Tambah bahan
+            </button>
+
+            {editError && <div style={{ color: "#c0392b", fontSize: 13, marginBottom: 10 }}>{editError}</div>}
+
+            <div className="form-footer">
+              <button className="secondary-button" onClick={cancelEditRecipe} disabled={editBusy}>Batal</button>
+              <button className="primary-button" onClick={saveEditRecipe} disabled={editBusy}>
+                {editBusy ? "Menyimpan..." : "Simpan Perubahan"}
+              </button>
+            </div>
+          </div>
+        )}
+
         <DataTable
-          columns={["Nama Menu", "Jumlah Bahan", "Daftar Bahan"]}
+          columns={["Nama Menu", "Jumlah Bahan", "Daftar Bahan", "Aksi"]}
           rows={rawData.recipes
             .slice()
             .sort((a, b) => String(a.menuName || "").localeCompare(String(b.menuName || "")))
@@ -1685,7 +1931,40 @@ export default function App() {
               (r.ingredients || []).length,
               (r.ingredients || [])
                 .map((ing) => `${ing.itemName} ${formatNumber(ing.quantity)} ${ing.unit}`)
-                .join(", ") || "-"
+                .join(", ") || "-",
+              deleteConfirmId === r.id ? (
+                <div key="del" style={{ display: "flex", gap: 6 }}>
+                  <span style={{ fontSize: 13, color: "#c0392b" }}>Yakin?</span>
+                  <button
+                    onClick={() => confirmDeleteRecipe(r.id)}
+                    disabled={deleteBusy}
+                    style={{ padding: "4px 10px", borderRadius: 6, border: "none", background: "#c0392b", color: "#fff", cursor: "pointer" }}
+                  >
+                    {deleteBusy ? "..." : "Ya, hapus"}
+                  </button>
+                  <button
+                    onClick={() => setDeleteConfirmId(null)}
+                    style={{ padding: "4px 10px", borderRadius: 6, border: "1px solid #ddd", background: "transparent", cursor: "pointer" }}
+                  >
+                    Batal
+                  </button>
+                </div>
+              ) : (
+                <div key="actions" style={{ display: "flex", gap: 6 }}>
+                  <button
+                    onClick={() => startEditRecipe(r)}
+                    style={{ padding: "4px 10px", borderRadius: 6, border: "1px solid #ddd", background: "transparent", cursor: "pointer" }}
+                  >
+                    Edit
+                  </button>
+                  <button
+                    onClick={() => setDeleteConfirmId(r.id)}
+                    style={{ padding: "4px 10px", borderRadius: 6, border: "1px solid #ddd", background: "transparent", color: "#c0392b", cursor: "pointer" }}
+                  >
+                    Hapus
+                  </button>
+                </div>
+              )
             ])}
           emptyText="Belum ada resep tersimpan."
         />
@@ -1833,6 +2112,21 @@ export default function App() {
     );
   }
 
+  if (dataLoadError) {
+    return (
+      <div style={{ display: "flex", flexDirection: "column", gap: 12, alignItems: "center", justifyContent: "center", height: "100vh", fontFamily: "sans-serif", color: "#666", textAlign: "center", padding: 24 }}>
+        <div style={{ color: "#c0392b", fontWeight: 600 }}>Gagal memuat data dari Firestore</div>
+        <div style={{ fontSize: 13, maxWidth: 400 }}>{dataLoadError}</div>
+        <button
+          onClick={loadInitialData}
+          style={{ marginTop: 8, padding: "8px 16px", borderRadius: 8, border: "none", background: "#2e7d32", color: "#fff", fontWeight: 600, cursor: "pointer" }}
+        >
+          Coba lagi
+        </button>
+      </div>
+    );
+  }
+
   return (
     <div className="app">
       <aside className="sidebar">
@@ -1914,7 +2208,52 @@ export default function App() {
                 ))}
               </div>
               <span className="chat-context-hint">Anda tetap bisa menyebut outlet lain langsung di dalam pesan.</span>
+              <button
+                onClick={() => setHistoryOpen((v) => !v)}
+                style={{ marginLeft: "auto", padding: "6px 12px", borderRadius: 8, border: "1px solid #ddd", background: historyOpen ? "#2e7d32" : "transparent", color: historyOpen ? "#fff" : "#333", cursor: "pointer", fontSize: 13 }}
+              >
+                Riwayat Chat
+              </button>
             </div>
+
+            {historyOpen && (
+              <div style={{ background: "#fff", border: "1px solid #eee", borderRadius: 10, padding: 14, margin: "0 0 12px" }}>
+                <div style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
+                  <span style={{ fontSize: 13, color: "#666" }}>Cari chat tanggal:</span>
+                  <input
+                    type="date"
+                    value={historyDate}
+                    onChange={(e) => setHistoryDate(e.target.value)}
+                    style={{ padding: "6px 8px", borderRadius: 6, border: "1px solid #ddd" }}
+                  />
+                  <button
+                    onClick={searchChatHistory}
+                    disabled={!historyDate || historyLoading}
+                    style={{ padding: "6px 14px", borderRadius: 6, border: "none", background: "#2e7d32", color: "#fff", cursor: "pointer" }}
+                  >
+                    {historyLoading ? "Mencari..." : "Cari"}
+                  </button>
+                  <button
+                    onClick={closeHistory}
+                    style={{ padding: "6px 14px", borderRadius: 6, border: "1px solid #ddd", background: "transparent", cursor: "pointer" }}
+                  >
+                    Tutup
+                  </button>
+                </div>
+
+                {historyError && <div style={{ color: "#c0392b", fontSize: 13, marginTop: 10 }}>{historyError}</div>}
+
+                {historyMessages !== null && (
+                  <div style={{ marginTop: 12, maxHeight: 320, overflowY: "auto", display: "flex", flexDirection: "column", gap: 8 }}>
+                    {historyMessages.length === 0 ? (
+                      <div style={{ fontSize: 13, color: "#888" }}>Tidak ada riwayat chat di tanggal ini.</div>
+                    ) : (
+                      historyMessages.map((m) => <ChatMessage key={m.id} message={m} />)
+                    )}
+                  </div>
+                )}
+              </div>
+            )}
 
             <div ref={chatRef} className="chat-messages">
               {messages.length === 1 && (

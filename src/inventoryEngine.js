@@ -78,22 +78,12 @@ export function calculateTheoreticalStock(
 ) {
   const result = {};
 
-  // ----------------------------------------------------------
-  // OPENING STOCK
-  // ----------------------------------------------------------
-
-  for (const item of data.openingStock) {
-    const key =
-      item.itemId ||
-      item.itemName;
-
+  function ensure(key, seed) {
     if (!result[key]) {
       result[key] = {
-        itemId: item.itemId || "",
-        itemName:
-          item.itemName || "",
-        unit:
-          item.unit || "",
+        itemId: seed.itemId || "",
+        itemName: seed.itemName || "",
+        unit: seed.unit || "",
         opening: 0,
         receiving: 0,
         usage: 0,
@@ -104,9 +94,68 @@ export function calculateTheoreticalStock(
         variance: null
       };
     }
+  }
 
-    result[key].opening +=
-      Number(item.quantity || 0);
+  // ----------------------------------------------------------
+  // BASELINE: cari stock opname TERBARU (by tanggal, bukan urutan
+  // array) per item, dan opname SEBELUMNYA (kalau ada) sebagai
+  // titik awal periode. Ini mencegah stok teoritis menumpuk
+  // seluruh histori transaksi sejak awal waktu -- setiap opname
+  // baru me-reset perhitungan mulai dari opname sebelumnya, bukan
+  // dari hari pertama aplikasi dipakai.
+  // ----------------------------------------------------------
+
+  const opnameByItem = {};
+  for (const opname of data.stockOpname) {
+    const key = opname.itemId || opname.itemName;
+    if (!opnameByItem[key]) opnameByItem[key] = [];
+    opnameByItem[key].push(opname);
+  }
+
+  const baselineInfo = {};
+  Object.entries(opnameByItem).forEach(([key, records]) => {
+    const sorted = [...records].sort((a, b) =>
+      String(a.date || "").localeCompare(String(b.date || ""))
+    );
+    const latest = sorted[sorted.length - 1];
+    const previous = sorted.length > 1 ? sorted[sorted.length - 2] : null;
+
+    ensure(key, latest);
+    result[key].actual = Number(latest.actualQuantity || 0);
+
+    baselineInfo[key] = {
+      latestDate: latest.date || "",
+      baselineValue: previous ? Number(previous.actualQuantity || 0) : null,
+      baselineDate: previous ? previous.date || "" : null
+    };
+  });
+
+  // Transaksi dihitung ke periode ini kalau tanggalnya SETELAH
+  // baseline (opname sebelumnya, kalau ada) dan TIDAK SETELAH
+  // opname terbaru. Item tanpa opname sama sekali tetap
+  // mengakumulasi seluruh histori seperti sebelumnya.
+  function withinPeriod(key, date) {
+    const info = baselineInfo[key];
+    if (!info) return true;
+    const d = String(date || "");
+    const afterBaseline = info.baselineDate === null || d > info.baselineDate;
+    const notAfterLatest = d <= info.latestDate;
+    return afterBaseline && notAfterLatest;
+  }
+
+  // ----------------------------------------------------------
+  // OPENING STOCK -- hanya relevan kalau belum ada opname
+  // sebelumnya untuk item ini (kalau sudah ada, opname itu sendiri
+  // yang jadi baseline, bukan stok awal).
+  // ----------------------------------------------------------
+
+  for (const item of data.openingStock) {
+    const key = item.itemId || item.itemName;
+    ensure(key, item);
+    const info = baselineInfo[key];
+    if (!info || info.baselineValue === null) {
+      result[key].opening += Number(item.quantity || 0);
+    }
   }
 
   // ----------------------------------------------------------
@@ -114,32 +163,11 @@ export function calculateTheoreticalStock(
   // ----------------------------------------------------------
 
   for (const item of data.receiving) {
-    const key =
-      item.itemId ||
-      item.itemName;
-
-    if (!result[key]) {
-      result[key] = {
-        itemId: item.itemId || "",
-        itemName:
-          item.itemName || "",
-        unit:
-          item.unit || "",
-        opening: 0,
-        receiving: 0,
-        usage: 0,
-        waste: 0,
-        adjustment: 0,
-        theoretical: 0,
-        actual: null,
-        variance: null
-      };
+    const key = item.itemId || item.itemName;
+    ensure(key, item);
+    if (withinPeriod(key, item.date)) {
+      result[key].receiving += Number(item.receivedQuantity || 0);
     }
-
-    result[key].receiving +=
-      Number(
-        item.receivedQuantity || 0
-      );
   }
 
   // ----------------------------------------------------------
@@ -147,30 +175,11 @@ export function calculateTheoreticalStock(
   // ----------------------------------------------------------
 
   for (const item of data.waste) {
-    const key =
-      item.itemId ||
-      item.itemName;
-
-    if (!result[key]) {
-      result[key] = {
-        itemId: item.itemId || "",
-        itemName:
-          item.itemName || "",
-        unit:
-          item.unit || "",
-        opening: 0,
-        receiving: 0,
-        usage: 0,
-        waste: 0,
-        adjustment: 0,
-        theoretical: 0,
-        actual: null,
-        variance: null
-      };
+    const key = item.itemId || item.itemName;
+    ensure(key, item);
+    if (withinPeriod(key, item.date)) {
+      result[key].waste += Number(item.quantity || 0);
     }
-
-    result[key].waste +=
-      Number(item.quantity || 0);
   }
 
   // ----------------------------------------------------------
@@ -178,30 +187,11 @@ export function calculateTheoreticalStock(
   // ----------------------------------------------------------
 
   for (const item of data.adjustments) {
-    const key =
-      item.itemId ||
-      item.itemName;
-
-    if (!result[key]) {
-      result[key] = {
-        itemId: item.itemId || "",
-        itemName:
-          item.itemName || "",
-        unit:
-          item.unit || "",
-        opening: 0,
-        receiving: 0,
-        usage: 0,
-        waste: 0,
-        adjustment: 0,
-        theoretical: 0,
-        actual: null,
-        variance: null
-      };
+    const key = item.itemId || item.itemName;
+    ensure(key, item);
+    if (withinPeriod(key, item.date)) {
+      result[key].adjustment += Number(item.quantity || 0);
     }
-
-    result[key].adjustment +=
-      Number(item.quantity || 0);
   }
 
   // ----------------------------------------------------------
@@ -209,110 +199,51 @@ export function calculateTheoreticalStock(
   // ----------------------------------------------------------
 
   for (const sale of data.sales) {
-    const recipe =
-      data.recipes.find(
-        (r) =>
-          r.menuName ===
-          sale.menuName
-      );
+    const recipe = data.recipes.find(
+      (r) => r.menuName === sale.menuName
+    );
 
     if (!recipe) {
       continue;
     }
 
-    for (
-      const ingredient
-      of recipe.ingredients
-    ) {
-      const key =
-        ingredient.itemId ||
-        ingredient.itemName;
+    for (const ingredient of recipe.ingredients) {
+      const key = ingredient.itemId || ingredient.itemName;
+      ensure(key, ingredient);
 
-      if (!result[key]) {
-        result[key] = {
-          itemId:
-            ingredient.itemId || "",
-          itemName:
-            ingredient.itemName || "",
-          unit:
-            ingredient.unit || "",
-          opening: 0,
-          receiving: 0,
-          usage: 0,
-          waste: 0,
-          adjustment: 0,
-          theoretical: 0,
-          actual: null,
-          variance: null
-        };
+      if (withinPeriod(key, sale.date)) {
+        const amount =
+          Number(ingredient.quantity || 0) *
+          Number(sale.quantity || 0);
+
+        result[key].usage += amount;
       }
-
-      const amount =
-        Number(
-          ingredient.quantity || 0
-        ) *
-        Number(
-          sale.quantity || 0
-        );
-
-      result[key].usage += amount;
     }
-  }
-
-  // ----------------------------------------------------------
-  // ACTUAL STOCK
-  // ----------------------------------------------------------
-
-  for (const opname of data.stockOpname) {
-    const key =
-      opname.itemId ||
-      opname.itemName;
-
-    if (!result[key]) {
-      result[key] = {
-        itemId:
-          opname.itemId || "",
-        itemName:
-          opname.itemName || "",
-        unit:
-          opname.unit || "",
-        opening: 0,
-        receiving: 0,
-        usage: 0,
-        waste: 0,
-        adjustment: 0,
-        theoretical: 0,
-        actual: null,
-        variance: null
-      };
-    }
-
-    result[key].actual =
-      Number(
-        opname.actualQuantity || 0
-      );
   }
 
   // ----------------------------------------------------------
   // FINAL CALCULATION
   // ----------------------------------------------------------
 
-  Object.values(result).forEach(
-    (item) => {
-      item.theoretical =
-        item.opening +
-        item.receiving -
-        item.usage -
-        item.waste +
-        item.adjustment;
+  Object.values(result).forEach((item) => {
+    const key = item.itemId || item.itemName;
+    const info = baselineInfo[key];
+    const baseline =
+      info && info.baselineValue !== null
+        ? info.baselineValue
+        : item.opening;
 
-      if (item.actual !== null) {
-        item.variance =
-          item.actual -
-          item.theoretical;
-      }
+    item.theoretical =
+      baseline +
+      item.receiving -
+      item.usage -
+      item.waste +
+      item.adjustment;
+
+    if (item.actual !== null) {
+      item.variance = item.actual - item.theoretical;
     }
-  );
+  });
 
   return Object.values(result);
 }

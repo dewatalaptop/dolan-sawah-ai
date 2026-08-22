@@ -6,7 +6,10 @@
 import {
   collection,
   addDoc,
-  getDocs
+  getDocs,
+  doc,
+  updateDoc,
+  deleteDoc
 } from "firebase/firestore";
 
 import { db } from "./firebase";
@@ -90,6 +93,66 @@ export async function saveRecipe(data) {
     id: docRef.id,
     ...recipe
   };
+}
+
+// ============================================================
+// UPDATE RECIPE
+// ============================================================
+
+export async function updateRecipe(id, data) {
+  if (!id) {
+    throw new Error(
+      "ID resep tidak valid."
+    );
+  }
+
+  if (!data.menuName) {
+    throw new Error(
+      "Nama menu wajib diisi."
+    );
+  }
+
+  if (
+    !Array.isArray(data.ingredients) ||
+    data.ingredients.length === 0
+  ) {
+    throw new Error(
+      "Resep harus memiliki minimal satu bahan."
+    );
+  }
+
+  const payload = {
+    menuName: data.menuName,
+    ingredients: data.ingredients,
+    portions: Number(data.portions || 1),
+    updatedAt: new Date().toISOString()
+  };
+
+  await updateDoc(
+    doc(db, COLLECTIONS.RECIPES, id),
+    payload
+  );
+
+  return {
+    id,
+    ...payload
+  };
+}
+
+// ============================================================
+// DELETE RECIPE
+// ============================================================
+
+export async function deleteRecipe(id) {
+  if (!id) {
+    throw new Error(
+      "ID resep tidak valid."
+    );
+  }
+
+  await deleteDoc(
+    doc(db, COLLECTIONS.RECIPES, id)
+  );
 }
 
 // ============================================================
