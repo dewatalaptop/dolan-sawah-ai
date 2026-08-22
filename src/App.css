@@ -765,3 +765,59 @@ tbody tr:hover { background: var(--green-050); }
 @keyframes ds-spin {
   to { transform: rotate(360deg); }
 }
+
+/* Data quality banner */
+.data-quality-banner {
+  background: #fff8e1;
+  border-bottom: 1px solid #ffe082;
+  padding: 10px 28px;
+}
+
+.data-quality-banner-header {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  cursor: pointer;
+  user-select: none;
+}
+
+.data-quality-banner-icon {
+  font-size: 16px;
+  line-height: 1;
+}
+
+.data-quality-banner-title {
+  font-weight: 600;
+  color: #8d6e00;
+  font-size: 14px;
+}
+
+.data-quality-banner-toggle {
+  margin-left: auto;
+  font-size: 13px;
+  color: #8d6e00;
+  white-space: nowrap;
+}
+
+.data-quality-banner-list {
+  margin: 10px 0 2px;
+  padding-left: 20px;
+  color: #6d5600;
+  font-size: 13px;
+  line-height: 1.6;
+}
+
+.data-quality-banner-list li {
+  margin-bottom: 4px;
+}
+
+@media (max-width: 720px) {
+  .data-quality-banner {
+    padding: 10px 16px;
+  }
+
+  .data-quality-banner-toggle {
+    margin-left: 0;
+    flex-basis: 100%;
+  }
+}

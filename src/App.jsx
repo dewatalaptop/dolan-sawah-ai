@@ -710,6 +710,122 @@ function buildPurchaseSuggestions(ingredientForecast, theoreticalStock) {
 }
 
 /* =========================================================
+   ANALISIS KUALITAS DATA
+   Dijalankan murni dari data yang sudah ada -- tidak menebak,
+   cuma mendeteksi pola yang secara struktural berisiko membuat
+   perhitungan (variance, kebutuhan bahan) jadi tidak akurat.
+   ========================================================= */
+
+// Tanggal ada aktivitas lain (pembelian/barang datang/opname/waste/
+// penyesuaian/stok awal) di suatu outlet, tapi tidak ada penjualan
+// tercatat di tanggal yang sama -- indikasi penjualan lupa diinput.
+function checkSalesGaps(rawData) {
+  const activityDates = {};
+  const salesDates = {};
+
+  function mark(map, outlet, date) {
+    if (!date || !outlet) return;
+    const key = outlet;
+    if (!map[key]) map[key] = new Set();
+    map[key].add(date);
+  }
+
+  ["purchases", "receiving", "stockOpname", "waste", "adjustments", "openingStock"].forEach((field) => {
+    (rawData[field] || []).forEach((row) => mark(activityDates, row.outlet, row.date));
+  });
+  (rawData.sales || []).forEach((row) => mark(salesDates, row.outlet, row.date));
+
+  const issues = [];
+  Object.entries(activityDates).forEach(([outlet, dates]) => {
+    const sold = salesDates[outlet] || new Set();
+    [...dates]
+      .filter((date) => !sold.has(date))
+      .sort()
+      .forEach((date) => {
+        issues.push({
+          type: "sales-gap",
+          message: `Outlet ${outlet}: ada aktivitas tercatat pada ${formatDateID(date)}, tapi tidak ada data penjualan di tanggal itu.`
+        });
+      });
+  });
+
+  return issues;
+}
+
+// Resep tanpa bahan sama sekali, atau semua bahannya tidak valid
+// (nama kosong / jumlah 0) -- kebutuhan bahan & variance untuk menu
+// itu tidak akan pernah bisa dihitung.
+function checkEmptyRecipes(rawData) {
+  return (rawData.recipes || [])
+    .filter(
+      (r) =>
+        !Array.isArray(r.ingredients) ||
+        r.ingredients.length === 0 ||
+        r.ingredients.every((ing) => !ing.itemName || !Number(ing.quantity))
+    )
+    .map((r) => ({
+      type: "empty-recipe",
+      message: `Resep "${r.menuName}" tidak punya bahan yang valid -- kebutuhan bahan & variance untuk menu ini tidak bisa dihitung.`
+    }));
+}
+
+// Menu yang pernah terjual tapi belum punya resep sama sekali --
+// pemakaian bahannya tidak pernah ikut mengurangi stok teoritis.
+function checkMenusWithoutRecipe(rawData) {
+  const recipeNames = new Set(
+    (rawData.recipes || []).map((r) => normalizeText(r.menuName))
+  );
+  const soldNames = new Map();
+  (rawData.sales || []).forEach((s) => {
+    const name = String(s.menuName || "").trim();
+    if (name) soldNames.set(normalizeText(name), name);
+  });
+
+  return [...soldNames.entries()]
+    .filter(([key]) => !recipeNames.has(key))
+    .map(([, name]) => ({
+      type: "menu-without-recipe",
+      message: `Menu "${name}" pernah terjual tapi belum punya resep -- pemakaian bahannya tidak ikut terhitung.`
+    }));
+}
+
+// Bahan yang dipakai di suatu resep tapi tidak pernah muncul di stok
+// awal maupun barang datang -- stok teoritisnya akan selalu negatif
+// karena tidak pernah ada pemasukan yang tercatat.
+function checkUnstockedIngredients(rawData) {
+  const stockedNames = new Set();
+  (rawData.openingStock || []).forEach((r) => stockedNames.add(normalizeText(r.itemName)));
+  (rawData.receiving || []).forEach((r) => stockedNames.add(normalizeText(r.itemName)));
+
+  const seen = new Set();
+  const issues = [];
+  (rawData.recipes || []).forEach((r) => {
+    (r.ingredients || []).forEach((ing) => {
+      const name = String(ing.itemName || "").trim();
+      if (!name) return;
+      const key = normalizeText(name);
+      if (stockedNames.has(key) || seen.has(key)) return;
+      seen.add(key);
+      issues.push({
+        type: "unstocked-ingredient",
+        message: `Bahan "${name}" dipakai di resep tapi belum pernah dicatat stok awal/pembelian -- stok teoritisnya akan selalu negatif.`
+      });
+    });
+  });
+
+  return issues;
+}
+
+function analyzeDataQuality(rawData) {
+  return [
+    ...checkSalesGaps(rawData),
+    ...checkEmptyRecipes(rawData),
+    ...checkMenusWithoutRecipe(rawData),
+    ...checkUnstockedIngredients(rawData)
+  ];
+}
+
+/* =========================================================
    LAPORAN LOKAL (fallback jika Gemini belum tersambung)
    ========================================================= */
 
@@ -1097,6 +1213,9 @@ export default function App() {
     () => filterDataByOutlet(rawData, activeOutlet),
     [rawData, activeOutlet]
   );
+
+  const dataQualityIssues = useMemo(() => analyzeDataQuality(rawData), [rawData]);
+  const [qualityBannerExpanded, setQualityBannerExpanded] = useState(false);
 
   const normalizedData = useMemo(() => toBaseUnitDataset(filteredData), [filteredData]);
 
@@ -2191,6 +2310,30 @@ export default function App() {
             </div>
           </div>
         </header>
+
+        {dataQualityIssues.length > 0 && (
+          <div className="data-quality-banner">
+            <div
+              className="data-quality-banner-header"
+              onClick={() => setQualityBannerExpanded((v) => !v)}
+            >
+              <span className="data-quality-banner-icon">⚠️</span>
+              <span className="data-quality-banner-title">
+                {dataQualityIssues.length} potensi masalah data ditemukan
+              </span>
+              <span className="data-quality-banner-toggle">
+                {qualityBannerExpanded ? "Sembunyikan ▲" : "Lihat detail ▼"}
+              </span>
+            </div>
+            {qualityBannerExpanded && (
+              <ul className="data-quality-banner-list">
+                {dataQualityIssues.map((issue, i) => (
+                  <li key={i}>{issue.message}</li>
+                ))}
+              </ul>
+            )}
+          </div>
+        )}
 
         {activeMenu === "chat" ? (
           <section className="chat-page">
