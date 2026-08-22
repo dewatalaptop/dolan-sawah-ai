@@ -33,6 +33,8 @@ import { getPriceHistory, savePrice } from "./priceEngine";
 
 import { processExcelFile } from "./excelEngine";
 
+import { buildReportWorkbook, downloadReportWorkbook } from "./reportEngine";
+
 import { askGemini, buildReportPrompt } from "./geminiEngine";
 
 /* =========================================================
@@ -40,6 +42,12 @@ import { askGemini, buildReportPrompt } from "./geminiEngine";
    ========================================================= */
 
 const TODAY = new Date().toISOString().slice(0, 10);
+
+function daysAgoISO(days) {
+  const d = new Date(TODAY);
+  d.setDate(d.getDate() - days);
+  return d.toISOString().slice(0, 10);
+}
 
 const OUTLETS = [
   { id: "ALL", label: "Semua Outlet" },
@@ -1094,6 +1102,11 @@ export default function App() {
     toastTimerRef.current = setTimeout(() => setToast(null), 5000);
   }
 
+  const [reportStart, setReportStart] = useState(daysAgoISO(29));
+  const [reportEnd, setReportEnd] = useState(TODAY);
+  const [reportOutlet, setReportOutlet] = useState("ALL");
+  const [reportBusy, setReportBusy] = useState(false);
+
   const [messages, setMessages] = useState([
     {
       id: "welcome",
@@ -2140,6 +2153,33 @@ export default function App() {
     );
   }
 
+  async function handleDownloadReport() {
+    if (reportStart && reportEnd && reportStart > reportEnd) {
+      showToast("Tanggal mulai tidak boleh lebih besar dari tanggal akhir.");
+      return;
+    }
+    setReportBusy(true);
+    try {
+      const workbook = buildReportWorkbook({
+        rawData: filterDataByOutlet(rawData, reportOutlet),
+        startDate: reportStart,
+        endDate: reportEnd,
+        outlet: reportOutlet,
+        dataQualityIssues,
+        purchaseSuggestions,
+        generatedAt: new Date().toLocaleString("id-ID")
+      });
+      const filename = `Laporan_DolanSawahAI_${reportOutlet}_${reportStart || "awal"}_sampai_${reportEnd || "sekarang"}.xlsx`;
+      downloadReportWorkbook(workbook, filename);
+      showToast("Laporan Excel berhasil diunduh.", "success");
+    } catch (error) {
+      console.error("Gagal membuat laporan Excel:", error);
+      showToast(`Gagal membuat laporan Excel: ${error.message}`);
+    } finally {
+      setReportBusy(false);
+    }
+  }
+
   function renderLaporan() {
     const prompts = [
       "Apa saja yang perlu dibeli besok?",
@@ -2148,9 +2188,77 @@ export default function App() {
       "Apakah ada selisih antara barang datang dan pesanan?",
       "Buatkan ringkasan performa hari ini untuk semua outlet."
     ];
+
+    function setPresetRange(days) {
+      setReportEnd(TODAY);
+      setReportStart(daysAgoISO(days - 1));
+    }
+
     return (
       <div className="page">
         <div className="section-header"><div><h1>Laporan AI</h1><p>Tanyakan apa saja berdasarkan data yang sudah tersimpan.</p></div></div>
+
+        <div className="card">
+          <div className="card-title">Unduh Laporan Excel</div>
+          <p style={{ fontSize: 13, color: "var(--ink-soft)", margin: "0 0 14px" }}>
+            Laporan lengkap (ringkasan, variance & waste, indikator masalah data, saran pembelian, dan seluruh
+            data transaksi) untuk rentang tanggal pilihan Anda — siap diunduh atau dikirim ke AI untuk dianalisa ulang.
+          </p>
+
+          <div style={{ display: "flex", gap: 8, flexWrap: "wrap", marginBottom: 12 }}>
+            <div className="outlet-switch small">
+              {OUTLETS.map((o) => (
+                <button
+                  key={o.id}
+                  className={`outlet-chip ${reportOutlet === o.id ? "active" : ""}`}
+                  onClick={() => setReportOutlet(o.id)}
+                >
+                  {o.id === "ALL" ? "Semua" : o.id}
+                </button>
+              ))}
+            </div>
+          </div>
+
+          <div style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap", marginBottom: 12 }}>
+            <span style={{ fontSize: 13, color: "var(--ink-soft)" }}>Dari</span>
+            <input
+              type="date"
+              value={reportStart}
+              max={reportEnd || undefined}
+              onChange={(e) => setReportStart(e.target.value)}
+              style={{ padding: "6px 8px", borderRadius: 6, border: "1px solid var(--border)" }}
+            />
+            <span style={{ fontSize: 13, color: "var(--ink-soft)" }}>s/d</span>
+            <input
+              type="date"
+              value={reportEnd}
+              min={reportStart || undefined}
+              onChange={(e) => setReportEnd(e.target.value)}
+              style={{ padding: "6px 8px", borderRadius: 6, border: "1px solid var(--border)" }}
+            />
+            <button className="prompt-chip" onClick={() => setPresetRange(7)}>7 hari</button>
+            <button className="prompt-chip" onClick={() => setPresetRange(30)}>30 hari</button>
+            <button className="prompt-chip" onClick={() => setPresetRange(90)}>90 hari</button>
+          </div>
+
+          <button
+            onClick={handleDownloadReport}
+            disabled={reportBusy}
+            style={{
+              padding: "10px 20px",
+              borderRadius: 10,
+              border: "none",
+              background: "var(--green-600)",
+              color: "#fff",
+              fontWeight: 600,
+              cursor: reportBusy ? "default" : "pointer",
+              opacity: reportBusy ? 0.7 : 1
+            }}
+          >
+            {reportBusy ? "Menyiapkan laporan..." : "⬇ Unduh Laporan Excel"}
+          </button>
+        </div>
+
         <div className="card">
           <div className="card-title">Pertanyaan cepat</div>
           <div className="prompt-list">
