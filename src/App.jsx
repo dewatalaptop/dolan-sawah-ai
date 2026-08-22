@@ -43,10 +43,33 @@ import { askAI, buildReportPrompt } from "./aiEngine";
 
 const TODAY = new Date().toISOString().slice(0, 10);
 
+// TODAY di atas cuma dihitung sekali saat modul di-load -- kalau tab
+// dibiarkan terbuka melewati tengah malam, TODAY tetap tanggal lama
+// selamanya. Untuk apa pun yang perlu tanggal "sekarang" yang akurat
+// di tengah sesi (bukan cuma nilai awal/default), pakai fungsi ini,
+// bukan konstanta TODAY.
+function getTodayISO() {
+  return new Date().toISOString().slice(0, 10);
+}
+
 function daysAgoISO(days) {
   const d = new Date(TODAY);
   d.setDate(d.getDate() - days);
   return d.toISOString().slice(0, 10);
+}
+
+function buildWelcomeMessage() {
+  return {
+    id: "welcome",
+    role: "assistant",
+    text:
+      "Halo, saya Dolan Sawah AI.\n\n" +
+      "Kirim data operasional dalam bahasa biasa — stok awal, pembelian, barang datang, " +
+      "penjualan, stock opname, resep, waste, atau harga bahan — dan saya catat otomatis " +
+      "ke database untuk 3 outlet (Dolan Sawah, Sawah Senja, Soto Pagi).\n\n" +
+      "Saya juga bisa menjawab pertanyaan seperti \"apa saja yang perlu dibeli besok?\" atau " +
+      "\"item mana selisihnya paling besar minggu ini?\"."
+  };
 }
 
 const OUTLETS = [
@@ -736,6 +759,50 @@ function computeVarianceValue(item, priceHistory) {
   return unitPriceBase * item.variance;
 }
 
+// Bahan yang muncul di data pembelian tapi tidak pernah dipakai di
+// resep mana pun -- kemungkinan besar bahan itu dipakai oleh menu
+// yang resepnya belum lengkap. Perkiraan KASAR: total bahan yang
+// dibeli dibagi total porsi menu ini terjual, dengan asumsi SELURUH
+// pembelian bahan itu habis untuk menu ini. Kalau bahan yang sama
+// juga dipakai menu lain, angka ini akan lebih besar dari kebutuhan
+// sebenarnya -- makanya ditandai sebagai perkiraan, bukan kepastian.
+function estimateMissingIngredients(menuName, rawData) {
+  const usedIngredientNames = new Set();
+  rawData.recipes.forEach((r) => {
+    (r.ingredients || []).forEach((ing) => {
+      const key = normalizeText(ing.itemName);
+      if (key) usedIngredientNames.add(key);
+    });
+  });
+
+  const purchasedTotals = {};
+  rawData.purchases.forEach((p) => {
+    const key = normalizeText(p.itemName);
+    if (!key || usedIngredientNames.has(key)) return;
+    const converted = convertToBase(p.quantity, p.unit);
+    if (!purchasedTotals[key]) {
+      purchasedTotals[key] = { itemName: p.itemName, base: converted.base, qty: 0 };
+    }
+    if (purchasedTotals[key].base !== converted.base) return;
+    purchasedTotals[key].qty += converted.value;
+  });
+
+  const totalPortions = rawData.sales
+    .filter((s) => normalizeText(s.menuName) === normalizeText(menuName))
+    .reduce((sum, s) => sum + Number(s.quantity || 0), 0);
+
+  if (totalPortions <= 0) return [];
+
+  return Object.values(purchasedTotals)
+    .filter((x) => x.qty > 0)
+    .map((x) => ({
+      itemName: x.itemName,
+      unit: x.base,
+      estimatedQtyPerPortion: x.qty / totalPortions
+    }))
+    .sort((a, b) => b.estimatedQtyPerPortion - a.estimatedQtyPerPortion);
+}
+
 function computeAvgDailySales(sales, days = 7) {
   const cutoff = new Date();
   cutoff.setDate(cutoff.getDate() - days);
@@ -1213,19 +1280,8 @@ export default function App() {
   const [salesFilterStart, setSalesFilterStart] = useState(daysAgoISO(29));
   const [salesFilterEnd, setSalesFilterEnd] = useState(TODAY);
 
-  const [messages, setMessages] = useState([
-    {
-      id: "welcome",
-      role: "assistant",
-      text:
-        "Halo, saya Dolan Sawah AI.\n\n" +
-        "Kirim data operasional dalam bahasa biasa — stok awal, pembelian, barang datang, " +
-        "penjualan, stock opname, resep, waste, atau harga bahan — dan saya catat otomatis " +
-        "ke database untuk 3 outlet (Dolan Sawah, Sawah Senja, Soto Pagi).\n\n" +
-        "Saya juga bisa menjawab pertanyaan seperti \"apa saja yang perlu dibeli besok?\" atau " +
-        "\"item mana selisihnya paling besar minggu ini?\"."
-    }
-  ]);
+  const [messages, setMessages] = useState(() => [buildWelcomeMessage()]);
+  const [chatDate, setChatDate] = useState(TODAY);
 
   const [input, setInput] = useState("");
   const [loading, setLoading] = useState(false);
@@ -1334,6 +1390,33 @@ export default function App() {
       })
       .catch((error) => console.error("Gagal memuat chat hari ini:", error));
   }, [authUser]);
+
+  // Kalau tab tetap terbuka melewati tengah malam, mulai obrolan baru
+  // untuk tanggal baru secara otomatis -- chat tanggal lama tetap utuh
+  // di Firestore, bisa dibuka lagi lewat Riwayat Chat. Dicek tiap 30
+  // detik: cukup sering untuk terasa "otomatis", tanpa perlu penjadwalan
+  // presisi ke tengah malam (dan tetap benar walau laptop sempat tidur).
+  function rolloverChatDate(newDate) {
+    setChatDate(newDate);
+    loadChatByDate(newDate)
+      .then((history) => {
+        setMessages(history.length > 0 ? history.map((m) => ({ id: m.id, role: m.role, text: m.text, tags: m.tags })) : [buildWelcomeMessage()]);
+      })
+      .catch((error) => {
+        console.error("Gagal memuat chat untuk tanggal baru:", error);
+        setMessages([buildWelcomeMessage()]);
+      });
+  }
+
+  useEffect(() => {
+    if (!authUser) return;
+    const interval = setInterval(() => {
+      const now = getTodayISO();
+      if (now !== chatDate) rolloverChatDate(now);
+    }, 30000);
+    return () => clearInterval(interval);
+  }, [authUser, chatDate]);
+
 
   /* =======================================================
      PERHITUNGAN TURUNAN
@@ -1674,7 +1757,7 @@ export default function App() {
 
       const contextText = JSON.stringify({
         outlet: activeOutlet,
-        tanggal: TODAY,
+        tanggal: getTodayISO(),
         item_variance_terbesar: varianceReport.items
           .slice()
           .sort((a, b) => a.variance - b.variance)
@@ -1747,9 +1830,11 @@ export default function App() {
     const text = input.trim();
     if (!text || loading) return;
 
+    const sendDate = chatDate;
+
     setInput("");
     setMessages((prev) => [...prev, { id: `user-${Date.now()}`, role: "user", text }]);
-    persistChatMessage(TODAY, "user", text, []);
+    persistChatMessage(sendDate, "user", text, []);
     setLoading(true);
 
     try {
@@ -1758,7 +1843,7 @@ export default function App() {
         ...prev,
         { id: `assistant-${Date.now()}`, role: "assistant", text: response.text, tags: response.tags }
       ]);
-      persistChatMessage(TODAY, "assistant", response.text, response.tags || []);
+      persistChatMessage(sendDate, "assistant", response.text, response.tags || []);
     } catch (error) {
       console.error(error);
       const errorText = `Terjadi kesalahan saat memproses data.\n\nDetail: ${error?.message || "Unknown error"}`;
@@ -1771,7 +1856,7 @@ export default function App() {
           tags: ["ERROR"]
         }
       ]);
-      persistChatMessage(TODAY, "assistant", errorText, ["ERROR"]);
+      persistChatMessage(sendDate, "assistant", errorText, ["ERROR"]);
     } finally {
       setLoading(false);
     }
@@ -1878,6 +1963,17 @@ export default function App() {
     setEditIngredients((prev) => [...prev, { itemName: "", quantity: "", unit: "gram" }]);
   }
 
+  function addSuggestedIngredient(suggestion) {
+    setEditIngredients((prev) => [
+      ...prev,
+      {
+        itemName: suggestion.itemName,
+        quantity: Math.round(suggestion.estimatedQtyPerPortion * 100) / 100,
+        unit: suggestion.unit
+      }
+    ]);
+  }
+
   function removeEditIngredientRow(index) {
     setEditIngredients((prev) => prev.filter((_, i) => i !== index));
   }
@@ -1957,7 +2053,7 @@ export default function App() {
     const trendDays = 14;
     const trendDates = [];
     {
-      const cursor = new Date(`${TODAY}T00:00:00Z`);
+      const cursor = new Date(`${getTodayISO()}T00:00:00Z`);
       cursor.setUTCDate(cursor.getUTCDate() - (trendDays - 1));
       for (let i = 0; i < trendDays; i++) {
         trendDates.push(cursor.toISOString().slice(0, 10));
@@ -2313,6 +2409,41 @@ export default function App() {
               + Tambah bahan
             </button>
 
+            {(() => {
+              const addedNames = new Set(editIngredients.map((ing) => normalizeText(ing.itemName)));
+              const suggestions = estimateMissingIngredients(editingRecipe.menuName, rawData).filter(
+                (s) => !addedNames.has(normalizeText(s.itemName))
+              );
+              if (!suggestions.length) return null;
+              return (
+                <div style={{ background: "var(--orange-050)", border: "1px solid var(--orange-100)", borderRadius: 10, padding: 12, marginBottom: 16 }}>
+                  <div style={{ fontSize: 13, fontWeight: 600, color: "var(--orange-600)", marginBottom: 4 }}>
+                    Kemungkinan bahan yang belum tercatat
+                  </div>
+                  <p style={{ fontSize: 12, color: "var(--ink-soft)", margin: "0 0 10px" }}>
+                    Bahan-bahan ini dibeli tapi belum dipakai di resep manapun. Perkiraan jumlah/porsi dihitung dari
+                    total pembelian dibagi total penjualan menu ini — <strong>perkiraan kasar</strong>, asumsi seluruh
+                    pembelian bahan itu habis untuk menu ini saja. Periksa dan sesuaikan sebelum disimpan.
+                  </p>
+                  <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+                    {suggestions.slice(0, 8).map((s) => (
+                      <div key={s.itemName} style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
+                        <span style={{ fontSize: 13 }}>
+                          <strong>{s.itemName}</strong> — sekitar {displayQuantity(s.estimatedQtyPerPortion, s.unit)} / porsi
+                        </span>
+                        <button
+                          onClick={() => addSuggestedIngredient(s)}
+                          style={{ marginLeft: "auto", padding: "4px 10px", borderRadius: 6, border: "1px solid var(--orange-500)", background: "transparent", color: "var(--orange-600)", cursor: "pointer", fontSize: 12 }}
+                        >
+                          + Tambahkan
+                        </button>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              );
+            })()}
+
             {editError && <div style={{ color: "#c0392b", fontSize: 13, marginBottom: 10 }}>{editError}</div>}
 
             <div className="form-footer">
@@ -2465,8 +2596,11 @@ export default function App() {
     ];
 
     function setPresetRange(days) {
-      setReportEnd(TODAY);
-      setReportStart(daysAgoISO(days - 1));
+      const today = getTodayISO();
+      setReportEnd(today);
+      const cursor = new Date(`${today}T00:00:00Z`);
+      cursor.setUTCDate(cursor.getUTCDate() - (days - 1));
+      setReportStart(cursor.toISOString().slice(0, 10));
     }
 
     return (
