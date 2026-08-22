@@ -171,6 +171,30 @@ export function calculateTheoreticalStock(
   }
 
   // ----------------------------------------------------------
+  // PEMBELIAN TANPA BARANG DATANG -- kalau sebuah pembelian belum
+  // punya laporan "barang datang" yang mencocokkannya (purchaseId),
+  // anggap barang diterima persis sesuai jumlah pesanan. Laporan
+  // barang datang hanya diperlukan untuk mengoreksi selisih; tanpa
+  // laporan itu, jumlah pesanan langsung dihitung sebagai pemasukan
+  // stok supaya pembelian tidak "hilang" dari stok teoritis.
+  // ----------------------------------------------------------
+
+  const resolvedPurchaseIds = new Set(
+    data.receiving
+      .map((r) => r.purchaseId)
+      .filter((id) => id)
+  );
+
+  for (const purchase of data.purchases) {
+    if (resolvedPurchaseIds.has(purchase.id)) continue;
+    const key = purchase.itemId || purchase.itemName;
+    ensure(key, purchase);
+    if (withinPeriod(key, purchase.date)) {
+      result[key].receiving += Number(purchase.quantity || 0);
+    }
+  }
+
+  // ----------------------------------------------------------
   // WASTE
   // ----------------------------------------------------------
 

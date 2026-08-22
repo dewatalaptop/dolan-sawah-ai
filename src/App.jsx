@@ -796,6 +796,7 @@ function checkUnstockedIngredients(rawData) {
   const stockedNames = new Set();
   (rawData.openingStock || []).forEach((r) => stockedNames.add(normalizeText(r.itemName)));
   (rawData.receiving || []).forEach((r) => stockedNames.add(normalizeText(r.itemName)));
+  (rawData.purchases || []).forEach((r) => stockedNames.add(normalizeText(r.itemName)));
 
   const seen = new Set();
   const issues = [];
@@ -1307,8 +1308,9 @@ export default function App() {
       await refreshData();
       return {
         text:
-          `PEMBELIAN (${outlet}) tersimpan — barang ini akan dicocokkan otomatis saat Anda kirim ` +
-          `data "barang datang".\n\nTanggal: ${formatDateID(date)}${supplier ? `\nSupplier: ${supplier}` : ""}\n\n` +
+          `PEMBELIAN (${outlet}) tersimpan — jumlah ini otomatis dianggap sudah diterima sesuai pesanan ` +
+          `dan langsung masuk stok. Kirim "barang datang" HANYA kalau jumlah yang diterima berbeda dari pesanan.` +
+          `\n\nTanggal: ${formatDateID(date)}${supplier ? `\nSupplier: ${supplier}` : ""}\n\n` +
           items.map((x) => `- ${x.itemName}: ${formatNumber(x.quantity)} ${x.unit}`).join("\n"),
         tags: ["PEMBELIAN", "TERSIMPAN"]
       };
@@ -1341,6 +1343,7 @@ export default function App() {
           createReceiving({
             date,
             outlet,
+            purchaseId: matched?.id || "",
             supplier: matched?.supplier || "",
             itemName: item.itemName,
             orderedQuantity,
@@ -1852,7 +1855,7 @@ export default function App() {
   function renderBarangDatang() {
     return (
       <div className="page">
-        <div className="section-header"><div><h1>Barang Datang</h1><p>Dicocokkan otomatis dengan data pembelian terakhir untuk barang yang sama.</p></div></div>
+        <div className="section-header"><div><h1>Barang Datang</h1><p>Opsional — hanya perlu diisi kalau jumlah yang diterima berbeda dari pesanan. Tanpa laporan ini, pembelian otomatis dianggap sesuai dan sudah masuk stok.</p></div></div>
         <DataTable
           columns={["Tanggal", "Outlet", "Barang", "Dipesan", "Diterima", "Selisih"]}
           rows={filteredData.receiving
@@ -1941,7 +1944,7 @@ export default function App() {
     return (
       <div className="page">
         <div className="section-header">
-          <div><h1>Variance & Waste</h1><p>Stok teoritis (stok awal + barang datang − pemakaian resep − waste + penyesuaian) dibanding stock opname aktual.</p></div>
+          <div><h1>Variance & Waste</h1><p>Stok teoritis (stok awal + pembelian/barang datang − pemakaian resep − waste + penyesuaian) dibanding stock opname aktual.</p></div>
         </div>
         <DataTable
           columns={["Bahan", "Teoritis", "Aktual", "Selisih", "Status"]}
