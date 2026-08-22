@@ -804,11 +804,23 @@ function estimateMissingIngredients(menuName, rawData) {
 }
 
 function computeAvgDailySales(sales, days = 7) {
-  const cutoff = new Date();
-  cutoff.setDate(cutoff.getDate() - days);
+  const dates = sales.map((s) => String(s.date || "")).filter(Boolean);
+  if (dates.length === 0) return {};
+
+  // Anchor on the latest date actually present in the data (not the real
+  // wall-clock date) so the window stays correct once "today" moves past
+  // the last recorded sale -- otherwise it would silently start averaging
+  // in phantom zero-sales days instead of the days that actually happened.
+  const anchorStr = dates.reduce((max, d) => (d > max ? d : max));
+  const anchor = new Date(`${anchorStr}T00:00:00Z`);
+  const cutoff = new Date(anchor);
+  cutoff.setUTCDate(cutoff.getUTCDate() - (days - 1));
   const cutoffStr = cutoff.toISOString().slice(0, 10);
 
-  const recent = sales.filter((s) => String(s.date || "") >= cutoffStr);
+  const recent = sales.filter((s) => {
+    const d = String(s.date || "");
+    return d >= cutoffStr && d <= anchorStr;
+  });
   const totals = {};
 
   for (const row of recent) {
@@ -823,6 +835,93 @@ function computeAvgDailySales(sales, days = 7) {
   });
 
   return avg;
+}
+
+function computeDailySalesStats(sales, recipes) {
+  const byDate = {};
+  for (const s of sales) {
+    const d = String(s.date || "");
+    if (!d) continue;
+    byDate[d] = byDate[d] || [];
+    byDate[d].push(s);
+  }
+  const dates = Object.keys(byDate).sort();
+
+  if (dates.length === 0) {
+    return {
+      dariTanggal: null,
+      sampaiTanggal: null,
+      jumlahHari: 0,
+      rataRataPorsiPerHari: 0,
+      rataRataOmzetPerHari: 0,
+      hariKerja: { jumlahHari: 0, porsi: 0, omzet: 0 },
+      akhirPekan: { jumlahHari: 0, porsi: 0, omzet: 0 },
+      perBulan: {}
+    };
+  }
+
+  const isWeekendDate = (d) => {
+    const day = new Date(`${d}T00:00:00Z`).getUTCDay();
+    return day === 0 || day === 6;
+  };
+
+  let totalPortions = 0;
+  let totalOmzet = 0;
+  let weekdayPortions = 0;
+  let weekdayOmzet = 0;
+  let weekdayCount = 0;
+  let weekendPortions = 0;
+  let weekendOmzet = 0;
+  let weekendCount = 0;
+  const perBulan = {};
+
+  for (const d of dates) {
+    const daySales = byDate[d];
+    const dayPortions = daySales.reduce((sum, s) => sum + Number(s.quantity || 0), 0);
+    const dayOmzet = computeRevenue(daySales, recipes);
+    totalPortions += dayPortions;
+    totalOmzet += dayOmzet;
+
+    if (isWeekendDate(d)) {
+      weekendPortions += dayPortions;
+      weekendOmzet += dayOmzet;
+      weekendCount++;
+    } else {
+      weekdayPortions += dayPortions;
+      weekdayOmzet += dayOmzet;
+      weekdayCount++;
+    }
+
+    const bulan = d.slice(0, 7);
+    perBulan[bulan] = perBulan[bulan] || { hari: 0, porsi: 0, omzet: 0 };
+    perBulan[bulan].hari++;
+    perBulan[bulan].porsi += dayPortions;
+    perBulan[bulan].omzet += dayOmzet;
+  }
+
+  Object.values(perBulan).forEach((b) => {
+    b.porsi = Math.round(b.porsi);
+    b.omzet = Math.round(b.omzet);
+  });
+
+  return {
+    dariTanggal: dates[0],
+    sampaiTanggal: dates[dates.length - 1],
+    jumlahHari: dates.length,
+    rataRataPorsiPerHari: Math.round(totalPortions / dates.length),
+    rataRataOmzetPerHari: Math.round(totalOmzet / dates.length),
+    hariKerja: {
+      jumlahHari: weekdayCount,
+      porsi: weekdayCount ? Math.round(weekdayPortions / weekdayCount) : 0,
+      omzet: weekdayCount ? Math.round(weekdayOmzet / weekdayCount) : 0
+    },
+    akhirPekan: {
+      jumlahHari: weekendCount,
+      porsi: weekendCount ? Math.round(weekendPortions / weekendCount) : 0,
+      omzet: weekendCount ? Math.round(weekendOmzet / weekendCount) : 0
+    },
+    perBulan
+  };
 }
 
 function buildPurchaseSuggestions(ingredientForecast, theoreticalStock) {
@@ -1054,8 +1153,18 @@ function buildLocalReport(question, ctx) {
       );
     }
 
+    const totalPerHari7Hari = allEntries.reduce((sum, [, avg]) => sum + avg, 0);
+    const overall = ctx.dailyStats;
+    const overallLine =
+      overall && overall.jumlahHari > 0
+        ? `TOTAL GABUNGAN SEMUA MENU: ${formatNumber(totalPerHari7Hari, 1)} porsi/hari (rata-rata 7 hari terakhir) ` +
+          `-- rata-rata seluruh periode data (${overall.dariTanggal} s/d ${overall.sampaiTanggal}, ${overall.jumlahHari} hari): ` +
+          `${formatNumber(overall.rataRataPorsiPerHari, 0)} porsi/hari.\n\n`
+        : `TOTAL GABUNGAN SEMUA MENU: ${formatNumber(totalPerHari7Hari, 1)} porsi/hari (rata-rata 7 hari terakhir).\n\n`;
+
     return (
-      "RATA-RATA PENJUALAN HARIAN (7 hari terakhir):\n\n" +
+      overallLine +
+      "RATA-RATA PENJUALAN HARIAN PER MENU (7 hari terakhir):\n\n" +
       entries.map(([menu, avg]) => `- ${menu}: ${formatNumber(avg, 1)} porsi/hari`).join("\n")
     );
   }
@@ -1726,12 +1835,15 @@ export default function App() {
     }
 
     if (dataType === "report") {
+      const dailyStats = computeDailySalesStats(filteredData.sales, rawData.recipes);
+
       const ctx = {
         varianceReport,
         purchaseSuggestions,
         avgDailySales,
         priceHistory,
-        receivingIssues
+        receivingIssues,
+        dailyStats
       };
 
       const omzetRataRataPerMenu = Object.fromEntries(
@@ -1755,9 +1867,49 @@ export default function App() {
           };
         });
 
+      // Total gabungan (semua menu dijumlahkan) untuk jendela 7 hari terakhir --
+      // dihitung di sini, bukan diserahkan ke AI untuk menjumlahkan sendiri
+      // angka per-menu, karena model kecil sering salah hitung penjumlahan.
+      const totalPorsi7HariTerakhir = Object.values(avgDailySales).reduce((a, b) => a + b, 0);
+      const totalOmzet7HariTerakhir = Object.values(omzetRataRataPerMenu).reduce((a, b) => a + b, 0);
+
+      const outletBreakdown = OUTLETS.filter((o) => o.id !== "ALL").map((o) => {
+        const outletSales = rawData.sales.filter((s) => (s.outlet || "DS") === o.id);
+        const stats = computeDailySalesStats(outletSales, rawData.recipes);
+        return {
+          outlet: o.id,
+          nama: o.label,
+          total_porsi: outletSales.reduce((sum, s) => sum + Number(s.quantity || 0), 0),
+          total_omzet: Math.round(computeRevenue(outletSales, rawData.recipes)),
+          rata_rata_porsi_per_hari: stats.rataRataPorsiPerHari,
+          rata_rata_omzet_per_hari: stats.rataRataOmzetPerHari
+        };
+      });
+
       const contextText = JSON.stringify({
-        outlet: activeOutlet,
-        tanggal: getTodayISO(),
+        outlet_terpilih: activeOutlet,
+        tanggal_sistem: getTodayISO(),
+        catatan_penting:
+          "Untuk pertanyaan 'rata-rata penjualan per hari' TANPA sebutan menu tertentu, " +
+          "JAWAB LANGSUNG memakai field rata_rata_harian_seluruh_periode (total gabungan semua menu) " +
+          "-- JANGAN menjumlahkan sendiri angka per-menu. Field rata_rata_penjualan_harian_per_menu " +
+          "hanya dipakai kalau pengguna tanya spesifik per-menu. Selalu sebutkan periode/tanggal data " +
+          "yang dipakai (field dari/sampai) agar jelas rentang waktunya.",
+        rata_rata_harian_seluruh_periode: {
+          dari: dailyStats.dariTanggal,
+          sampai: dailyStats.sampaiTanggal,
+          jumlah_hari: dailyStats.jumlahHari,
+          rata_rata_porsi_per_hari: dailyStats.rataRataPorsiPerHari,
+          rata_rata_omzet_per_hari: dailyStats.rataRataOmzetPerHari,
+          rata_rata_hari_kerja: dailyStats.hariKerja,
+          rata_rata_akhir_pekan: dailyStats.akhirPekan
+        },
+        rata_rata_harian_7_hari_terakhir: {
+          total_porsi_per_hari: Math.round(totalPorsi7HariTerakhir),
+          total_omzet_per_hari: Math.round(totalOmzet7HariTerakhir)
+        },
+        omzet_dan_porsi_per_bulan: dailyStats.perBulan,
+        omzet_per_outlet: outletBreakdown,
         item_variance_terbesar: varianceReport.items
           .slice()
           .sort((a, b) => a.variance - b.variance)
@@ -1776,7 +1928,7 @@ export default function App() {
           saran_beli: Math.round(x.suggestedPurchase),
           satuan: x.base
         })),
-        rata_rata_penjualan_harian: avgDailySales,
+        rata_rata_penjualan_harian_per_menu: avgDailySales,
         omzet_rata_rata_harian_per_menu: omzetRataRataPerMenu,
         total_omzet_tercatat: Math.round(computeRevenue(filteredData.sales, rawData.recipes)),
         margin_per_menu: marginPerMenu,
