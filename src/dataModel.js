@@ -76,6 +76,9 @@ export function createRecipe(data = {}) {
     portions:
       Number(data.portions || 1),
 
+    sellPrice:
+      Number(data.sellPrice || 0),
+
     createdAt:
       data.createdAt ||
       new Date().toISOString(),

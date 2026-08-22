@@ -86,6 +86,16 @@ function datesInRange(startDate, endDate) {
   return dates;
 }
 
+function findMenuPrice(menuName, recipes) {
+  const key = String(menuName || "").trim().toLowerCase();
+  const recipe = (recipes || []).find((r) => String(r.menuName || "").trim().toLowerCase() === key);
+  return recipe ? Number(recipe.sellPrice || 0) : 0;
+}
+
+function computeRevenue(sales, recipes) {
+  return sales.reduce((sum, s) => sum + Number(s.quantity || 0) * findMenuPrice(s.menuName, recipes), 0);
+}
+
 function varianceStatus(item) {
   if (item.actual === null || item.actual === undefined) return "BELUM DI-OPNAME";
   const v = Number(item.variance || 0);
@@ -105,6 +115,7 @@ export function buildReportWorkbook({
   outlet,
   dataQualityIssues,
   purchaseSuggestions,
+  recipes,
   generatedAt
 }) {
   const periodData = filterDataByDateRange(rawData, startDate, endDate);
@@ -117,7 +128,9 @@ export function buildReportWorkbook({
   // ----------------------------------------------------------
 
   const totalSalesQty = periodData.sales.reduce((s, r) => s + Number(r.quantity || 0), 0);
+  const totalRevenue = computeRevenue(periodData.sales, recipes);
   const totalPurchaseValue = periodData.purchases.reduce((s, r) => s + Number(r.total || 0), 0);
+  const hasAnyPrice = (recipes || []).some((r) => Number(r.sellPrice || 0) > 0);
   const criticalItems = theoreticalStock
     .filter((i) => i.actual !== null && Number(i.variance || 0) < -0.0001)
     .sort((a, b) => a.variance - b.variance);
@@ -130,6 +143,7 @@ export function buildReportWorkbook({
     ["Dibuat pada", generatedAt],
     [],
     ["RINGKASAN PERIODE"],
+    ["Total omzet (Rp)", hasAnyPrice ? round2(totalRevenue) : "belum ada harga jual resep"],
     ["Total penjualan (porsi)", round2(totalSalesQty)],
     ["Total nilai pembelian (Rp)", round2(totalPurchaseValue)],
     ["Jumlah transaksi penjualan", periodData.sales.length],
@@ -240,6 +254,7 @@ export function buildReportWorkbook({
       total += qty;
     });
     row["Total Porsi"] = round2(total);
+    row["Omzet (Rp)"] = round2(computeRevenue(dayRows, recipes));
     row["Jumlah Menu Terjual"] = new Set(dayRows.map((r) => r.menuName)).size;
     return row;
   });
@@ -248,7 +263,7 @@ export function buildReportWorkbook({
     sheetFromRows(
       dailyRows.length
         ? dailyRows
-        : [{ Tanggal: "-", Hari: "", "Total Porsi": "", "Jumlah Menu Terjual": "" }]
+        : [{ Tanggal: "-", Hari: "", "Total Porsi": "", "Omzet (Rp)": "", "Jumlah Menu Terjual": "" }]
     ),
     "Performa Harian"
   );
@@ -261,14 +276,19 @@ export function buildReportWorkbook({
   const salesRows = periodData.sales
     .slice()
     .sort((a, b) => (a.date < b.date ? -1 : a.date > b.date ? 1 : a.outlet < b.outlet ? -1 : 1))
-    .map((r) => ({
-      Tanggal: r.date,
-      Hari: dayName(r.date),
-      Outlet: r.outlet,
-      Menu: r.menuName,
-      Qty: round2(r.quantity)
-    }));
-  XLSX.utils.book_append_sheet(workbook, sheetFromRows(salesRows.length ? salesRows : [{ Tanggal: "-", Hari: "", Outlet: "", Menu: "Tidak ada data di periode ini", Qty: "" }]), "Penjualan");
+    .map((r) => {
+      const price = findMenuPrice(r.menuName, recipes);
+      return {
+        Tanggal: r.date,
+        Hari: dayName(r.date),
+        Outlet: r.outlet,
+        Menu: r.menuName,
+        Qty: round2(r.quantity),
+        "Harga Jual": price > 0 ? price : "",
+        "Total (Rp)": price > 0 ? round2(r.quantity * price) : ""
+      };
+    });
+  XLSX.utils.book_append_sheet(workbook, sheetFromRows(salesRows.length ? salesRows : [{ Tanggal: "-", Hari: "", Outlet: "", Menu: "Tidak ada data di periode ini", Qty: "", "Harga Jual": "", "Total (Rp)": "" }]), "Penjualan");
 
   // ----------------------------------------------------------
   // SHEET 7: PEMBELIAN

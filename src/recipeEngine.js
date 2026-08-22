@@ -125,6 +125,7 @@ export async function updateRecipe(id, data) {
     menuName: data.menuName,
     ingredients: data.ingredients,
     portions: Number(data.portions || 1),
+    sellPrice: Number(data.sellPrice || 0),
     updatedAt: new Date().toISOString()
   };
 

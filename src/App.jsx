@@ -29,7 +29,7 @@ import {
 
 import { saveRecipe, updateRecipe, deleteRecipe, calculateUsageFromSales } from "./recipeEngine";
 
-import { getPriceHistory, savePrice } from "./priceEngine";
+import { getPriceHistory, savePrice, getCurrentPrice } from "./priceEngine";
 
 import { processExcelFile } from "./excelEngine";
 
@@ -686,6 +686,56 @@ function filterDataByOutlet(data, outlet) {
   };
 }
 
+/* =========================================================
+   OMZET & MARGIN
+   Harga jual disimpan per resep (recipe.sellPrice). Harga bahan
+   diambil dari price_history (harga bahan terakhir yang berlaku
+   pada tanggal transaksi) -- bukan dari master_items yang memang
+   tidak pernah diisi aplikasi ini.
+   ========================================================= */
+
+function findRecipeByMenu(menuName, recipes) {
+  const key = normalizeText(menuName);
+  return recipes.find((r) => normalizeText(r.menuName) === key) || null;
+}
+
+function computeRevenue(sales, recipes) {
+  return sales.reduce((sum, s) => {
+    const recipe = findRecipeByMenu(s.menuName, recipes);
+    const price = recipe ? Number(recipe.sellPrice || 0) : 0;
+    return sum + price * Number(s.quantity || 0);
+  }, 0);
+}
+
+function computeRecipeCost(recipe, priceHistory, date = TODAY) {
+  const lines = (recipe.ingredients || []).map((ing) => {
+    const priceEntry = getCurrentPrice(ing.itemName, priceHistory, date);
+    const unitPrice = priceEntry ? Number(priceEntry.price || 0) : null;
+    const converted = convertToBase(ing.quantity, ing.unit);
+    const priceConverted = priceEntry ? convertToBase(1, priceEntry.unit) : null;
+    // harga per satuan dasar (mis. Rp/gram) supaya konsisten dengan qty resep yang juga dikonversi ke satuan dasar
+    const unitPriceBase = unitPrice !== null && priceConverted ? unitPrice / priceConverted.value : null;
+    const cost = unitPriceBase !== null ? unitPriceBase * converted.value : null;
+    return { ...ing, unitPrice, cost };
+  });
+  const known = lines.filter((l) => l.cost !== null);
+  const totalCost = known.reduce((s, l) => s + l.cost, 0);
+  return {
+    lines,
+    totalCost,
+    complete: lines.length > 0 && known.length === lines.length
+  };
+}
+
+function computeVarianceValue(item, priceHistory) {
+  const priceEntry = getCurrentPrice(item.itemName, priceHistory);
+  if (!priceEntry) return null;
+  const priceConverted = convertToBase(1, priceEntry.unit);
+  if (priceConverted.base !== item.unit) return null;
+  const unitPriceBase = Number(priceEntry.price || 0) / priceConverted.value;
+  return unitPriceBase * item.variance;
+}
+
 function computeAvgDailySales(sales, days = 7) {
   const cutoff = new Date();
   cutoff.setDate(cutoff.getDate() - days);
@@ -1160,6 +1210,9 @@ export default function App() {
   const [reportOutlet, setReportOutlet] = useState("ALL");
   const [reportBusy, setReportBusy] = useState(false);
 
+  const [salesFilterStart, setSalesFilterStart] = useState(daysAgoISO(29));
+  const [salesFilterEnd, setSalesFilterEnd] = useState(TODAY);
+
   const [messages, setMessages] = useState([
     {
       id: "welcome",
@@ -1192,6 +1245,7 @@ export default function App() {
   const [editingRecipeId, setEditingRecipeId] = useState(null);
   const [editMenuName, setEditMenuName] = useState("");
   const [editIngredients, setEditIngredients] = useState([]);
+  const [editSellPrice, setEditSellPrice] = useState("");
   const [editBusy, setEditBusy] = useState(false);
   const [editError, setEditError] = useState("");
   const [deleteConfirmId, setDeleteConfirmId] = useState(null);
@@ -1782,6 +1836,7 @@ export default function App() {
         unit: ing.unit || "gram"
       }))
     );
+    setEditSellPrice(recipe.sellPrice ? String(recipe.sellPrice) : "");
   }
 
   function cancelEditRecipe() {
@@ -1828,7 +1883,8 @@ export default function App() {
     try {
       await updateRecipe(editingRecipeId, {
         menuName: editMenuName.trim(),
-        ingredients: cleanedIngredients
+        ingredients: cleanedIngredients,
+        sellPrice: Number(editSellPrice) || 0
       });
       setEditingRecipeId(null);
       await refreshData();
@@ -1861,6 +1917,34 @@ export default function App() {
   function renderDashboard() {
     const totalSalesPortions = filteredData.sales.reduce((s, r) => s + Number(r.quantity || 0), 0);
     const criticalCount = varianceReport.items.filter((x) => x.variance < 0).length;
+    const totalRevenue = computeRevenue(filteredData.sales, rawData.recipes);
+    const hasAnyPrice = rawData.recipes.some((r) => Number(r.sellPrice || 0) > 0);
+
+    const outletBreakdown = OUTLETS.filter((o) => o.id !== "ALL").map((o) => {
+      const outletSales = rawData.sales.filter((s) => (s.outlet || "DS") === o.id);
+      return {
+        outlet: o.id,
+        label: o.label,
+        portions: outletSales.reduce((s, r) => s + Number(r.quantity || 0), 0),
+        revenue: computeRevenue(outletSales, rawData.recipes)
+      };
+    });
+
+    const trendDays = 14;
+    const trendDates = [];
+    {
+      const cursor = new Date(`${TODAY}T00:00:00Z`);
+      cursor.setUTCDate(cursor.getUTCDate() - (trendDays - 1));
+      for (let i = 0; i < trendDays; i++) {
+        trendDates.push(cursor.toISOString().slice(0, 10));
+        cursor.setUTCDate(cursor.getUTCDate() + 1);
+      }
+    }
+    const trend = trendDates.map((d) => {
+      const daySales = filteredData.sales.filter((s) => s.date === d);
+      return { date: d, revenue: computeRevenue(daySales, rawData.recipes) };
+    });
+    const maxTrendRevenue = Math.max(1, ...trend.map((t) => t.revenue));
 
     return (
       <div className="page">
@@ -1872,11 +1956,52 @@ export default function App() {
         </div>
 
         <div className="stat-grid">
-          <StatCard title="Penjualan" value={formatNumber(totalSalesPortions)} subtitle="total porsi tercatat" icon="coin" tone="orange" />
+          <StatCard title="Omzet" value={`Rp ${formatNumber(totalRevenue)}`} subtitle="total tercatat" icon="coin" tone="orange" />
+          <StatCard title="Penjualan" value={formatNumber(totalSalesPortions)} subtitle="total porsi tercatat" icon="cart" tone="green" />
           <StatCard title="Pembelian" value={rawData.purchases.length} subtitle="record" icon="cart" tone="green" />
-          <StatCard title="Barang Datang" value={rawData.receiving.length} subtitle="record" icon="truck" tone="green" />
           <StatCard title="Item Bervariance" value={criticalCount} subtitle="perlu ditinjau" icon="trend" tone={criticalCount > 0 ? "orange" : "green"} />
         </div>
+
+        {!hasAnyPrice && (
+          <div className="logic-card">
+            <div className="logic-icon"><Icon name="leaf" size={20} /></div>
+            <div>
+              Omzet menampilkan Rp 0 karena belum ada resep dengan <strong>harga jual</strong> terisi. Buka halaman{" "}
+              <strong>Resep</strong>, klik <strong>Edit</strong> pada tiap menu, lalu isi harga jual per porsi.
+            </div>
+          </div>
+        )}
+
+        <div className="card">
+          <div className="card-title">Tren omzet 14 hari terakhir</div>
+          <div className="card-description">Berdasarkan tanggal transaksi penjualan, outlet: {OUTLETS.find((o) => o.id === activeOutlet)?.label}.</div>
+          <div style={{ display: "flex", alignItems: "flex-end", gap: 4, height: 120, marginTop: 14 }}>
+            {trend.map((t) => {
+              const heightPct = Math.max((t.revenue / maxTrendRevenue) * 100, 2);
+              return (
+                <div key={t.date} title={`${formatDateID(t.date)}: Rp ${formatNumber(t.revenue)}`} style={{ flex: 1, display: "flex", flexDirection: "column", alignItems: "center", gap: 4, minWidth: 0 }}>
+                  <div style={{ width: "100%", height: 90, display: "flex", alignItems: "flex-end" }}>
+                    <div style={{ width: "100%", height: `${heightPct}%`, background: "var(--green-500)", borderRadius: "4px 4px 0 0", minHeight: 2 }} />
+                  </div>
+                  <span style={{ fontSize: 9, color: "var(--ink-faint)" }}>{t.date.slice(8, 10)}/{t.date.slice(5, 7)}</span>
+                </div>
+              );
+            })}
+          </div>
+        </div>
+
+        {activeOutlet === "ALL" && (
+          <div className="card">
+            <div className="card-title">Performa per outlet</div>
+            <DataTable
+              columns={["Outlet", "Porsi Terjual", "Omzet"]}
+              rows={outletBreakdown
+                .slice()
+                .sort((a, b) => b.revenue - a.revenue)
+                .map((o) => [o.label, formatNumber(o.portions), `Rp ${formatNumber(o.revenue)}`])}
+            />
+          </div>
+        )}
 
         <div className="card">
           <div className="card-title">Saran pembelian teratas</div>
@@ -1943,16 +2068,57 @@ export default function App() {
   }
 
   function renderPenjualan() {
+    const periodSales = filteredData.sales.filter(
+      (s) => (!salesFilterStart || s.date >= salesFilterStart) && (!salesFilterEnd || s.date <= salesFilterEnd)
+    );
+    const periodPortions = periodSales.reduce((s, r) => s + Number(r.quantity || 0), 0);
+    const periodRevenue = computeRevenue(periodSales, rawData.recipes);
+
     return (
       <div className="page">
         <div className="section-header"><div><h1>Penjualan</h1><p>Data penjualan yang masuk melalui chat atau import.</p></div></div>
-        <DataTable
-          columns={["Tanggal", "Outlet", "Menu", "Jumlah"]}
-          rows={filteredData.sales
-            .slice()
-            .sort((a, b) => (a.date < b.date ? 1 : -1))
-            .map((x) => [formatDateID(x.date), x.outlet, x.menuName, `${formatNumber(x.quantity)} porsi`])}
-        />
+
+        <div className="card">
+          <div style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap", marginBottom: 12 }}>
+            <span style={{ fontSize: 13, color: "var(--ink-soft)" }}>Dari</span>
+            <input
+              type="date"
+              value={salesFilterStart}
+              max={salesFilterEnd || undefined}
+              onChange={(e) => setSalesFilterStart(e.target.value)}
+              style={{ padding: "6px 8px", borderRadius: 6, border: "1px solid var(--border)" }}
+            />
+            <span style={{ fontSize: 13, color: "var(--ink-soft)" }}>s/d</span>
+            <input
+              type="date"
+              value={salesFilterEnd}
+              min={salesFilterStart || undefined}
+              onChange={(e) => setSalesFilterEnd(e.target.value)}
+              style={{ padding: "6px 8px", borderRadius: 6, border: "1px solid var(--border)" }}
+            />
+            <span style={{ marginLeft: "auto", fontSize: 13, color: "var(--ink-soft)" }}>
+              {formatNumber(periodPortions)} porsi · <strong style={{ color: "var(--ink)" }}>Rp {formatNumber(periodRevenue)}</strong>
+            </span>
+          </div>
+
+          <DataTable
+            columns={["Tanggal", "Outlet", "Menu", "Jumlah", "Total"]}
+            rows={periodSales
+              .slice()
+              .sort((a, b) => (a.date < b.date ? 1 : -1))
+              .map((x) => {
+                const recipe = findRecipeByMenu(x.menuName, rawData.recipes);
+                const price = recipe ? Number(recipe.sellPrice || 0) : 0;
+                return [
+                  formatDateID(x.date),
+                  x.outlet,
+                  x.menuName,
+                  `${formatNumber(x.quantity)} porsi`,
+                  price > 0 ? `Rp ${formatNumber(x.quantity * price)}` : "-"
+                ];
+              })}
+          />
+        </div>
       </div>
     );
   }
@@ -2013,14 +2179,18 @@ export default function App() {
           <div><h1>Variance & Waste</h1><p>Stok teoritis (stok awal + pembelian/barang datang − pemakaian resep − waste + penyesuaian) dibanding stock opname aktual.</p></div>
         </div>
         <DataTable
-          columns={["Bahan", "Teoritis", "Aktual", "Selisih", "Status"]}
+          columns={["Bahan", "Teoritis", "Aktual", "Selisih", "Nilai Selisih", "Status"]}
           rows={items.map((x) => {
             const ratio = x.theoretical > 0 ? x.actual / x.theoretical : x.actual >= 0 ? 1 : 0;
+            const value = computeVarianceValue(x, priceHistory);
             return [
               x.itemName,
               displayQuantity(x.theoretical, x.unit),
               displayQuantity(x.actual, x.unit),
               displayQuantity(x.variance, x.unit),
+              value !== null
+                ? <span style={{ color: value < 0 ? "#c6392e" : "#1f7a4c", fontWeight: 600 }}>Rp {formatNumber(value)}</span>
+                : <span style={{ color: "#999" }}>harga bahan belum ada</span>,
               <div key="h" style={{ minWidth: 90 }}><HealthBar ratio={ratio} /></div>
             ];
           })}
@@ -2058,14 +2228,26 @@ export default function App() {
         {editingRecipe && (
           <div className="card">
             <div className="card-title">Edit resep: {editingRecipe.menuName}</div>
-            <div style={{ marginBottom: 12 }}>
-              <label style={{ display: "block", fontSize: 13, color: "#666", marginBottom: 4 }}>Nama menu</label>
-              <input
-                type="text"
-                value={editMenuName}
-                onChange={(e) => setEditMenuName(e.target.value)}
-                style={{ width: "100%", maxWidth: 320, padding: "8px 10px", borderRadius: 8, border: "1px solid #ddd", boxSizing: "border-box" }}
-              />
+            <div style={{ display: "flex", gap: 16, flexWrap: "wrap", marginBottom: 12 }}>
+              <div>
+                <label style={{ display: "block", fontSize: 13, color: "#666", marginBottom: 4 }}>Nama menu</label>
+                <input
+                  type="text"
+                  value={editMenuName}
+                  onChange={(e) => setEditMenuName(e.target.value)}
+                  style={{ width: 260, padding: "8px 10px", borderRadius: 8, border: "1px solid #ddd", boxSizing: "border-box" }}
+                />
+              </div>
+              <div>
+                <label style={{ display: "block", fontSize: 13, color: "#666", marginBottom: 4 }}>Harga jual / porsi (Rp)</label>
+                <input
+                  type="number"
+                  placeholder="mis. 25000"
+                  value={editSellPrice}
+                  onChange={(e) => setEditSellPrice(e.target.value)}
+                  style={{ width: 160, padding: "8px 10px", borderRadius: 8, border: "1px solid #ddd", boxSizing: "border-box" }}
+                />
+              </div>
             </div>
 
             <label style={{ display: "block", fontSize: 13, color: "#666", marginBottom: 4 }}>Bahan</label>
@@ -2119,16 +2301,30 @@ export default function App() {
         )}
 
         <DataTable
-          columns={["Nama Menu", "Jumlah Bahan", "Daftar Bahan", "Aksi"]}
+          columns={["Nama Menu", "Daftar Bahan", "Harga Jual", "Estimasi HPP", "Margin", "Aksi"]}
           rows={rawData.recipes
             .slice()
             .sort((a, b) => String(a.menuName || "").localeCompare(String(b.menuName || "")))
-            .map((r) => [
+            .map((r) => {
+              const cost = computeRecipeCost(r, priceHistory);
+              const sellPrice = Number(r.sellPrice || 0);
+              const margin = sellPrice > 0 && cost.complete ? sellPrice - cost.totalCost : null;
+              const marginPct = margin !== null && sellPrice > 0 ? (margin / sellPrice) * 100 : null;
+              return [
               r.menuName,
-              (r.ingredients || []).length,
               (r.ingredients || [])
-                .map((ing) => `${ing.itemName} ${formatNumber(ing.quantity)} ${ing.unit}`)
+                .map((ing) => {
+                  const converted = convertToBase(ing.quantity, ing.unit);
+                  return `${ing.itemName} ${displayQuantity(converted.value, converted.base)}`;
+                })
                 .join(", ") || "-",
+              sellPrice > 0 ? `Rp ${formatNumber(sellPrice)}` : <span style={{ color: "#999" }}>belum diisi</span>,
+              cost.complete ? `Rp ${formatNumber(cost.totalCost)}` : <span style={{ color: "#999" }}>data harga bahan belum lengkap</span>,
+              margin !== null
+                ? <span style={{ color: margin >= 0 ? "#1f7a4c" : "#c6392e", fontWeight: 600 }}>
+                    Rp {formatNumber(margin)} ({formatNumber(marginPct, 0)}%)
+                  </span>
+                : "-",
               deleteConfirmId === r.id ? (
                 <div key="del" style={{ display: "flex", gap: 6 }}>
                   <span style={{ fontSize: 13, color: "#c0392b" }}>Yakin?</span>
@@ -2162,7 +2358,8 @@ export default function App() {
                   </button>
                 </div>
               )
-            ])}
+              ];
+            })}
           emptyText="Belum ada resep tersimpan."
         />
       </div>
@@ -2220,6 +2417,7 @@ export default function App() {
         outlet: reportOutlet,
         dataQualityIssues,
         purchaseSuggestions,
+        recipes: rawData.recipes,
         generatedAt: new Date().toLocaleString("id-ID")
       });
       const filename = `Laporan_DolanSawahAI_${reportOutlet}_${reportStart || "awal"}_sampai_${reportEnd || "sekarang"}.xlsx`;
