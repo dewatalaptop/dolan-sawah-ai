@@ -1,855 +1,1981 @@
-import { useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
+import { collection, addDoc, getDocs, query, limit } from "firebase/firestore";
+import {
+  onAuthStateChanged,
+  signInWithEmailAndPassword,
+  signOut
+} from "firebase/auth";
 
-function App() {
-  const [message, setMessage] = useState("");
-  const [isThinking, setIsThinking] = useState(false);
+import { db, auth } from "./firebase";
+import "./App.css";
 
-  const [messages, setMessages] = useState([
-    {
-      id: 1,
-      role: "assistant",
-      text: "Halo! Saya Dolan Sawah AI. Saya siap membantu Anda menganalisis bisnis, penjualan, inventory, dan strategi Dolan Sawah.",
-    },
-  ]);
+import {
+  COLLECTIONS,
+  createOpeningStock,
+  createPurchase,
+  createReceiving,
+  createSale,
+  createStockOpname,
+  createWaste,
+  createAdjustment
+} from "./dataModel";
 
-  const suggestions = [
-    {
-      icon: "◉",
-      text: "Analisis penjualan hari ini",
-    },
-    {
-      icon: "↗",
-      text: "Analisis laba rugi outlet",
-    },
-    {
-      icon: "◫",
-      text: "Prediksi kebutuhan bahan",
-    },
-    {
-      icon: "✦",
-      text: "Buat strategi marketing",
-    },
-  ];
+import {
+  loadInventoryData,
+  calculateTheoreticalStock,
+  generateVarianceReport
+} from "./inventoryEngine";
 
-  const generateAIResponse = (question) => {
-    const q = question.toLowerCase();
+import { saveRecipe, calculateUsageFromSales } from "./recipeEngine";
 
-    if (q.includes("penjualan")) {
-      return "Baik. Saya akan membantu menganalisis penjualan Dolan Sawah. Untuk analisis yang lebih akurat, nantinya saya akan membaca data penjualan dari Firebase berdasarkan periode, outlet, menu, dan jumlah transaksi.";
+import { getPriceHistory, savePrice } from "./priceEngine";
+
+import { processExcelFile } from "./excelEngine";
+
+import { askGemini, buildReportPrompt } from "./geminiEngine";
+
+/* =========================================================
+   KONSTANTA
+   ========================================================= */
+
+const TODAY = new Date().toISOString().slice(0, 10);
+
+const OUTLETS = [
+  { id: "ALL", label: "Semua Outlet" },
+  { id: "DS", label: "Dolan Sawah" },
+  { id: "SS", label: "Sawah Senja" },
+  { id: "SP", label: "Soto Pagi" }
+];
+
+const MENU = [
+  { id: "chat", label: "AI Assistant", icon: "chat" },
+  { section: "OPERASIONAL" },
+  { id: "dashboard", label: "Dashboard", icon: "grid" },
+  { id: "pembelian", label: "Pembelian", icon: "cart" },
+  { id: "barang-datang", label: "Barang Datang", icon: "truck" },
+  { id: "penjualan", label: "Penjualan", icon: "coin" },
+  { id: "stok", label: "Stock Opname", icon: "box" },
+  { section: "ANALISIS" },
+  { id: "kebutuhan", label: "Kebutuhan Bahan", icon: "leaf" },
+  { id: "variance", label: "Variance & Waste", icon: "trend" },
+  { id: "harga", label: "Harga Bahan", icon: "tag" },
+  { id: "resep", label: "Resep", icon: "book" },
+  { id: "import", label: "Import Excel", icon: "upload" },
+  { id: "laporan", label: "Laporan AI", icon: "doc" }
+];
+
+const MOBILE_NAV = ["chat", "dashboard", "kebutuhan", "variance"];
+
+/* =========================================================
+   HELPER DASAR
+   ========================================================= */
+
+function normalizeText(value) {
+  return String(value || "")
+    .toLowerCase()
+    .replace(/[""]/g, "")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function titleCase(value) {
+  return String(value || "")
+    .trim()
+    .toLowerCase()
+    .replace(/\b\w/g, (c) => c.toUpperCase());
+}
+
+function formatNumber(value, maxDecimals = 1) {
+  const n = Number(value || 0);
+  return new Intl.NumberFormat("id-ID", {
+    maximumFractionDigits: maxDecimals
+  }).format(n);
+}
+
+function formatDateID(date) {
+  const value = date || TODAY;
+  const [y, m, d] = String(value).split("-");
+  if (!y || !m || !d) return value;
+  return `${d}-${m}-${y}`;
+}
+
+function toNumber(value) {
+  if (typeof value === "number") return Number.isFinite(value) ? value : 0;
+
+  let text = String(value || "").trim();
+
+  if (text.includes(".") && text.includes(",")) {
+    // format Indonesia lengkap: 25.000,50
+    text = text.replace(/\./g, "").replace(",", ".");
+  } else if (text.includes(".")) {
+    // "." bisa berarti ribuan (25.000) atau desimal (4.5) -- hanya
+    // dianggap pemisah ribuan kalau persis 3 digit di belakang titik,
+    // sama seperti logika parseNumber() di excelEngine.js.
+    const parts = text.split(".");
+    if (parts.length === 2 && parts[1].length === 3) {
+      text = parts.join("");
     }
+  } else if (text.includes(",")) {
+    text = text.replace(",", ".");
+  }
 
-    if (
-      q.includes("laba") ||
-      q.includes("rugi") ||
-      q.includes("profit")
-    ) {
-      return "Saya bisa menganalisis laba dan rugi berdasarkan omzet, HPP, biaya operasional, dan margin setiap outlet. Pada tahap berikutnya data tersebut akan saya ambil langsung dari database Dolan Sawah.";
-    }
+  return Number(text.replace(/[^\d.-]/g, "")) || 0;
+}
 
-    if (
-      q.includes("bahan") ||
-      q.includes("inventory") ||
-      q.includes("stok")
-    ) {
-      return "Saya dapat membantu menghitung kebutuhan bahan berdasarkan penjualan dan master resep. Nantinya sistem dapat memberikan rekomendasi pembelian seperti ayam, daging, beras, sayuran, dan bahan lainnya.";
-    }
+function unitNormalize(unit) {
+  const u = normalizeText(unit);
+  if (u.includes("mililiter") || u.includes("milliliter") || u === "ml") return "ml";
+  if (u.includes("liter") || u === "l" || u === "ltr") return "liter";
+  if (u.includes("gram") || u === "gr" || u === "g") return "gram";
+  if (u.includes("kg") || u.includes("kilo")) return "kg";
+  if (
+    u.includes("pcs") ||
+    u.includes("buah") ||
+    u.includes("butir") ||
+    u.includes("ekor") ||
+    u.includes("porsi") ||
+    u.includes("pack") ||
+    u.includes("bungkus") ||
+    u.includes("kemasan") ||
+    u.includes("ikat")
+  ) {
+    return "unit";
+  }
+  return u || "unit";
+}
 
-    if (
-      q.includes("marketing") ||
-      q.includes("promosi") ||
-      q.includes("promo")
-    ) {
-      return "Saya dapat membantu membuat strategi marketing berdasarkan kondisi bisnis, tren penjualan, hari dalam minggu, periode ramai, periode sepi, dan performa promo.";
-    }
+// Konversi ke satuan dasar: kg->gram, liter tetap liter, unit tetap unit.
+// Ini dipakai supaya perhitungan kebutuhan bahan & variance tidak
+// mencampur kg dengan gram secara diam-diam (lihat catatan di bawah).
+function convertToBase(value, unit) {
+  const n = Number(value || 0);
+  const u = unitNormalize(unit);
+  if (u === "kg") return { value: n * 1000, base: "gram" };
+  if (u === "gram") return { value: n, base: "gram" };
+  if (u === "liter") return { value: n, base: "liter" };
+  if (u === "ml") return { value: n / 1000, base: "liter" };
+  return { value: n, base: "unit" };
+}
 
-    return "Saya mengerti pertanyaan Anda. Saat ini saya masih berada dalam mode prototype. Pada tahap berikutnya kita akan menghubungkan saya dengan Gemini dan Firebase sehingga saya dapat menjawab berdasarkan data bisnis Dolan Sawah yang sebenarnya.";
+function displayQuantity(value, base) {
+  const n = Number(value || 0);
+  if (base === "gram" && Math.abs(n) >= 1000) {
+    return `${formatNumber(n / 1000, 2)} kg`;
+  }
+  if (base === "gram") return `${formatNumber(n)} gram`;
+  if (base === "liter") return `${formatNumber(n, 2)} liter`;
+  return `${formatNumber(n)} unit`;
+}
+
+/* =========================================================
+   ALIAS BAHAN
+   ========================================================= */
+
+const INGREDIENT_ALIASES = {
+  ayam: "Ayam",
+  "ayam potong": "Ayam",
+  "ayam broiler": "Ayam",
+  "daging sapi": "Daging Sapi",
+  sapi: "Daging Sapi",
+  beras: "Beras",
+  nasi: "Beras",
+  "minyak goreng": "Minyak Goreng",
+  minyak: "Minyak Goreng",
+  gula: "Gula",
+  telur: "Telur",
+  tepung: "Tepung",
+  kikil: "Kikil",
+  babat: "Babat",
+  tetelan: "Tetelan"
+};
+
+function normalizeIngredient(name) {
+  const raw = normalizeText(name);
+  return INGREDIENT_ALIASES[raw] || titleCase(name);
+}
+
+/* =========================================================
+   DETEKSI OUTLET
+   ========================================================= */
+
+function detectOutlet(text, fallback) {
+  const t = normalizeText(text);
+  if (/sawah senja/.test(t) || /\bss\b/.test(t)) return "SS";
+  if (/soto pagi|soto sawah/.test(t) || /\bsp\b/.test(t)) return "SP";
+  if (/dolan sawah/.test(t) || /\bds\b/.test(t)) return "DS";
+  return fallback === "ALL" ? "DS" : fallback;
+}
+
+/* =========================================================
+   PARSER TANGGAL
+   ========================================================= */
+
+function extractDate(text) {
+  const source = String(text);
+
+  let match = source.match(/(\d{1,2})[/-](\d{1,2})[/-](\d{4})/);
+  if (match) {
+    return `${match[3]}-${String(match[2]).padStart(2, "0")}-${String(
+      match[1]
+    ).padStart(2, "0")}`;
+  }
+
+  match = source.match(/(\d{4})[/-](\d{1,2})[/-](\d{1,2})/);
+  if (match) {
+    return `${match[1]}-${String(match[2]).padStart(2, "0")}-${String(
+      match[3]
+    ).padStart(2, "0")}`;
+  }
+
+  const bulanMap = {
+    januari: "01", februari: "02", maret: "03", april: "04",
+    mei: "05", juni: "06", juli: "07", agustus: "08",
+    september: "09", oktober: "10", november: "11", desember: "12"
   };
+  match = normalizeText(source).match(
+    /(\d{1,2})\s+(januari|februari|maret|april|mei|juni|juli|agustus|september|oktober|november|desember)\s+(\d{4})/
+  );
+  if (match) {
+    return `${match[3]}-${bulanMap[match[2]]}-${String(match[1]).padStart(2, "0")}`;
+  }
 
-  const sendMessage = (text = message) => {
-    const cleanText = text.trim();
+  if (/\bkemarin\b/.test(normalizeText(source))) {
+    const d = new Date();
+    d.setDate(d.getDate() - 1);
+    return d.toISOString().slice(0, 10);
+  }
 
-    if (!cleanText || isThinking) return;
+  return TODAY;
+}
 
-    const userMessage = {
-      id: Date.now(),
-      role: "user",
-      text: cleanText,
+/* =========================================================
+   DETEKSI JENIS DATA
+   Urutan penting: cek yang paling spesifik dulu supaya tidak
+   salah tangkap (mis. "stock opname" jangan kebaca sebagai "stok").
+   ========================================================= */
+
+function detectDataType(text) {
+  const t = normalizeText(text);
+
+  if (t.includes("stock opname") || t.includes("stok opname") || t.includes("opname")) {
+    return "stock_opname";
+  }
+
+  if (
+    t.includes("barang datang") ||
+    t.includes("barang yang datang") ||
+    t.includes("barang diterima") ||
+    t.includes("diterima") ||
+    t.includes("terima barang")
+  ) {
+    return "receiving";
+  }
+
+  if (t.includes("stok awal") || t.includes("stock awal") || t.includes("saldo awal")) {
+    return "opening_stock";
+  }
+
+  if (
+    t.includes("waste") ||
+    t.includes("rusak") ||
+    t.includes("terbuang") ||
+    t.includes("busuk") ||
+    t.includes("kadaluarsa") ||
+    t.includes("basi")
+  ) {
+    return "waste";
+  }
+
+  if (t.includes("penyesuaian") || t.includes("koreksi stok") || t.includes("adjustment")) {
+    return "adjustment";
+  }
+
+  if (
+    t.includes("pembelian") ||
+    t.includes("pesan barang") ||
+    t.includes("po ke") ||
+    t.includes("order barang") ||
+    /\bbeli\b/.test(t)
+  ) {
+    return "purchase";
+  }
+
+  if (t.includes("penjualan") || t.includes("terjual") || t.includes("laku")) {
+    return "sales";
+  }
+
+  if (t.includes("resep") || (t.includes("per porsi") && !t.includes("penjualan"))) {
+    return "recipe";
+  }
+
+  if (t.includes("harga") || t.includes("update harga") || t.includes("price")) {
+    return "price";
+  }
+
+  if (
+    t.includes("laporan") ||
+    t.includes("variance") ||
+    t.includes("selisih") ||
+    t.includes("analisa") ||
+    t.includes("analisis") ||
+    t.includes("kebutuhan") ||
+    t.includes("rekomendasi") ||
+    t.includes("saran") ||
+    t.includes("bagaimana") ||
+    t.includes("kenapa") ||
+    t.includes("berapa") ||
+    t.trim().endsWith("?")
+  ) {
+    return "report";
+  }
+
+  return "unknown";
+}
+
+/* =========================================================
+   PARSER BARIS "BARANG + JUMLAH + SATUAN"
+   Dipakai untuk stok awal, pembelian, barang datang, stock
+   opname, waste, adjustment.
+   ========================================================= */
+
+function parseItemLines(text) {
+  const lines = String(text)
+    .split(/\n|;/)
+    .map((x) => x.trim())
+    .filter(Boolean);
+
+  const result = [];
+
+  for (const line of lines) {
+    // Satuan wajib match di sini (bukan opsional). Baris header/tanggal
+    // ("Stok awal 21 Agustus 2026 DS", "21-08-2026", "Untuk outlet DS
+    // tanggal 21 Agustus 2026", dll.) selalu punya angka tapi angka itu
+    // tidak pernah diikuti langsung oleh kata satuan — jadi mewajibkan
+    // satuan di sini otomatis mencegah angka tanggal/metadata terbaca
+    // sebagai quantity barang, tanpa perlu parser tanggal terpisah.
+    const match = line.match(
+      /([\d.,]+)\s*(kg|kilogram|gram|gr|g|liter|ltr|l|ml|porsi|pcs|buah|butir|ekor|pack|bungkus|kemasan|ikat)\b/i
+    );
+
+    if (!match || !match[1]) continue;
+
+    let clean = line
+      .replace(match[0], "")
+      .replace(/^[-•*:\s]+/, "")
+      .trim();
+
+    if (!clean) continue;
+
+    // baris "supplier: xxx" / "alasan: xxx" bukan baris barang
+    if (/^(supplier|vendor|alasan|keterangan|catatan)\s*:/i.test(clean)) continue;
+
+    result.push({
+      itemName: normalizeIngredient(clean),
+      quantity: toNumber(match[1]),
+      unit: unitNormalize(match[2])
+    });
+  }
+
+  return result;
+}
+
+function extractLabeledValue(text, labels) {
+  const lines = String(text).split(/\n/);
+  for (const line of lines) {
+    for (const label of labels) {
+      const re = new RegExp(`^${label}\\s*:\\s*(.+)$`, "i");
+      const match = line.trim().match(re);
+      if (match) return match[1].trim();
+    }
+  }
+  return "";
+}
+
+/* =========================================================
+   PARSER PENJUALAN
+   ========================================================= */
+
+function parseSalesLines(text) {
+  const lines = String(text)
+    .split(/\n|;/)
+    .map((x) => x.trim())
+    .filter(Boolean);
+
+  const result = [];
+
+  for (const line of lines) {
+    // Satuan wajib ada (bukan opsional) supaya baris header/tanggal tanpa
+    // outlet (mis. "Penjualan 21 Agustus 2026") tidak salah terbaca jadi
+    // penjualan dengan menuName ngawur dan quantity = tahunnya.
+    const match = line.match(/^[-•*]?\s*(.+?)\s+([\d.,]+)\s*(porsi|pcs|buah|unit)$/i);
+    if (!match) continue;
+
+    const name = match[1].replace(/^penjualan\s*/i, "").trim();
+    const quantity = toNumber(match[2]);
+    if (!name || !quantity) continue;
+
+    result.push({ menuName: titleCase(name), quantity });
+  }
+
+  return result;
+}
+
+/* =========================================================
+   PARSER RESEP -> dikelompokkan per menu
+   ========================================================= */
+
+function parseRecipeGroups(text) {
+  const lines = String(text)
+    .split(/\n/)
+    .map((x) => x.trim())
+    .filter(Boolean);
+
+  const groups = {};
+  let currentMenu = null;
+
+  for (const rawLine of lines) {
+    const clean = rawLine.replace(/^[-•*]\s*/, "").trim();
+    if (!clean) continue;
+
+    const match = clean.match(
+      /([\d.,]+)\s*(kg|kilogram|gram|gr|g|liter|ltr|l|ml)\s*per\s+porsi/i
+    );
+
+    if (match) {
+      // Potong di tanda akhir kalimat pertama (., ?, !) supaya kalimat lain
+      // yang ikut terbawa dalam satu pesan (mis. "Ayam Bakar 250 gram per
+      // porsi. Apa yang perlu dibeli besok?") tidak ikut menempel jadi
+      // bagian dari nama menu/bahan -- sebelumnya seluruh kalimat kedua
+      // ikut tersimpan sebagai nama resep.
+      const remainingText = clean
+        .replace(match[0], "")
+        .trim()
+        .split(/[.?!]/)[0]
+        .trim();
+
+      if (!currentMenu) {
+        // Format singkat satu baris: "<Nama Menu> <qty> <satuan> per porsi"
+        // (nama menu & bahan digabung di baris yang sama, tanpa baris nama
+        // menu terpisah sebelumnya). Karena tidak ada nama bahan lain yang
+        // disebutkan, nama menu dipakai juga sebagai nama bahannya.
+        if (!remainingText) continue;
+
+        const menuName = titleCase(remainingText.replace(/:$/, ""));
+
+        if (!groups[menuName]) groups[menuName] = [];
+
+        groups[menuName].push({
+          itemName: normalizeIngredient(remainingText),
+          quantity: toNumber(match[1]),
+          unit: unitNormalize(match[2])
+        });
+
+        // Reset supaya baris berikutnya (resep lain dalam format singkat
+        // yang sama) tidak ikut nyambung ke menu ini.
+        currentMenu = null;
+        continue;
+      }
+
+      // Format lama: baris ini bahan dari menu yang sudah ditentukan oleh
+      // baris nama menu sebelumnya. Kalau tidak ada nama bahan sebelum
+      // angkanya (mis. "250 gram per porsi" saja), baris ini bukan bahan
+      // yang valid -- lewati supaya tidak masuk sebagai itemName kosong.
+      if (!remainingText) continue;
+
+      if (!groups[currentMenu]) groups[currentMenu] = [];
+
+      groups[currentMenu].push({
+        itemName: normalizeIngredient(remainingText),
+        quantity: toNumber(match[1]),
+        unit: unitNormalize(match[2])
+      });
+
+      continue;
+    }
+
+    if (!/resep/i.test(clean)) {
+      currentMenu = titleCase(clean.replace(/:$/, ""));
+    }
+  }
+
+  return Object.entries(groups).map(([menuName, ingredients]) => ({
+    menuName,
+    ingredients
+  }));
+}
+
+/* =========================================================
+   PARSER HARGA
+   ========================================================= */
+
+function parsePriceLines(text) {
+  const lines = String(text)
+    .split(/\n|;/)
+    .map((x) => x.trim())
+    .filter(Boolean);
+
+  const result = [];
+
+  for (const line of lines) {
+    if (/^(supplier|update harga)\s*:?/i.test(line) && !/rp/i.test(line)) continue;
+
+    // Baris header/tanggal (mis. "Harga update 21 Agustus 2026", "21-08-2026")
+    // bukan baris harga bahan -- lewati supaya angka tanggal tidak salah
+    // terbaca sebagai harga (satuan di sini memang opsional by design,
+    // jadi tidak bisa diandalkan mewajibkan satuan seperti parser lain).
+    if (
+      /\d{1,2}[/-]\d{1,2}[/-]\d{4}/.test(line) ||
+      /\d{4}[/-]\d{1,2}[/-]\d{1,2}/.test(line) ||
+      /\d{1,2}\s+(januari|februari|maret|april|mei|juni|juli|agustus|september|oktober|november|desember)\s+\d{4}/i.test(line)
+    ) {
+      continue;
+    }
+
+    const match = line.match(
+      /^[-•*]?\s*(.+?)\s*(?:Rp\.?|rp\.?)?\s*([\d.,]+)(?:\s*\/\s*(\w+))?$/i
+    );
+
+    if (!match) continue;
+
+    const item = match[1].trim();
+    const price = toNumber(match[2]);
+    if (!item || !price) continue;
+
+    result.push({
+      itemName: normalizeIngredient(item),
+      price,
+      unit: unitNormalize(match[3] || "kg")
+    });
+  }
+
+  return result;
+}
+
+/* =========================================================
+   FIRESTORE: SIMPAN
+   ========================================================= */
+
+async function saveRows(collectionName, rows) {
+  const ids = [];
+  for (const row of rows) {
+    const ref = await addDoc(collection(db, collectionName), row);
+    ids.push(ref.id);
+  }
+  return ids;
+}
+
+/* =========================================================
+   BUSINESS LOGIC: NORMALISASI SATUAN UNTUK PERHITUNGAN
+   inventoryEngine & recipeEngine menjumlahkan field quantity
+   apa adanya tanpa konversi satuan. Supaya kg tidak tercampur
+   gram (mis. stok dicatat kg, resep dicatat gram/porsi), kita
+   samakan dulu ke satuan dasar sebelum dikirim ke engine.
+   ========================================================= */
+
+function toBaseUnitDataset(data) {
+  const convertList = (rows, qtyField) =>
+    rows.map((row) => {
+      const converted = convertToBase(row[qtyField], row.unit);
+      return { ...row, [qtyField]: converted.value, unit: converted.base };
+    });
+
+  const receiving = data.receiving.map((row) => {
+    const ordered = convertToBase(row.orderedQuantity, row.unit);
+    const received = convertToBase(row.receivedQuantity, row.unit);
+    return {
+      ...row,
+      orderedQuantity: ordered.value,
+      receivedQuantity: received.value,
+      unit: ordered.base
     };
+  });
 
-    setMessages((prev) => [...prev, userMessage]);
-    setMessage("");
-    setIsThinking(true);
+  const recipes = data.recipes.map((recipe) => ({
+    ...recipe,
+    ingredients: (recipe.ingredients || []).map((ing) => {
+      const converted = convertToBase(ing.quantity, ing.unit);
+      return { ...ing, quantity: converted.value, unit: converted.base };
+    })
+  }));
 
-    setTimeout(() => {
-      const response = generateAIResponse(cleanText);
+  return {
+    ...data,
+    openingStock: convertList(data.openingStock, "quantity"),
+    purchases: convertList(data.purchases, "quantity"),
+    receiving,
+    stockOpname: convertList(data.stockOpname, "actualQuantity"),
+    waste: convertList(data.waste, "quantity"),
+    adjustments: convertList(data.adjustments, "quantity"),
+    recipes
+  };
+}
 
-      const aiMessage = {
-        id: Date.now() + 1,
-        role: "assistant",
-        text: response,
+function filterDataByOutlet(data, outlet) {
+  if (outlet === "ALL") return data;
+  const byOutlet = (row) => (row.outlet || "DS") === outlet;
+  return {
+    ...data,
+    openingStock: data.openingStock.filter(byOutlet),
+    purchases: data.purchases.filter(byOutlet),
+    receiving: data.receiving.filter(byOutlet),
+    sales: data.sales.filter(byOutlet),
+    stockOpname: data.stockOpname.filter(byOutlet),
+    waste: data.waste.filter(byOutlet),
+    adjustments: data.adjustments.filter(byOutlet)
+  };
+}
+
+function computeAvgDailySales(sales, days = 7) {
+  const cutoff = new Date();
+  cutoff.setDate(cutoff.getDate() - days);
+  const cutoffStr = cutoff.toISOString().slice(0, 10);
+
+  const recent = sales.filter((s) => String(s.date || "") >= cutoffStr);
+  const totals = {};
+
+  for (const row of recent) {
+    const key = row.menuName;
+    if (!key) continue;
+    totals[key] = (totals[key] || 0) + Number(row.quantity || 0);
+  }
+
+  const avg = {};
+  Object.entries(totals).forEach(([menu, total]) => {
+    avg[menu] = total / days;
+  });
+
+  return avg;
+}
+
+function buildPurchaseSuggestions(ingredientForecast, theoreticalStock) {
+  const stockMap = {};
+  theoreticalStock.forEach((item) => {
+    stockMap[normalizeText(item.itemName)] = item;
+  });
+
+  return ingredientForecast
+    .map((need) => {
+      const stockItem = stockMap[normalizeText(need.itemName)];
+      const saldoTeoritis = stockItem ? stockItem.theoretical : 0;
+      const sourceIsOpname = !!stockItem && stockItem.actual !== null && stockItem.actual !== undefined;
+
+      // STOK TERSEDIA: pakai hasil stock opname (actual) kalau bahan ini
+      // sudah pernah di-opname -- itu lebih bisa dipercaya daripada saldo
+      // teoritis yang murni akumulasi historis dan tidak pernah dikoreksi
+      // fisik. Kalau belum pernah opname, fallback ke saldo teoritis.
+      const stokTersedia = sourceIsOpname ? stockItem.actual : saldoTeoritis;
+
+      const base = need.unit || (stockItem ? stockItem.unit : "unit");
+      const suggested = Math.max(0, need.quantity - stokTersedia);
+
+      return {
+        itemName: need.itemName,
+        base,
+        dailyNeed: need.quantity,
+        currentStock: stokTersedia,
+        saldoTeoritis,
+        sourceIsOpname,
+        suggestedPurchase: suggested,
+        sourceMenus: need.sourceMenus || []
       };
+    })
+    .sort((a, b) => b.suggestedPurchase - a.suggestedPurchase);
+}
 
-      setMessages((prev) => [...prev, aiMessage]);
-      setIsThinking(false);
-    }, 900);
-  };
+/* =========================================================
+   LAPORAN LOKAL (fallback jika Gemini belum tersambung)
+   ========================================================= */
 
-  const handleKeyDown = (e) => {
-    if (e.key === "Enter" && !e.shiftKey) {
-      e.preventDefault();
-      sendMessage();
+function buildLocalReport(question, ctx) {
+  const q = normalizeText(question);
+
+  if (q.includes("kebutuhan") || q.includes("saran") || q.includes("besok")) {
+    if (!ctx.purchaseSuggestions.length) {
+      return "Belum ada saran pembelian karena data resep dan/atau penjualan masih kosong.";
     }
-  };
+    const top = ctx.purchaseSuggestions.slice(0, 8);
+    return (
+      "SARAN PEMBELIAN (berdasarkan rata-rata penjualan 7 hari terakhir vs stok berjalan):\n\n" +
+      top
+        .map(
+          (x) =>
+            `- ${x.itemName}: kebutuhan/hari ${displayQuantity(x.dailyNeed, x.base)}, ` +
+            `stok saat ini ${displayQuantity(x.currentStock, x.base)} → ` +
+            `beli sekitar ${displayQuantity(x.suggestedPurchase, x.base)}`
+        )
+        .join("\n") +
+      "\n\nCatatan: perkiraan ini akan lebih akurat jika resep dan stock opname rutin diperbarui."
+    );
+  }
 
-  const newChat = () => {
-    setMessages([
-      {
-        id: Date.now(),
-        role: "assistant",
-        text: "Percakapan baru dimulai. Apa yang ingin Anda analisis?",
-      },
-    ]);
+  if (q.includes("variance") || q.includes("selisih") || q.includes("waste")) {
+    if (!ctx.varianceReport.items.length) {
+      return "Belum ada data variance yang bisa dianalisa (stock opname belum lengkap).";
+    }
+    const items = [...ctx.varianceReport.items]
+      .sort((a, b) => a.variance - b.variance)
+      .slice(0, 8);
+    return (
+      "ITEM DENGAN VARIANCE TERBESAR (aktual dibanding teoritis):\n\n" +
+      items
+        .map(
+          (x) =>
+            `- ${x.itemName}: teoritis ${displayQuantity(x.theoretical, x.unit)}, ` +
+            `aktual ${displayQuantity(x.actual, x.unit)}, ` +
+            `selisih ${displayQuantity(x.variance, x.unit)} ` +
+            `${x.variance < 0 ? "(kemungkinan waste/kurang tercatat)" : "(surplus, periksa pencatatan)"}`
+        )
+        .join("\n")
+    );
+  }
 
-    setMessage("");
-  };
+  if (q.includes("penjualan") || q.includes("laku") || q.includes("terlaris")) {
+    const entries = Object.entries(ctx.avgDailySales).sort((a, b) => b[1] - a[1]).slice(0, 8);
+    if (!entries.length) return "Belum ada data penjualan pada periode ini.";
+    return (
+      "RATA-RATA PENJUALAN HARIAN (7 hari terakhir):\n\n" +
+      entries.map(([menu, avg]) => `- ${menu}: ${formatNumber(avg, 1)} porsi/hari`).join("\n")
+    );
+  }
+
+  if (q.includes("harga")) {
+    if (!ctx.priceHistory.length) return "Belum ada data harga bahan yang tersimpan.";
+    const latestByItem = {};
+    ctx.priceHistory.forEach((p) => {
+      const key = normalizeText(p.itemName);
+      if (!latestByItem[key] || p.effectiveDate > latestByItem[key].effectiveDate) {
+        latestByItem[key] = p;
+      }
+    });
+    const rows = Object.values(latestByItem).slice(0, 10);
+    return (
+      "HARGA BAHAN TERBARU:\n\n" +
+      rows.map((p) => `- ${p.itemName}: Rp ${formatNumber(p.price)} / ${p.unit}`).join("\n")
+    );
+  }
+
+  if (q.includes("barang datang") || q.includes("diterima") || q.includes("pengecekan")) {
+    const issues = ctx.receivingIssues;
+    if (!issues.length) return "Semua barang yang diterima sesuai dengan pemesanan (tidak ada selisih tercatat).";
+    return (
+      "SELISIH BARANG DATANG vs PEMESANAN:\n\n" +
+      issues
+        .slice(0, 8)
+        .map(
+          (r) =>
+            `- ${r.itemName} (${r.date}): pesan ${formatNumber(r.orderedQuantity)} ${r.unit}, ` +
+            `diterima ${formatNumber(r.receivedQuantity)} ${r.unit}, selisih ${formatNumber(r.difference)} ${r.unit}`
+        )
+        .join("\n")
+    );
+  }
 
   return (
-    <div style={styles.app}>
-
-      {/* ================= SIDEBAR ================= */}
-
-      <aside style={styles.sidebar}>
-
-        <div style={styles.logoArea}>
-          <div style={styles.logo}>DS</div>
-
-          <div>
-            <div style={styles.logoTitle}>Dolan Sawah</div>
-            <div style={styles.logoSubtitle}>
-              AI Business Assistant
-            </div>
-          </div>
-        </div>
-
-        <button
-          style={styles.newChat}
-          onClick={newChat}
-        >
-          <span style={styles.plus}>+</span>
-          Percakapan Baru
-        </button>
-
-        <div style={styles.menuSection}>
-
-          <div style={styles.menuLabel}>
-            MENU
-          </div>
-
-          <div style={styles.menuItemActive}>
-            <span>✦</span>
-            AI Assistant
-          </div>
-
-          <div style={styles.menuItem}>
-            <span>▣</span>
-            Dashboard
-          </div>
-
-          <div style={styles.menuItem}>
-            <span>◷</span>
-            Analisis Penjualan
-          </div>
-
-          <div style={styles.menuItem}>
-            <span>◈</span>
-            Inventory
-          </div>
-
-          <div style={styles.menuItem}>
-            <span>◎</span>
-            Marketing
-          </div>
-
-          <div style={styles.menuItem}>
-            <span>▤</span>
-            Laporan
-          </div>
-
-        </div>
-
-        <div style={styles.sidebarBottom}>
-
-          <div style={styles.menuItem}>
-            <span>⚙</span>
-            Pengaturan
-          </div>
-
-          <div style={styles.userBox}>
-
-            <div style={styles.avatar}>
-              Y
-            </div>
-
-            <div>
-              <div style={styles.userName}>
-                Dolan Sawah
-              </div>
-
-              <div style={styles.userRole}>
-                Administrator
-              </div>
-            </div>
-
-          </div>
-
-        </div>
-
-      </aside>
-
-
-      {/* ================= MAIN ================= */}
-
-      <main style={styles.main}>
-
-        {/* HEADER */}
-
-        <header style={styles.header}>
-
-          <div>
-            <div style={styles.pageTitle}>
-              AI Assistant
-            </div>
-
-            <div style={styles.pageSubtitle}>
-              Asisten bisnis untuk Dolan Sawah
-            </div>
-          </div>
-
-          <div style={styles.status}>
-            <span style={styles.statusDot}></span>
-            AI Online
-          </div>
-
-        </header>
-
-
-        {/* ================= CHAT ================= */}
-
-        <section style={styles.chatContainer}>
-
-          {/* WELCOME */}
-
-          {messages.length === 1 && (
-            <div style={styles.hero}>
-
-              <div style={styles.aiIcon}>
-                ✦
-              </div>
-
-              <h1 style={styles.heroTitle}>
-                Selamat datang di{" "}
-                <span style={styles.gradientText}>
-                  Dolan Sawah AI
-                </span>
-              </h1>
-
-              <p style={styles.heroText}>
-                Asisten AI yang membantu Anda memahami
-                bisnis, menganalisis data, dan mengambil
-                keputusan dengan lebih cepat.
-              </p>
-
-            </div>
-          )}
-
-
-          {/* MESSAGES */}
-
-          <div style={styles.messages}>
-
-            {messages.map((item) => (
-
-              <div
-                key={item.id}
-                style={{
-                  ...styles.messageRow,
-                  justifyContent:
-                    item.role === "user"
-                      ? "flex-end"
-                      : "flex-start",
-                }}
-              >
-
-                {item.role === "assistant" && (
-                  <div style={styles.smallAI}>
-                    ✦
-                  </div>
-                )}
-
-                <div
-                  style={
-                    item.role === "user"
-                      ? styles.userBubble
-                      : styles.aiBubble
-                  }
-                >
-                  {item.text}
-                </div>
-
-              </div>
-
-            ))}
-
-            {isThinking && (
-
-              <div style={styles.messageRow}>
-
-                <div style={styles.smallAI}>
-                  ✦
-                </div>
-
-                <div style={styles.aiBubble}>
-                  <span style={styles.thinking}>
-                    AI sedang berpikir...
-                  </span>
-                </div>
-
-              </div>
-
-            )}
-
-          </div>
-
-
-          {/* QUICK ACTION */}
-
-          {messages.length === 1 && (
-
-            <div style={styles.quickSection}>
-
-              <div style={styles.sectionTitle}>
-                Apa yang ingin Anda lakukan?
-              </div>
-
-              <div style={styles.cards}>
-
-                {suggestions.map((item, index) => (
-
-                  <button
-                    key={index}
-                    style={styles.card}
-                    onClick={() =>
-                      sendMessage(item.text)
-                    }
-                  >
-
-                    <div style={styles.cardIcon}>
-                      {item.icon}
-                    </div>
-
-                    <div style={styles.cardText}>
-                      {item.text}
-                    </div>
-
-                    <div style={styles.cardArrow}>
-                      →
-                    </div>
-
-                  </button>
-
-                ))}
-
-              </div>
-
-            </div>
-
-          )}
-
-
-          {/* INPUT */}
-
-          <div style={styles.chatArea}>
-
-            <div style={styles.inputWrapper}>
-
-              <textarea
-                value={message}
-                onChange={(e) =>
-                  setMessage(e.target.value)
-                }
-                onKeyDown={handleKeyDown}
-                placeholder="Tanyakan sesuatu tentang bisnis Dolan Sawah..."
-                style={styles.textarea}
-                rows={1}
-              />
-
-              <button
-                onClick={() => sendMessage()}
-                style={{
-                  ...styles.sendButton,
-                  opacity:
-                    message.trim() && !isThinking
-                      ? 1
-                      : 0.45,
-                }}
-              >
-                ↑
-              </button>
-
-            </div>
-
-            <div style={styles.inputHint}>
-              Tekan Enter untuk mengirim · Shift + Enter
-              untuk baris baru
-            </div>
-
-          </div>
-
-        </section>
-
-
-        {/* FOOTER */}
-
-        <footer style={styles.footer}>
-          <span>Dolan Sawah AI</span>
-          <span>•</span>
-          <span>Powered by Nuvora Systems</span>
-        </footer>
-
-      </main>
-
+    "Saya belum menemukan Gemini API key yang aktif (VITE_GEMINI_API_KEY), jadi jawaban ini dihasilkan " +
+    "dari perhitungan lokal saja.\n\n" +
+    "Saya bisa menjawab langsung untuk topik: kebutuhan bahan/saran pembelian, variance & waste, " +
+    "penjualan, harga bahan, dan pengecekan barang datang. Coba spesifikkan salah satu topik itu, " +
+    "atau sambungkan Gemini API key untuk jawaban bebas."
+  );
+}
+
+/* =========================================================
+   IKON (SVG inline ringan, tanpa dependency)
+   ========================================================= */
+
+const ICONS = {
+  chat: "M4 4h16v12H7l-3 3V4z",
+  grid: "M4 4h7v7H4zM13 4h7v7h-7zM4 13h7v7H4zM13 13h7v7h-7z",
+  cart: "M3 4h2l2.4 12.2A2 2 0 0 0 9.4 18H18a2 2 0 0 0 2-1.6L21.5 8H6",
+  truck: "M2 7h11v9H2zM13 10h5l3 3v3h-8zM6 19a1.5 1.5 0 1 0 0-3 1.5 1.5 0 0 0 0 3zM18 19a1.5 1.5 0 1 0 0-3 1.5 1.5 0 0 0 0 3z",
+  coin: "M12 21a9 9 0 1 0 0-18 9 9 0 0 0 0 18zM12 7v10M9 9.5c0-1 1-1.8 3-1.8s3 .8 3 1.8-1 1.5-3 1.8-3 .8-3 1.9 1 1.8 3 1.8 3-.8 3-1.8",
+  box: "M3 7l9-4 9 4-9 4-9-4zM3 7v10l9 4 9-4V7M12 11v10",
+  leaf: "M20 4C10 4 4 10 4 18c8 0 14-6 16-14zM4 20c4-4 8-8 16-16",
+  trend: "M3 17l6-6 4 4 8-8M15 6h6v6",
+  tag: "M20 12l-8 8-9-9V4h7l10 8zM7 7h.01",
+  upload: "M12 16V4M7 9l5-5 5 5M4 16v3a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-3",
+  doc: "M6 3h8l4 4v14H6zM14 3v4h4M9 12h6M9 16h6M9 8h2",
+  book: "M4 5c0-1 1-2 3-2h5v16H7c-2 0-3 1-3 2zM12 3h5c2 0 3 1 3 2v14c0-1-1-2-3-2h-5z"
+};
+
+function Icon({ name, size = 17 }) {
+  const path = ICONS[name] || ICONS.doc;
+  return (
+    <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
+      <path d={path} />
+    </svg>
+  );
+}
+
+/* =========================================================
+   KOMPONEN KECIL
+   ========================================================= */
+
+function StatCard({ title, value, subtitle, icon, tone = "green" }) {
+  return (
+    <div className="stat-card">
+      <div className={`stat-icon tone-${tone}`}>
+        <Icon name={icon} size={19} />
+      </div>
+      <div>
+        <div className="stat-title">{title}</div>
+        <div className="stat-value">{value}</div>
+        {subtitle && <div className="stat-subtitle">{subtitle}</div>}
+      </div>
     </div>
   );
 }
 
+function HealthBar({ ratio }) {
+  // ratio: aktual/teoritis. 1 = sehat, <1 = menipis, negatif/0 = kritis.
+  const pct = Math.max(0, Math.min(1, ratio));
+  const tone = ratio < 0.15 ? "critical" : ratio < 0.4 ? "watch" : "healthy";
+  return (
+    <div className="health-bar">
+      <div className={`health-bar-fill tone-${tone}`} style={{ width: `${pct * 100}%` }} />
+    </div>
+  );
+}
 
-/* ================= STYLES ================= */
+function DataTable({ columns, rows, emptyText = "Belum ada data." }) {
+  return (
+    <div className="table-wrapper">
+      {rows.length === 0 ? (
+        <div className="empty-state">
+          <div className="empty-icon"><Icon name="box" size={26} /></div>
+          <div className="empty-title">{emptyText}</div>
+          <div className="empty-description">Kirim data melalui AI Assistant atau import Excel.</div>
+        </div>
+      ) : (
+        <table>
+          <thead>
+            <tr>{columns.map((c) => <th key={c}>{c}</th>)}</tr>
+          </thead>
+          <tbody>
+            {rows.map((row, i) => (
+              <tr key={i}>{row.map((cell, j) => <td key={j}>{cell}</td>)}</tr>
+            ))}
+          </tbody>
+        </table>
+      )}
+    </div>
+  );
+}
 
-const styles = {
+function ChatMessage({ message }) {
+  const isUser = message.role === "user";
+  return (
+    <div className={`chat-row ${isUser ? "chat-row-user" : "chat-row-ai"}`}>
+      {!isUser && <div className="chat-avatar">DS</div>}
+      <div className={`chat-bubble ${isUser ? "chat-bubble-user" : "chat-bubble-ai"}`}>
+        {message.text}
+        {message.tags?.length > 0 && (
+          <div className="chat-tags">
+            {message.tags.map((tag, i) => (
+              <span key={i} className="chat-tag">{tag}</span>
+            ))}
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
 
-  app: {
-    minHeight: "100vh",
-    display: "flex",
-    background: "#f7f9fc",
-    color: "#172033",
-    fontFamily:
-      "Inter, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif",
-  },
+/* =========================================================
+   APP
+   ========================================================= */
 
-  sidebar: {
-    width: "250px",
-    minHeight: "100vh",
-    background: "#ffffff",
-    borderRight: "1px solid #e7ebf2",
-    display: "flex",
-    flexDirection: "column",
-    padding: "24px 16px",
-    boxSizing: "border-box",
-  },
+export default function App() {
+  const [authUser, setAuthUser] = useState(null);
+  const [authChecked, setAuthChecked] = useState(false);
+  const [loginEmail, setLoginEmail] = useState("");
+  const [loginPassword, setLoginPassword] = useState("");
+  const [loginError, setLoginError] = useState("");
+  const [loginBusy, setLoginBusy] = useState(false);
 
-  logoArea: {
-    display: "flex",
-    alignItems: "center",
-    gap: "12px",
-    padding: "0 8px 28px",
-  },
+  useEffect(() => {
+    const unsubscribe = onAuthStateChanged(auth, (user) => {
+      setAuthUser(user);
+      setAuthChecked(true);
+    });
+    return unsubscribe;
+  }, []);
 
-  logo: {
-    width: "42px",
-    height: "42px",
-    borderRadius: "13px",
-    background:
-      "linear-gradient(135deg, #2563eb, #7c3aed)",
-    color: "white",
-    display: "flex",
-    alignItems: "center",
-    justifyContent: "center",
-    fontWeight: "800",
-    fontSize: "14px",
-    boxShadow:
-      "0 8px 20px rgba(37,99,235,0.20)",
-  },
+  function describeAuthError(error) {
+    switch (error?.code) {
+      case "auth/invalid-email":
+        return "Format email tidak valid.";
+      case "auth/user-not-found":
+      case "auth/wrong-password":
+      case "auth/invalid-credential":
+        return "Email atau password salah.";
+      case "auth/too-many-requests":
+        return "Terlalu banyak percobaan gagal. Coba lagi beberapa saat lagi.";
+      case "auth/user-disabled":
+        return "Akun ini dinonaktifkan.";
+      case "auth/network-request-failed":
+        return "Tidak ada koneksi internet ke server Firebase. Periksa jaringan Anda.";
+      case "auth/unauthorized-domain":
+        return "Domain ini belum diizinkan untuk login (Authorized domains di Firebase Console).";
+      default:
+        return `Gagal login: ${error?.message || "terjadi kesalahan tidak dikenal"} (${error?.code || "no-code"})`;
+    }
+  }
 
-  logoTitle: {
-    fontSize: "15px",
-    fontWeight: "750",
-  },
+  async function handleLogin(e) {
+    e.preventDefault();
+    setLoginError("");
+    setLoginBusy(true);
+    try {
+      await signInWithEmailAndPassword(auth, loginEmail.trim(), loginPassword);
+      setLoginPassword("");
+    } catch (error) {
+      console.error("Login error:", error);
+      setLoginError(describeAuthError(error));
+    } finally {
+      setLoginBusy(false);
+    }
+  }
 
-  logoSubtitle: {
-    fontSize: "11px",
-    color: "#8a94a6",
-    marginTop: "3px",
-  },
+  const [activeMenu, setActiveMenu] = useState("chat");
+  const [activeOutlet, setActiveOutlet] = useState("ALL");
+  const [chatOutlet, setChatOutlet] = useState("DS");
 
-  newChat: {
-    width: "100%",
-    border: "1px solid #dce3ef",
-    background: "#ffffff",
-    borderRadius: "11px",
-    padding: "11px 13px",
-    display: "flex",
-    alignItems: "center",
-    gap: "10px",
-    fontSize: "13px",
-    fontWeight: "600",
-    color: "#25324a",
-    cursor: "pointer",
-    marginBottom: "28px",
-  },
+  const [messages, setMessages] = useState([
+    {
+      id: "welcome",
+      role: "assistant",
+      text:
+        "Halo, saya Dolan Sawah AI.\n\n" +
+        "Kirim data operasional dalam bahasa biasa — stok awal, pembelian, barang datang, " +
+        "penjualan, stock opname, resep, waste, atau harga bahan — dan saya catat otomatis " +
+        "ke database untuk 3 outlet (Dolan Sawah, Sawah Senja, Soto Pagi).\n\n" +
+        "Saya juga bisa menjawab pertanyaan seperti \"apa saja yang perlu dibeli besok?\" atau " +
+        "\"item mana selisihnya paling besar minggu ini?\"."
+    }
+  ]);
 
-  plus: {
-    fontSize: "20px",
-    color: "#2563eb",
-  },
+  const [input, setInput] = useState("");
+  const [loading, setLoading] = useState(false);
+  const [systemOnline, setSystemOnline] = useState(false);
+  const [dataLoading, setDataLoading] = useState(true);
 
-  menuSection: {
-    flex: 1,
-  },
+  const [rawData, setRawData] = useState({
+    items: [], recipes: [], openingStock: [], purchases: [],
+    receiving: [], sales: [], stockOpname: [], waste: [], adjustments: []
+  });
+  const [priceHistory, setPriceHistory] = useState([]);
 
-  menuLabel: {
-    fontSize: "10px",
-    fontWeight: "700",
-    color: "#9aa4b5",
-    letterSpacing: "1px",
-    padding: "0 10px 10px",
-  },
+  const [importResult, setImportResult] = useState(null);
+  const [importBusy, setImportBusy] = useState(false);
 
-  menuItem: {
-    padding: "11px 12px",
-    borderRadius: "9px",
-    display: "flex",
-    alignItems: "center",
-    gap: "12px",
-    color: "#657084",
-    fontSize: "13px",
-    marginBottom: "4px",
-    cursor: "pointer",
-  },
+  const chatRef = useRef(null);
 
-  menuItemActive: {
-    padding: "11px 12px",
-    borderRadius: "9px",
-    display: "flex",
-    alignItems: "center",
-    gap: "12px",
-    color: "#2563eb",
-    background: "#eff5ff",
-    fontSize: "13px",
-    fontWeight: "650",
-    marginBottom: "4px",
-  },
+  useEffect(() => {
+    if (!chatRef.current) return;
+    chatRef.current.scrollTop = chatRef.current.scrollHeight;
+  }, [messages, loading]);
 
-  sidebarBottom: {
-    borderTop: "1px solid #edf0f5",
-    paddingTop: "14px",
-  },
+  async function checkConnection() {
+    try {
+      await getDocs(query(collection(db, COLLECTIONS.SALES), limit(1)));
+      setSystemOnline(true);
+    } catch (error) {
+      console.error("Firebase connection error:", error);
+      setSystemOnline(false);
+    }
+  }
 
-  userBox: {
-    display: "flex",
-    alignItems: "center",
-    gap: "10px",
-    padding: "12px 8px 4px",
-  },
+  async function refreshData() {
+    const [inventory, prices] = await Promise.all([
+      loadInventoryData(),
+      getPriceHistory()
+    ]);
+    setRawData(inventory);
+    setPriceHistory(prices);
+  }
 
-  avatar: {
-    width: "32px",
-    height: "32px",
-    borderRadius: "50%",
-    background: "#e8eefc",
-    color: "#2563eb",
-    display: "flex",
-    alignItems: "center",
-    justifyContent: "center",
-    fontWeight: "700",
-    fontSize: "13px",
-  },
+  useEffect(() => {
+    if (!authUser) return;
+    setDataLoading(true);
+    Promise.all([checkConnection(), refreshData()]).finally(() => setDataLoading(false));
+  }, [authUser]);
 
-  userName: {
-    fontSize: "12px",
-    fontWeight: "650",
-  },
+  /* =======================================================
+     PERHITUNGAN TURUNAN
+     ======================================================= */
 
-  userRole: {
-    fontSize: "10px",
-    color: "#9aa4b5",
-    marginTop: "2px",
-  },
+  const filteredData = useMemo(
+    () => filterDataByOutlet(rawData, activeOutlet),
+    [rawData, activeOutlet]
+  );
 
-  main: {
-    flex: 1,
-    minWidth: 0,
-    display: "flex",
-    flexDirection: "column",
-  },
+  const normalizedData = useMemo(() => toBaseUnitDataset(filteredData), [filteredData]);
 
-  header: {
-    height: "72px",
-    background: "rgba(255,255,255,0.90)",
-    borderBottom: "1px solid #e7ebf2",
-    display: "flex",
-    alignItems: "center",
-    justifyContent: "space-between",
-    padding: "0 34px",
-    boxSizing: "border-box",
-  },
+  const theoreticalStock = useMemo(
+    () => calculateTheoreticalStock(normalizedData),
+    [normalizedData]
+  );
 
-  pageTitle: {
-    fontSize: "16px",
-    fontWeight: "700",
-  },
+  const varianceReport = useMemo(
+    () => generateVarianceReport(theoreticalStock),
+    [theoreticalStock]
+  );
 
-  pageSubtitle: {
-    fontSize: "11px",
-    color: "#8b95a7",
-    marginTop: "3px",
-  },
+  const avgDailySales = useMemo(
+    () => computeAvgDailySales(filteredData.sales, 7),
+    [filteredData.sales]
+  );
 
-  status: {
-    display: "flex",
-    alignItems: "center",
-    gap: "7px",
-    fontSize: "11px",
-    color: "#657084",
-    background: "#f7f9fc",
-    border: "1px solid #e5e9f0",
-    borderRadius: "20px",
-    padding: "7px 11px",
-  },
+  const ingredientForecast = useMemo(() => {
+    const syntheticSales = Object.entries(avgDailySales).map(([menuName, quantity]) => ({
+      menuName,
+      quantity
+    }));
+    return calculateUsageFromSales(syntheticSales, normalizedData.recipes);
+  }, [avgDailySales, normalizedData.recipes]);
 
-  statusDot: {
-    width: "7px",
-    height: "7px",
-    background: "#22c55e",
-    borderRadius: "50%",
-    display: "inline-block",
-  },
+  const purchaseSuggestions = useMemo(
+    () => buildPurchaseSuggestions(ingredientForecast, theoreticalStock),
+    [ingredientForecast, theoreticalStock]
+  );
 
-  chatContainer: {
-    width: "100%",
-    maxWidth: "950px",
-    margin: "0 auto",
-    padding: "55px 32px 30px",
-    boxSizing: "border-box",
-    flex: 1,
-    display: "flex",
-    flexDirection: "column",
-  },
+  const receivingIssues = useMemo(
+    () => filteredData.receiving.filter((r) => Math.abs(Number(r.difference || 0)) > 0.0001),
+    [filteredData.receiving]
+  );
 
-  hero: {
-    textAlign: "center",
-    maxWidth: "680px",
-    margin: "0 auto 35px",
-  },
+  /* =======================================================
+     PROSES PESAN CHAT
+     ======================================================= */
 
-  aiIcon: {
-    width: "52px",
-    height: "52px",
-    margin: "0 auto 20px",
-    borderRadius: "16px",
-    background:
-      "linear-gradient(135deg, #2563eb, #7c3aed)",
-    color: "#ffffff",
-    display: "flex",
-    alignItems: "center",
-    justifyContent: "center",
-    fontSize: "25px",
-    boxShadow:
-      "0 12px 30px rgba(79,70,229,0.20)",
-  },
+  async function processMessage(text) {
+    const dataType = detectDataType(text);
+    const date = extractDate(text);
+    const outlet = detectOutlet(text, chatOutlet);
 
-  heroTitle: {
-    fontSize: "34px",
-    lineHeight: "1.2",
-    margin: 0,
-    fontWeight: "800",
-    letterSpacing: "-1px",
-  },
+    if (dataType === "opening_stock") {
+      const items = parseItemLines(text);
+      if (!items.length) {
+        return {
+          text:
+            "Saya kenali ini sebagai STOK AWAL, tapi belum menemukan pasangan barang + jumlah.\n\n" +
+            "Contoh:\nStok awal 21 Agustus 2026 DS\nAyam 35 kg\nDaging sapi 18 kg",
+          tags: ["STOK AWAL"]
+        };
+      }
+      const rows = items.map((x) => createOpeningStock({ ...x, date, outlet }));
+      await saveRows(COLLECTIONS.OPENING_STOCK, rows);
+      await refreshData();
+      return {
+        text:
+          `STOK AWAL (${outlet}) tersimpan.\n\nTanggal: ${formatDateID(date)}\n\n` +
+          items.map((x) => `- ${x.itemName}: ${formatNumber(x.quantity)} ${x.unit}`).join("\n"),
+        tags: ["STOK AWAL", "TERSIMPAN"]
+      };
+    }
 
-  gradientText: {
-    background:
-      "linear-gradient(90deg, #2563eb, #7c3aed)",
-    WebkitBackgroundClip: "text",
-    WebkitTextFillColor: "transparent",
-  },
+    if (dataType === "purchase") {
+      const items = parseItemLines(text);
+      const supplier = extractLabeledValue(text, ["supplier", "vendor", "pemasok"]);
+      if (!items.length) {
+        return {
+          text:
+            "Saya kenali ini sebagai PEMBELIAN, tapi jumlah barang belum terbaca.\n\n" +
+            "Contoh:\nPembelian 21 Agustus 2026 DS\nSupplier: PT Ternak Jaya\nAyam 20 kg\nBeras 25 kg",
+          tags: ["PEMBELIAN"]
+        };
+      }
+      const rows = items.map((x) => createPurchase({ ...x, date, outlet, supplier }));
+      await saveRows(COLLECTIONS.PURCHASES, rows);
+      await refreshData();
+      return {
+        text:
+          `PEMBELIAN (${outlet}) tersimpan — barang ini akan dicocokkan otomatis saat Anda kirim ` +
+          `data "barang datang".\n\nTanggal: ${formatDateID(date)}${supplier ? `\nSupplier: ${supplier}` : ""}\n\n` +
+          items.map((x) => `- ${x.itemName}: ${formatNumber(x.quantity)} ${x.unit}`).join("\n"),
+        tags: ["PEMBELIAN", "TERSIMPAN"]
+      };
+    }
 
-  heroText: {
-    maxWidth: "580px",
-    margin: "16px auto 0",
-    color: "#778195",
-    fontSize: "14px",
-    lineHeight: "1.7",
-  },
+    if (dataType === "receiving") {
+      const items = parseItemLines(text);
+      if (!items.length) {
+        return {
+          text:
+            "Saya kenali ini sebagai BARANG DATANG, tapi jumlah belum terbaca.\n\n" +
+            "Contoh:\nBarang datang 22 Agustus 2026 DS\nAyam 20 kg\nBeras 25 kg",
+          tags: ["BARANG DATANG"]
+        };
+      }
 
-  messages: {
-    display: "flex",
-    flexDirection: "column",
-    gap: "14px",
-    marginBottom: "25px",
-  },
+      const relevantPurchases = filteredData.purchases.filter((p) => p.outlet === outlet);
+      const rows = [];
+      const noteLines = [];
 
-  messageRow: {
-    display: "flex",
-    alignItems: "flex-start",
-    gap: "9px",
-  },
+      for (const item of items) {
+        const candidates = relevantPurchases
+          .filter((p) => normalizeText(p.itemName) === normalizeText(item.itemName) && p.date <= date)
+          .sort((a, b) => (a.date < b.date ? 1 : -1));
 
-  smallAI: {
-    width: "30px",
-    height: "30px",
-    minWidth: "30px",
-    borderRadius: "9px",
-    background:
-      "linear-gradient(135deg, #2563eb, #7c3aed)",
-    color: "#ffffff",
-    display: "flex",
-    alignItems: "center",
-    justifyContent: "center",
-    fontSize: "14px",
-  },
+        const matched = candidates[0];
+        const orderedQuantity = matched ? Number(matched.quantity) : 0;
 
-  aiBubble: {
-    maxWidth: "75%",
-    background: "#ffffff",
-    border: "1px solid #e4e9f1",
-    borderRadius: "4px 14px 14px 14px",
-    padding: "12px 15px",
-    color: "#4c586d",
-    fontSize: "13px",
-    lineHeight: "1.6",
-    boxShadow:
-      "0 3px 12px rgba(31,41,55,0.03)",
-  },
+        rows.push(
+          createReceiving({
+            date,
+            outlet,
+            supplier: matched?.supplier || "",
+            itemName: item.itemName,
+            orderedQuantity,
+            receivedQuantity: item.quantity,
+            unit: item.unit
+          })
+        );
 
-  userBubble: {
-    maxWidth: "75%",
-    background:
-      "linear-gradient(135deg, #2563eb, #4f46e5)",
-    color: "#ffffff",
-    borderRadius: "14px 4px 14px 14px",
-    padding: "12px 15px",
-    fontSize: "13px",
-    lineHeight: "1.6",
-    boxShadow:
-      "0 5px 15px rgba(37,99,235,0.15)",
-  },
+        if (matched) {
+          const diff = item.quantity - orderedQuantity;
+          if (Math.abs(diff) > 0.0001) {
+            noteLines.push(
+              `⚠️ ${item.itemName}: dipesan ${formatNumber(orderedQuantity)} ${item.unit}, diterima ${formatNumber(
+                item.quantity
+              )} ${item.unit} (selisih ${formatNumber(diff)})`
+            );
+          } else {
+            noteLines.push(`✅ ${item.itemName}: sesuai pesanan`);
+          }
+        } else {
+          noteLines.push(`ℹ️ ${item.itemName}: tidak ditemukan pembelian yang cocok — dicatat apa adanya`);
+        }
+      }
 
-  thinking: {
-    color: "#8b95a7",
-    fontStyle: "italic",
-  },
+      await saveRows(COLLECTIONS.RECEIVING, rows);
+      await refreshData();
 
-  quickSection: {
-    marginBottom: "25px",
-  },
+      return {
+        text:
+          `BARANG DATANG (${outlet}) tersimpan.\n\nTanggal: ${formatDateID(date)}\n\n` +
+          noteLines.join("\n"),
+        tags: ["BARANG DATANG", "TERSIMPAN"]
+      };
+    }
 
-  sectionTitle: {
-    fontSize: "12px",
-    fontWeight: "700",
-    color: "#69758a",
-    marginBottom: "12px",
-  },
+    if (dataType === "sales") {
+      const items = parseSalesLines(text);
+      if (!items.length) {
+        return {
+          text:
+            "Saya kenali ini sebagai PENJUALAN, tapi menu + jumlah porsi belum terbaca.\n\n" +
+            "Contoh:\nPenjualan 21 Agustus 2026 DS\nAyam Bakar 45 porsi\nAyam Geprek 32 porsi",
+          tags: ["PENJUALAN"]
+        };
+      }
+      const rows = items.map((x) => createSale({ ...x, date, outlet, source: "AI" }));
+      await saveRows(COLLECTIONS.SALES, rows);
+      await refreshData();
+      const total = items.reduce((sum, x) => sum + x.quantity, 0);
+      return {
+        text:
+          `PENJUALAN (${outlet}) tersimpan.\n\nTanggal: ${formatDateID(date)}\n\n` +
+          items.map((x) => `- ${x.menuName}: ${formatNumber(x.quantity)} porsi`).join("\n") +
+          `\n\nTotal porsi: ${formatNumber(total)}. Data ini otomatis dipakai untuk menghitung ` +
+          `kebutuhan bahan besok berdasarkan resep.`,
+        tags: ["PENJUALAN", "TERSIMPAN"]
+      };
+    }
 
-  cards: {
-    display: "grid",
-    gridTemplateColumns:
-      "repeat(2, minmax(0, 1fr))",
-    gap: "10px",
-  },
+    if (dataType === "stock_opname") {
+      const items = parseItemLines(text);
+      if (!items.length) {
+        return {
+          text:
+            "Saya kenali ini sebagai STOCK OPNAME, tapi jumlah fisik belum terbaca.\n\n" +
+            "Contoh:\nStock opname 21 Agustus 2026 DS\nAyam 28 kg\nBeras 42 kg",
+          tags: ["STOCK OPNAME"]
+        };
+      }
+      const rows = items.map((x) =>
+        createStockOpname({
+          date,
+          outlet,
+          itemName: x.itemName,
+          actualQuantity: x.quantity,
+          unit: x.unit
+        })
+      );
+      await saveRows(COLLECTIONS.STOCK_OPNAME, rows);
+      await refreshData();
+      return {
+        text:
+          `STOCK OPNAME (${outlet}) tersimpan.\n\nTanggal: ${formatDateID(date)}\n\n` +
+          items.map((x) => `- ${x.itemName}: ${formatNumber(x.quantity)} ${x.unit}`).join("\n") +
+          `\n\nBuka menu Variance & Waste untuk melihat selisih dengan stok teoritis.`,
+        tags: ["STOCK OPNAME", "TERSIMPAN"]
+      };
+    }
 
-  card: {
-    border: "1px solid #e5eaf2",
-    background: "#ffffff",
-    borderRadius: "12px",
-    padding: "15px",
-    display: "flex",
-    alignItems: "center",
-    textAlign: "left",
-    gap: "12px",
-    cursor: "pointer",
-    color: "#26334a",
-  },
+    if (dataType === "waste") {
+      const items = parseItemLines(text);
+      const reason = extractLabeledValue(text, ["alasan", "keterangan", "sebab"]);
+      if (!items.length) {
+        return {
+          text:
+            "Saya kenali ini sebagai WASTE, tapi jumlah belum terbaca.\n\n" +
+            "Contoh:\nWaste 21 Agustus 2026 DS\nAlasan: basi\nAyam 2 kg",
+          tags: ["WASTE"]
+        };
+      }
+      const rows = items.map((x) => createWaste({ ...x, date, outlet, reason }));
+      await saveRows(COLLECTIONS.WASTE, rows);
+      await refreshData();
+      return {
+        text:
+          `WASTE (${outlet}) tersimpan.\n\nTanggal: ${formatDateID(date)}${reason ? `\nAlasan: ${reason}` : ""}\n\n` +
+          items.map((x) => `- ${x.itemName}: ${formatNumber(x.quantity)} ${x.unit}`).join("\n"),
+        tags: ["WASTE", "TERSIMPAN"]
+      };
+    }
 
-  cardIcon: {
-    width: "34px",
-    height: "34px",
-    borderRadius: "9px",
-    background: "#f1f5ff",
-    color: "#356de8",
-    display: "flex",
-    alignItems: "center",
-    justifyContent: "center",
-    fontSize: "15px",
-  },
+    if (dataType === "adjustment") {
+      const items = parseItemLines(text);
+      const reason = extractLabeledValue(text, ["alasan", "keterangan"]);
+      if (!items.length) {
+        return {
+          text: "Saya kenali ini sebagai PENYESUAIAN STOK, tapi jumlah belum terbaca.",
+          tags: ["PENYESUAIAN"]
+        };
+      }
+      const rows = items.map((x) => createAdjustment({ ...x, date, outlet, reason }));
+      await saveRows(COLLECTIONS.ADJUSTMENTS, rows);
+      await refreshData();
+      return {
+        text: `PENYESUAIAN STOK (${outlet}) tersimpan.`,
+        tags: ["PENYESUAIAN", "TERSIMPAN"]
+      };
+    }
 
-  cardText: {
-    flex: 1,
-    fontSize: "12px",
-    fontWeight: "600",
-  },
+    if (dataType === "recipe") {
+      const groups = parseRecipeGroups(text);
+      if (!groups.length) {
+        return {
+          text:
+            "Saya kenali ini sebagai RESEP, tapi formatnya belum terbaca.\n\n" +
+            "Contoh:\nSoto Ayam\nAyam 50 gram per porsi\nBeras 100 gram per porsi",
+          tags: ["RESEP"]
+        };
+      }
+      for (const group of groups) {
+        await saveRecipe({ menuName: group.menuName, ingredients: group.ingredients, portions: 1 });
+      }
+      await refreshData();
+      const output = groups
+        .map(
+          (g) =>
+            `${g.menuName}\n` +
+            g.ingredients.map((x) => `- ${x.itemName}: ${formatNumber(x.quantity)} ${x.unit} / porsi`).join("\n")
+        )
+        .join("\n\n");
+      return {
+        text: `RESEP tersimpan.\n\n${output}`,
+        tags: ["RESEP", "TERSIMPAN"]
+      };
+    }
 
-  cardArrow: {
-    color: "#a1aabd",
-    fontSize: "16px",
-  },
+    if (dataType === "price") {
+      const items = parsePriceLines(text);
+      if (!items.length) {
+        return {
+          text:
+            "Saya kenali ini sebagai UPDATE HARGA, tapi format harga belum terbaca.\n\n" +
+            "Contoh:\nHarga update\nAyam Rp 35.000 / kg\nBeras Rp 15.000 / kg",
+          tags: ["HARGA"]
+        };
+      }
+      for (const item of items) {
+        await savePrice({ ...item, effectiveDate: date, source: "AI" });
+      }
+      await refreshData();
+      return {
+        text:
+          "UPDATE HARGA tersimpan.\n\n" +
+          items.map((x) => `- ${x.itemName}: Rp ${formatNumber(x.price)} / ${x.unit}`).join("\n"),
+        tags: ["HARGA", "TERSIMPAN"]
+      };
+    }
 
-  chatArea: {
-    marginTop: "auto",
-  },
+    if (dataType === "report") {
+      const ctx = {
+        varianceReport,
+        purchaseSuggestions,
+        avgDailySales,
+        priceHistory,
+        receivingIssues
+      };
 
-  inputWrapper: {
-    display: "flex",
-    alignItems: "flex-end",
-    gap: "10px",
-    background: "#ffffff",
-    border: "1px solid #dce3ed",
-    borderRadius: "15px",
-    padding: "10px 10px 10px 16px",
-    boxShadow:
-      "0 8px 30px rgba(31,41,55,0.06)",
-  },
+      const contextText = JSON.stringify({
+        outlet: activeOutlet,
+        tanggal: TODAY,
+        item_variance_terbesar: varianceReport.items
+          .slice()
+          .sort((a, b) => a.variance - b.variance)
+          .slice(0, 10)
+          .map((x) => ({
+            item: x.itemName,
+            teoritis: Math.round(x.theoretical),
+            aktual: Math.round(x.actual),
+            selisih: Math.round(x.variance),
+            satuan: x.unit
+          })),
+        saran_pembelian: purchaseSuggestions.slice(0, 10).map((x) => ({
+          item: x.itemName,
+          kebutuhan_harian: Math.round(x.dailyNeed),
+          stok_sekarang: Math.round(x.currentStock),
+          saran_beli: Math.round(x.suggestedPurchase),
+          satuan: x.base
+        })),
+        rata_rata_penjualan_harian: avgDailySales,
+        selisih_barang_datang: receivingIssues.slice(0, 10)
+      });
 
-  textarea: {
-    flex: 1,
-    resize: "none",
-    border: "none",
-    outline: "none",
-    fontFamily: "inherit",
-    fontSize: "13px",
-    lineHeight: "1.5",
-    color: "#26334a",
-    background: "transparent",
-    minHeight: "24px",
-    maxHeight: "100px",
-  },
+      let answerText;
+      let usedFallback = false;
+      try {
+        answerText = await askGemini(buildReportPrompt(text, contextText));
+      } catch (error) {
+        console.warn("Gemini fallback:", error.message);
+        answerText = buildLocalReport(text, ctx);
+        usedFallback = true;
+      }
 
-  sendButton: {
-    width: "38px",
-    height: "38px",
-    border: "none",
-    borderRadius: "10px",
-    background:
-      "linear-gradient(135deg, #2563eb, #4f46e5)",
-    color: "#ffffff",
-    fontSize: "20px",
-    cursor: "pointer",
-  },
+      return {
+        text: answerText,
+        tags: usedFallback ? ["LAPORAN AI", "MODE LOKAL"] : ["LAPORAN AI"]
+      };
+    }
 
-  inputHint: {
-    textAlign: "center",
-    fontSize: "10px",
-    color: "#a2aaba",
-    marginTop: "9px",
-  },
+    const lower = normalizeText(text);
+    if (lower.includes("status") || lower.includes("database")) {
+      return {
+        text:
+          `STATUS SISTEM\n\n` +
+          `Firebase: ${systemOnline ? "Terhubung" : "Periksa koneksi"}\n\n` +
+          `Penjualan: ${rawData.sales.length} record\n` +
+          `Pembelian: ${rawData.purchases.length} record\n` +
+          `Barang datang: ${rawData.receiving.length} record\n` +
+          `Stok awal: ${rawData.openingStock.length} record\n` +
+          `Stock opname: ${rawData.stockOpname.length} record\n` +
+          `Resep: ${rawData.recipes.length} menu\n` +
+          `Harga tersimpan: ${priceHistory.length} record`,
+        tags: ["STATUS"]
+      };
+    }
 
-  footer: {
-    padding: "15px 30px",
-    borderTop: "1px solid #e9edf3",
-    color: "#a0a8b6",
-    fontSize: "10px",
-    display: "flex",
-    justifyContent: "center",
-    gap: "7px",
-  },
-};
+    return {
+      text:
+        "Saya bisa mengenali: stok awal, pembelian, barang datang, penjualan, stock opname, " +
+        "waste, penyesuaian stok, resep, dan update harga — cukup ketik dalam bahasa biasa.\n\n" +
+        "Untuk laporan, coba tanya misalnya \"apa yang perlu dibeli besok?\" atau " +
+        "\"item mana yang variance-nya paling besar?\".",
+      tags: ["AI ASSISTANT"]
+    };
+  }
 
-export default App;
+  async function handleSend() {
+    const text = input.trim();
+    if (!text || loading) return;
+
+    setInput("");
+    setMessages((prev) => [...prev, { id: `user-${Date.now()}`, role: "user", text }]);
+    setLoading(true);
+
+    try {
+      const response = await processMessage(text);
+      setMessages((prev) => [
+        ...prev,
+        { id: `assistant-${Date.now()}`, role: "assistant", text: response.text, tags: response.tags }
+      ]);
+    } catch (error) {
+      console.error(error);
+      setMessages((prev) => [
+        ...prev,
+        {
+          id: `error-${Date.now()}`,
+          role: "assistant",
+          text: `Terjadi kesalahan saat memproses data.\n\nDetail: ${error?.message || "Unknown error"}`,
+          tags: ["ERROR"]
+        }
+      ]);
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  function handleKeyDown(e) {
+    if (e.key === "Enter" && !e.shiftKey) {
+      e.preventDefault();
+      handleSend();
+    }
+  }
+
+  function quickAction(text) {
+    setInput(text);
+  }
+
+  /* =======================================================
+     IMPORT EXCEL
+     ======================================================= */
+
+  async function handleFileSelected(e) {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    setImportBusy(true);
+    try {
+      const result = await processExcelFile(file);
+      setImportResult(result);
+    } catch (error) {
+      console.error(error);
+      setImportResult([{ sheetName: "Error", type: "UNKNOWN", rows: [], valid: false, errors: [error.message] }]);
+    } finally {
+      setImportBusy(false);
+    }
+  }
+
+  async function handleSaveImport() {
+    if (!importResult) return;
+    setImportBusy(true);
+    try {
+      const typeToCollection = {
+        SALES: COLLECTIONS.SALES,
+        PURCHASE: COLLECTIONS.PURCHASES,
+        RECEIVING: COLLECTIONS.RECEIVING,
+        OPENING_STOCK: COLLECTIONS.OPENING_STOCK,
+        STOCK_OPNAME: COLLECTIONS.STOCK_OPNAME,
+        WASTE: COLLECTIONS.WASTE
+      };
+
+      for (const sheet of importResult) {
+        const target = typeToCollection[sheet.type];
+        if (!target || !sheet.rows.length) continue;
+        // Buang baris tanpa identitas (itemName/menuName kosong) sebelum
+        // disimpan -- validateImport() menandainya sebagai error, tapi
+        // sheet yang tidak valid tetap bisa ditekan "Simpan" oleh user,
+        // jadi baris kosong harus disaring di sini juga.
+        const rows = sheet.rows
+          .filter((r) => r.itemName || r.menuName)
+          .map((r) => ({ ...r, outlet: r.outlet || "DS" }));
+        if (!rows.length) continue;
+        await saveRows(target, rows);
+      }
+
+      await refreshData();
+      setImportResult(null);
+    } catch (error) {
+      console.error(error);
+      alert(`Gagal menyimpan hasil import: ${error.message}`);
+    } finally {
+      setImportBusy(false);
+    }
+  }
+
+  /* =======================================================
+     RENDER HALAMAN
+     ======================================================= */
+
+  function renderDashboard() {
+    const totalSalesPortions = filteredData.sales.reduce((s, r) => s + Number(r.quantity || 0), 0);
+    const criticalCount = varianceReport.items.filter((x) => x.variance < 0).length;
+
+    return (
+      <div className="page">
+        <div className="section-header">
+          <div>
+            <h1>Dashboard</h1>
+            <p>Ringkasan operasional — {OUTLETS.find((o) => o.id === activeOutlet)?.label}.</p>
+          </div>
+        </div>
+
+        <div className="stat-grid">
+          <StatCard title="Penjualan" value={formatNumber(totalSalesPortions)} subtitle="total porsi tercatat" icon="coin" tone="orange" />
+          <StatCard title="Pembelian" value={rawData.purchases.length} subtitle="record" icon="cart" tone="green" />
+          <StatCard title="Barang Datang" value={rawData.receiving.length} subtitle="record" icon="truck" tone="green" />
+          <StatCard title="Item Bervariance" value={criticalCount} subtitle="perlu ditinjau" icon="trend" tone={criticalCount > 0 ? "orange" : "green"} />
+        </div>
+
+        <div className="card">
+          <div className="card-title">Saran pembelian teratas</div>
+          <div className="card-description">Berdasarkan rata-rata penjualan 7 hari terakhir dikurangi stok berjalan.</div>
+          <DataTable
+            columns={["Bahan", "Kebutuhan/hari", "Stok sekarang", "Saran beli"]}
+            rows={purchaseSuggestions.slice(0, 6).map((x) => [
+              x.itemName,
+              displayQuantity(x.dailyNeed, x.base),
+              displayQuantity(x.currentStock, x.base),
+              displayQuantity(x.suggestedPurchase, x.base)
+            ])}
+          />
+        </div>
+
+        <div className="card">
+          <div className="card-title">Status database</div>
+          <p className="card-description">
+            Firebase: <strong>{systemOnline ? "Terhubung" : "Belum terhubung"}</strong>
+          </p>
+          <button className="secondary-button" onClick={refreshData}>Refresh data</button>
+        </div>
+      </div>
+    );
+  }
+
+  function renderPembelian() {
+    return (
+      <div className="page">
+        <div className="section-header"><div><h1>Pembelian</h1><p>Barang yang dipesan ke supplier.</p></div></div>
+        <DataTable
+          columns={["Tanggal", "Outlet", "Barang", "Jumlah", "Supplier"]}
+          rows={filteredData.purchases
+            .slice()
+            .sort((a, b) => (a.date < b.date ? 1 : -1))
+            .map((x) => [formatDateID(x.date), x.outlet, x.itemName, `${formatNumber(x.quantity)} ${x.unit}`, x.supplier || "-"])}
+        />
+      </div>
+    );
+  }
+
+  function renderBarangDatang() {
+    return (
+      <div className="page">
+        <div className="section-header"><div><h1>Barang Datang</h1><p>Dicocokkan otomatis dengan data pembelian terakhir untuk barang yang sama.</p></div></div>
+        <DataTable
+          columns={["Tanggal", "Outlet", "Barang", "Dipesan", "Diterima", "Selisih"]}
+          rows={filteredData.receiving
+            .slice()
+            .sort((a, b) => (a.date < b.date ? 1 : -1))
+            .map((x) => [
+              formatDateID(x.date),
+              x.outlet,
+              x.itemName,
+              `${formatNumber(x.orderedQuantity)} ${x.unit}`,
+              `${formatNumber(x.receivedQuantity)} ${x.unit}`,
+              Math.abs(x.difference) > 0.0001
+                ? <span key="d" className="badge badge-warning">{formatNumber(x.difference)} {x.unit}</span>
+                : <span key="d" className="badge badge-ok">Sesuai</span>
+            ])}
+        />
+      </div>
+    );
+  }
+
+  function renderPenjualan() {
+    return (
+      <div className="page">
+        <div className="section-header"><div><h1>Penjualan</h1><p>Data penjualan yang masuk melalui chat atau import.</p></div></div>
+        <DataTable
+          columns={["Tanggal", "Outlet", "Menu", "Jumlah"]}
+          rows={filteredData.sales
+            .slice()
+            .sort((a, b) => (a.date < b.date ? 1 : -1))
+            .map((x) => [formatDateID(x.date), x.outlet, x.menuName, `${formatNumber(x.quantity)} porsi`])}
+        />
+      </div>
+    );
+  }
+
+  function renderStok() {
+    return (
+      <div className="page">
+        <div className="section-header"><div><h1>Stock Opname</h1><p>Stok fisik terakhir yang dilaporkan.</p></div></div>
+        <DataTable
+          columns={["Tanggal", "Outlet", "Barang", "Jumlah"]}
+          rows={filteredData.stockOpname
+            .slice()
+            .sort((a, b) => (a.date < b.date ? 1 : -1))
+            .map((x) => [formatDateID(x.date), x.outlet, x.itemName, `${formatNumber(x.actualQuantity)} ${x.unit}`])}
+        />
+      </div>
+    );
+  }
+
+  function renderKebutuhan() {
+    return (
+      <div className="page">
+        <div className="section-header">
+          <div><h1>Kebutuhan Bahan</h1><p>Proyeksi kebutuhan harian dari resep × rata-rata penjualan 7 hari, dibandingkan stok berjalan.</p></div>
+        </div>
+
+        {purchaseSuggestions.length === 0 && (
+          <div className="logic-card">
+            <div className="logic-icon"><Icon name="leaf" size={20} /></div>
+            <div>
+              <div className="logic-title">Belum ada proyeksi</div>
+              <div className="logic-text">
+                Proyeksi ini butuh minimal: <strong>data resep</strong> per menu dan <strong>data penjualan</strong> beberapa hari terakhir. Kirim keduanya lewat AI Assistant untuk mulai melihat saran pembelian di sini.
+              </div>
+            </div>
+          </div>
+        )}
+
+        <DataTable
+          columns={["Bahan", "Kebutuhan / hari", "Stok berjalan", "Saran pembelian", "Dipakai di menu"]}
+          rows={purchaseSuggestions.map((x) => [
+            x.itemName,
+            displayQuantity(x.dailyNeed, x.base),
+            displayQuantity(x.currentStock, x.base),
+            <strong key="s">{displayQuantity(x.suggestedPurchase, x.base)}</strong>,
+            x.sourceMenus.slice(0, 3).join(", ") || "-"
+          ])}
+        />
+      </div>
+    );
+  }
+
+  function renderVariance() {
+    const items = varianceReport.items.slice().sort((a, b) => a.variance - b.variance);
+    return (
+      <div className="page">
+        <div className="section-header">
+          <div><h1>Variance & Waste</h1><p>Stok teoritis (stok awal + barang datang − pemakaian resep − waste + penyesuaian) dibanding stock opname aktual.</p></div>
+        </div>
+        <DataTable
+          columns={["Bahan", "Teoritis", "Aktual", "Selisih", "Status"]}
+          rows={items.map((x) => {
+            const ratio = x.theoretical > 0 ? x.actual / x.theoretical : x.actual >= 0 ? 1 : 0;
+            return [
+              x.itemName,
+              displayQuantity(x.theoretical, x.unit),
+              displayQuantity(x.actual, x.unit),
+              displayQuantity(x.variance, x.unit),
+              <div key="h" style={{ minWidth: 90 }}><HealthBar ratio={ratio} /></div>
+            ];
+          })}
+        />
+      </div>
+    );
+  }
+
+  function renderHarga() {
+    const latestByItem = {};
+    priceHistory.forEach((p) => {
+      const key = normalizeText(p.itemName);
+      if (!latestByItem[key] || p.effectiveDate > latestByItem[key].effectiveDate) latestByItem[key] = p;
+    });
+    const rows = Object.values(latestByItem).sort((a, b) => a.itemName.localeCompare(b.itemName));
+
+    return (
+      <div className="page">
+        <div className="section-header"><div><h1>Harga Bahan</h1><p>Harga terbaru per bahan (riwayat lengkap tersimpan untuk perbandingan biaya resep).</p></div></div>
+        <DataTable
+          columns={["Bahan", "Harga", "Satuan", "Berlaku sejak"]}
+          rows={rows.map((x) => [x.itemName, `Rp ${formatNumber(x.price)}`, x.unit, formatDateID(x.effectiveDate)])}
+        />
+      </div>
+    );
+  }
+
+  function renderResep() {
+    return (
+      <div className="page">
+        <div className="section-header"><div><h1>Resep</h1><p>Resep yang sudah tersimpan, lengkap dengan bahan per porsi (tampilan baca saja).</p></div></div>
+        <DataTable
+          columns={["Nama Menu", "Jumlah Bahan", "Daftar Bahan"]}
+          rows={rawData.recipes
+            .slice()
+            .sort((a, b) => String(a.menuName || "").localeCompare(String(b.menuName || "")))
+            .map((r) => [
+              r.menuName,
+              (r.ingredients || []).length,
+              (r.ingredients || [])
+                .map((ing) => `${ing.itemName} ${formatNumber(ing.quantity)} ${ing.unit}`)
+                .join(", ") || "-"
+            ])}
+          emptyText="Belum ada resep tersimpan."
+        />
+      </div>
+    );
+  }
+
+  function renderImport() {
+    return (
+      <div className="page">
+        <div className="section-header"><div><h1>Import Excel / CSV</h1><p>Deteksi otomatis jenis data per sheet: penjualan, pembelian, barang datang, stok awal, stock opname, atau waste.</p></div></div>
+
+        <div className="card">
+          <label className="file-drop">
+            <input type="file" accept=".xlsx,.xls,.csv" onChange={handleFileSelected} disabled={importBusy} />
+            <Icon name="upload" size={22} />
+            <span>{importBusy ? "Memproses..." : "Pilih file Excel / CSV"}</span>
+          </label>
+        </div>
+
+        {importResult && (
+          <div className="card">
+            <div className="card-title">Hasil deteksi</div>
+            <DataTable
+              columns={["Sheet", "Jenis terdeteksi", "Baris", "Valid"]}
+              rows={importResult.map((s) => [
+                s.sheetName,
+                s.type === "UNKNOWN" ? <span key="u" className="badge badge-warning">Tidak dikenali</span> : <span key="t" className="badge badge-ok">{s.type}</span>,
+                s.rows.length,
+                s.valid ? "Ya" : `Tidak (${s.errors.length} error)`
+              ])}
+            />
+            <div className="form-footer">
+              <span className="message">Outlet default: DS (bisa diedit manual setelah tersimpan).</span>
+              <button className="primary-button" onClick={handleSaveImport} disabled={importBusy}>
+                Simpan ke database
+              </button>
+            </div>
+          </div>
+        )}
+      </div>
+    );
+  }
+
+  function renderLaporan() {
+    const prompts = [
+      "Apa saja yang perlu dibeli besok?",
+      "Item mana yang variance-nya paling besar minggu ini?",
+      "Menu apa yang paling laku 7 hari terakhir?",
+      "Apakah ada selisih antara barang datang dan pesanan?",
+      "Buatkan ringkasan performa hari ini untuk semua outlet."
+    ];
+    return (
+      <div className="page">
+        <div className="section-header"><div><h1>Laporan AI</h1><p>Tanyakan apa saja berdasarkan data yang sudah tersimpan.</p></div></div>
+        <div className="card">
+          <div className="card-title">Pertanyaan cepat</div>
+          <div className="prompt-list">
+            {prompts.map((p) => (
+              <button key={p} className="prompt-chip" onClick={() => { setActiveMenu("chat"); setInput(p); }}>
+                {p}
+              </button>
+            ))}
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  function renderContent() {
+    switch (activeMenu) {
+      case "dashboard": return renderDashboard();
+      case "pembelian": return renderPembelian();
+      case "barang-datang": return renderBarangDatang();
+      case "penjualan": return renderPenjualan();
+      case "stok": return renderStok();
+      case "kebutuhan": return renderKebutuhan();
+      case "variance": return renderVariance();
+      case "harga": return renderHarga();
+      case "resep": return renderResep();
+      case "import": return renderImport();
+      case "laporan": return renderLaporan();
+      default: return null;
+    }
+  }
+
+  /* =======================================================
+     RENDER UTAMA
+     ======================================================= */
+
+  if (!authChecked) {
+    return (
+      <div style={{ display: "flex", flexDirection: "column", gap: 12, alignItems: "center", justifyContent: "center", height: "100vh", fontFamily: "sans-serif", color: "#666" }}>
+        <div className="ds-spinner" />
+        Memuat...
+      </div>
+    );
+  }
+
+  if (!authUser) {
+    return (
+      <div style={{ display: "flex", alignItems: "center", justifyContent: "center", height: "100vh", fontFamily: "sans-serif", background: "#f5f5f0" }}>
+        <form
+          onSubmit={handleLogin}
+          style={{ background: "#fff", padding: 32, borderRadius: 12, width: 320, boxShadow: "0 2px 12px rgba(0,0,0,0.08)" }}
+        >
+          <div style={{ fontWeight: 700, fontSize: 18, marginBottom: 4 }}>Dolan Sawah AI</div>
+          <div style={{ color: "#888", fontSize: 13, marginBottom: 20 }}>Masuk untuk melanjutkan</div>
+          <input
+            type="email"
+            placeholder="Email"
+            value={loginEmail}
+            onChange={(e) => setLoginEmail(e.target.value)}
+            required
+            style={{ width: "100%", padding: "10px 12px", marginBottom: 10, borderRadius: 8, border: "1px solid #ddd", boxSizing: "border-box" }}
+          />
+          <input
+            type="password"
+            placeholder="Password"
+            value={loginPassword}
+            onChange={(e) => setLoginPassword(e.target.value)}
+            required
+            style={{ width: "100%", padding: "10px 12px", marginBottom: 10, borderRadius: 8, border: "1px solid #ddd", boxSizing: "border-box" }}
+          />
+          {loginError && <div style={{ color: "#c0392b", fontSize: 13, marginBottom: 10 }}>{loginError}</div>}
+          <button
+            type="submit"
+            disabled={loginBusy}
+            style={{ width: "100%", padding: "10px 12px", borderRadius: 8, border: "none", background: "#2e7d32", color: "#fff", fontWeight: 600, cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center", gap: 8 }}
+          >
+            {loginBusy && <div className="ds-spinner ds-spinner-light" />}
+            {loginBusy ? "Memproses..." : "Masuk"}
+          </button>
+        </form>
+      </div>
+    );
+  }
+
+  if (dataLoading) {
+    return (
+      <div style={{ display: "flex", flexDirection: "column", gap: 12, alignItems: "center", justifyContent: "center", height: "100vh", fontFamily: "sans-serif", color: "#666" }}>
+        <div className="ds-spinner" />
+        Memuat data dari Firestore...
+      </div>
+    );
+  }
+
+  return (
+    <div className="app">
+      <aside className="sidebar">
+        <div className="brand">
+          <div className="brand-logo">DS</div>
+          <div>
+            <div className="brand-title">Dolan Sawah AI</div>
+            <div className="brand-subtitle">Business Intelligence</div>
+          </div>
+        </div>
+
+        <nav className="menu-container">
+          {MENU.map((item, i) => {
+            if (item.section) return <div key={`s-${i}`} className="menu-title">{item.section}</div>;
+            const active = activeMenu === item.id;
+            return (
+              <button key={item.id} className={`menu-item ${active ? "active" : ""}`} onClick={() => setActiveMenu(item.id)}>
+                <span className="menu-icon"><Icon name={item.icon} /></span>
+                <span>{item.label}</span>
+              </button>
+            );
+          })}
+        </nav>
+
+        <div className="sidebar-bottom">
+          <div className="connection">
+            <span className={`online-dot ${systemOnline ? "" : "offline"}`} />
+            {systemOnline ? "Firebase Connected" : "Connecting..."}
+          </div>
+          <div className="powered">by Nuvora Systems</div>
+          <button
+            onClick={() => signOut(auth)}
+            style={{ marginTop: 8, width: "100%", padding: "6px 10px", borderRadius: 8, border: "1px solid #ddd", background: "transparent", color: "#888", fontSize: 12, cursor: "pointer" }}
+          >
+            Keluar ({authUser.email})
+          </button>
+        </div>
+      </aside>
+
+      <main className="main">
+        <header className="topbar">
+          <div>
+            <div className="page-title">AI Business Assistant</div>
+            <div className="page-description">Dolan Sawah Group — 3 outlet</div>
+          </div>
+
+          <div className="topbar-right">
+            <div className="outlet-switch">
+              {OUTLETS.map((o) => (
+                <button
+                  key={o.id}
+                  className={`outlet-chip ${activeOutlet === o.id ? "active" : ""}`}
+                  onClick={() => setActiveOutlet(o.id)}
+                >
+                  {o.id === "ALL" ? "Semua" : o.id}
+                </button>
+              ))}
+            </div>
+            <div className={`status ${systemOnline ? "status-ok" : "status-warn"}`}>
+              <span className="status-dot" />
+              {systemOnline ? "Online" : "Connecting"}
+            </div>
+          </div>
+        </header>
+
+        {activeMenu === "chat" ? (
+          <section className="chat-page">
+            <div className="chat-context-bar">
+              <span>Outlet untuk entri data baru:</span>
+              <div className="outlet-switch small">
+                {OUTLETS.filter((o) => o.id !== "ALL").map((o) => (
+                  <button
+                    key={o.id}
+                    className={`outlet-chip ${chatOutlet === o.id ? "active" : ""}`}
+                    onClick={() => setChatOutlet(o.id)}
+                  >
+                    {o.id}
+                  </button>
+                ))}
+              </div>
+              <span className="chat-context-hint">Anda tetap bisa menyebut outlet lain langsung di dalam pesan.</span>
+            </div>
+
+            <div ref={chatRef} className="chat-messages">
+              {messages.length === 1 && (
+                <div className="hero">
+                  <div className="hero-logo">DS</div>
+                  <h2>Apa yang ingin Anda catat hari ini?</h2>
+                  <p>Ketik data dalam bahasa biasa — saya yang mengatur ke database dan menghitung analisanya.</p>
+                </div>
+              )}
+
+              {messages.map((m) => <ChatMessage key={m.id} message={m} />)}
+
+              {loading && (
+                <div className="chat-typing">
+                  <div className="chat-avatar small">DS</div>
+                  <div className="typing">Dolan Sawah AI sedang memproses...</div>
+                </div>
+              )}
+              <div style={{ height: 12 }} />
+            </div>
+
+            <div className="quick-actions">
+              <button onClick={() => quickAction(`Stok awal hari ini ${chatOutlet}\nAyam 35 kg\nBeras 50 kg`)}>Stok Awal</button>
+              <button onClick={() => quickAction(`Pembelian hari ini ${chatOutlet}\nAyam 20 kg\nBeras 25 kg`)}>Pembelian</button>
+              <button onClick={() => quickAction(`Barang datang hari ini ${chatOutlet}\nAyam 20 kg`)}>Barang Datang</button>
+              <button onClick={() => quickAction(`Penjualan hari ini ${chatOutlet}\nAyam Bakar 45 porsi\nAyam Geprek 32 porsi`)}>Penjualan</button>
+              <button onClick={() => quickAction(`Stock opname hari ini ${chatOutlet}\nAyam 28 kg`)}>Stock Opname</button>
+              <button onClick={() => quickAction("Apa saja yang perlu dibeli besok?")}>Kebutuhan Besok</button>
+            </div>
+
+            <div className="input-area">
+              <textarea
+                value={input}
+                onChange={(e) => setInput(e.target.value)}
+                onKeyDown={handleKeyDown}
+                placeholder="Ketik data atau pertanyaan Anda..."
+                rows={2}
+              />
+              <button className="send-button" onClick={handleSend} disabled={loading || !input.trim()}>
+                <Icon name="chat" size={18} />
+              </button>
+            </div>
+            <div className="input-hint">Enter untuk mengirim • Shift + Enter untuk baris baru</div>
+          </section>
+        ) : (
+          <div className="content-area">{renderContent()}</div>
+        )}
+      </main>
+
+      <nav className="mobile-nav">
+        {MENU.filter((m) => MOBILE_NAV.includes(m.id)).map((item) => (
+          <button
+            key={item.id}
+            className={`mobile-nav-item ${activeMenu === item.id ? "active" : ""}`}
+            onClick={() => setActiveMenu(item.id)}
+          >
+            <Icon name={item.icon} size={20} />
+            <span>{item.label}</span>
+          </button>
+        ))}
+      </nav>
+    </div>
+  );
+}
