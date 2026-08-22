@@ -258,6 +258,32 @@ function extractDate(text) {
 }
 
 /* =========================================================
+   DETEKSI: apakah pesan ini pertanyaan/permintaan laporan?
+   Dicek PALING AWAL, sebelum kata kunci data-entry -- supaya
+   pertanyaan natural seperti "apa menu dengan penjualan
+   tertinggi?" tidak salah dianggap sebagai input data hanya
+   karena mengandung kata "penjualan". Tanpa ini, kata benda
+   topik (penjualan/pembelian/stok/harga/dst.) selalu menang
+   duluan meskipun kalimatnya jelas-jelas sebuah pertanyaan.
+   ========================================================= */
+
+function looksLikeReportRequest(t) {
+  if (t.trim().endsWith("?")) return true;
+
+  const starters = [
+    "apa ", "apa saja", "apakah", "berapa", "bagaimana", "gimana",
+    "kenapa", "mengapa", "kapan", "siapa", "coba ", "tolong ",
+    "buatkan", "tampilkan", "tunjukkan", "rangkum", "ringkas",
+    "ringkasan", "jelaskan", "kasih tau", "kasih tahu", "beritahu",
+    "info ", "cek "
+  ];
+  if (starters.some((w) => t.startsWith(w))) return true;
+
+  const anywhere = [" mana yang ", " yang mana ", " adakah ", " apakah "];
+  return anywhere.some((w) => t.includes(w));
+}
+
+/* =========================================================
    DETEKSI JENIS DATA
    Urutan penting: cek yang paling spesifik dulu supaya tidak
    salah tangkap (mis. "stock opname" jangan kebaca sebagai "stok").
@@ -265,6 +291,10 @@ function extractDate(text) {
 
 function detectDataType(text) {
   const t = normalizeText(text);
+
+  if (looksLikeReportRequest(t)) {
+    return "report";
+  }
 
   if (t.includes("stock opname") || t.includes("stok opname") || t.includes("opname")) {
     return "stock_opname";
@@ -329,11 +359,7 @@ function detectDataType(text) {
     t.includes("analisis") ||
     t.includes("kebutuhan") ||
     t.includes("rekomendasi") ||
-    t.includes("saran") ||
-    t.includes("bagaimana") ||
-    t.includes("kenapa") ||
-    t.includes("berapa") ||
-    t.trim().endsWith("?")
+    t.includes("saran")
   ) {
     return "report";
   }
@@ -882,8 +908,35 @@ function buildLocalReport(question, ctx) {
   }
 
   if (q.includes("penjualan") || q.includes("laku") || q.includes("terlaris")) {
-    const entries = Object.entries(ctx.avgDailySales).sort((a, b) => b[1] - a[1]).slice(0, 8);
-    if (!entries.length) return "Belum ada data penjualan pada periode ini.";
+    const allEntries = Object.entries(ctx.avgDailySales);
+    if (!allEntries.length) return "Belum ada data penjualan pada periode ini.";
+
+    const wantsLowest =
+      q.includes("terendah") ||
+      q.includes("tersepi") ||
+      q.includes("kurang laku") ||
+      q.includes("tidak laku") ||
+      q.includes("paling sedikit") ||
+      q.includes("paling jarang");
+    const wantsHighest =
+      q.includes("tertinggi") ||
+      q.includes("terlaris") ||
+      q.includes("paling laku") ||
+      q.includes("terbanyak");
+
+    const sorted = [...allEntries].sort((a, b) => (wantsLowest ? a[1] - b[1] : b[1] - a[1]));
+    const entries = sorted.slice(0, 8);
+
+    if (wantsLowest || wantsHighest) {
+      const [topMenu, topAvg] = sorted[0];
+      const label = wantsLowest ? "PALING RENDAH" : "PALING TINGGI";
+      return (
+        `MENU DENGAN PENJUALAN ${label}: ${topMenu} (${formatNumber(topAvg, 1)} porsi/hari, rata-rata 7 hari terakhir)\n\n` +
+        "Selengkapnya:\n" +
+        entries.map(([menu, avg], i) => `${i + 1}. ${menu}: ${formatNumber(avg, 1)} porsi/hari`).join("\n")
+      );
+    }
+
     return (
       "RATA-RATA PENJUALAN HARIAN (7 hari terakhir):\n\n" +
       entries.map(([menu, avg]) => `- ${menu}: ${formatNumber(avg, 1)} porsi/hari`).join("\n")
