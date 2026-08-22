@@ -59,6 +59,33 @@ function sheetFromRows(rows) {
   return sheet;
 }
 
+const DAY_NAMES_ID = ["Minggu", "Senin", "Selasa", "Rabu", "Kamis", "Jumat", "Sabtu"];
+
+// UTC everywhere below -- a "T00:00:00" (no zone) string parses as LOCAL
+// time per spec, which silently shifts the date by a day against
+// toISOString() in any non-UTC timezone (e.g. WIB, UTC+7). Anchoring
+// explicitly to "Z" and using the getUTC*/setUTC* family keeps every
+// date-only string mapped to itself regardless of the host timezone.
+
+function dayName(dateStr) {
+  if (!dateStr) return "";
+  const d = new Date(`${dateStr}T00:00:00Z`);
+  if (Number.isNaN(d.getTime())) return "";
+  return DAY_NAMES_ID[d.getUTCDay()];
+}
+
+function datesInRange(startDate, endDate) {
+  if (!startDate || !endDate) return [];
+  const dates = [];
+  const cursor = new Date(`${startDate}T00:00:00Z`);
+  const end = new Date(`${endDate}T00:00:00Z`);
+  while (cursor <= end) {
+    dates.push(cursor.toISOString().slice(0, 10));
+    cursor.setUTCDate(cursor.getUTCDate() + 1);
+  }
+  return dates;
+}
+
 function varianceStatus(item) {
   if (item.actual === null || item.actual === undefined) return "BELUM DI-OPNAME";
   const v = Number(item.variance || 0);
@@ -197,22 +224,54 @@ export function buildReportWorkbook({
   );
 
   // ----------------------------------------------------------
-  // SHEET 5: PENJUALAN
+  // SHEET 5: PERFORMA HARIAN -- satu baris per tanggal (bukan
+  // total keseluruhan periode) supaya tren naik/turun per hari
+  // dan per outlet mudah dipantau, termasuk hari tanpa penjualan.
+  // ----------------------------------------------------------
+
+  const outletsInPlay = [...new Set(periodData.sales.map((r) => r.outlet))].sort();
+  const dailyRows = datesInRange(startDate, endDate).map((date) => {
+    const dayRows = periodData.sales.filter((r) => r.date === date);
+    const row = { Tanggal: date, Hari: dayName(date) };
+    let total = 0;
+    outletsInPlay.forEach((o) => {
+      const qty = dayRows.filter((r) => r.outlet === o).reduce((s, r) => s + Number(r.quantity || 0), 0);
+      row[`Porsi ${o}`] = round2(qty);
+      total += qty;
+    });
+    row["Total Porsi"] = round2(total);
+    row["Jumlah Menu Terjual"] = new Set(dayRows.map((r) => r.menuName)).size;
+    return row;
+  });
+  XLSX.utils.book_append_sheet(
+    workbook,
+    sheetFromRows(
+      dailyRows.length
+        ? dailyRows
+        : [{ Tanggal: "-", Hari: "", "Total Porsi": "", "Jumlah Menu Terjual": "" }]
+    ),
+    "Performa Harian"
+  );
+
+  // ----------------------------------------------------------
+  // SHEET 6: PENJUALAN -- detail tiap transaksi per tanggal,
+  // BUKAN diringkas jadi total.
   // ----------------------------------------------------------
 
   const salesRows = periodData.sales
     .slice()
-    .sort((a, b) => (a.date < b.date ? -1 : 1))
+    .sort((a, b) => (a.date < b.date ? -1 : a.date > b.date ? 1 : a.outlet < b.outlet ? -1 : 1))
     .map((r) => ({
       Tanggal: r.date,
+      Hari: dayName(r.date),
       Outlet: r.outlet,
       Menu: r.menuName,
       Qty: round2(r.quantity)
     }));
-  XLSX.utils.book_append_sheet(workbook, sheetFromRows(salesRows.length ? salesRows : [{ Tanggal: "-", Outlet: "", Menu: "Tidak ada data di periode ini", Qty: "" }]), "Penjualan");
+  XLSX.utils.book_append_sheet(workbook, sheetFromRows(salesRows.length ? salesRows : [{ Tanggal: "-", Hari: "", Outlet: "", Menu: "Tidak ada data di periode ini", Qty: "" }]), "Penjualan");
 
   // ----------------------------------------------------------
-  // SHEET 6: PEMBELIAN
+  // SHEET 7: PEMBELIAN
   // ----------------------------------------------------------
 
   const purchaseRows = periodData.purchases
@@ -231,7 +290,7 @@ export function buildReportWorkbook({
   XLSX.utils.book_append_sheet(workbook, sheetFromRows(purchaseRows.length ? purchaseRows : [{ Tanggal: "-", Outlet: "", Supplier: "", Bahan: "Tidak ada data di periode ini", Qty: "", Unit: "", Harga: "", Total: "" }]), "Pembelian");
 
   // ----------------------------------------------------------
-  // SHEET 7: BARANG DATANG
+  // SHEET 8: BARANG DATANG
   // ----------------------------------------------------------
 
   const receivingRows = periodData.receiving
@@ -250,7 +309,7 @@ export function buildReportWorkbook({
   XLSX.utils.book_append_sheet(workbook, sheetFromRows(receivingRows.length ? receivingRows : [{ Tanggal: "-", Outlet: "", Supplier: "", Bahan: "Tidak ada data di periode ini", Dipesan: "", Diterima: "", Unit: "", Selisih: "" }]), "Barang Datang");
 
   // ----------------------------------------------------------
-  // SHEET 8: STOCK OPNAME
+  // SHEET 9: STOCK OPNAME
   // ----------------------------------------------------------
 
   const opnameRows = periodData.stockOpname
@@ -266,7 +325,7 @@ export function buildReportWorkbook({
   XLSX.utils.book_append_sheet(workbook, sheetFromRows(opnameRows.length ? opnameRows : [{ Tanggal: "-", Outlet: "", Bahan: "Tidak ada data di periode ini", "Stok Aktual": "", Unit: "" }]), "Stock Opname");
 
   // ----------------------------------------------------------
-  // SHEET 9: WASTE
+  // SHEET 10: WASTE
   // ----------------------------------------------------------
 
   const wasteRows = periodData.waste

@@ -2201,8 +2201,9 @@ export default function App() {
         <div className="card">
           <div className="card-title">Unduh Laporan Excel</div>
           <p style={{ fontSize: 13, color: "var(--ink-soft)", margin: "0 0 14px" }}>
-            Laporan lengkap (ringkasan, variance & waste, indikator masalah data, saran pembelian, dan seluruh
-            data transaksi) untuk rentang tanggal pilihan Anda — siap diunduh atau dikirim ke AI untuk dianalisa ulang.
+            Laporan lengkap (ringkasan, variance & waste, indikator masalah data, saran pembelian, performa
+            harian per tanggal, dan detail seluruh transaksi per tanggal — bukan total) untuk rentang tanggal
+            pilihan Anda — siap diunduh atau dikirim ke AI untuk dianalisa ulang.
           </p>
 
           <div style={{ display: "flex", gap: 8, flexWrap: "wrap", marginBottom: 12 }}>
