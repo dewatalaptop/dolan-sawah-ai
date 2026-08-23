@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { collection, addDoc, getDocs, query, limit, where, doc, writeBatch, updateDoc } from "firebase/firestore";
+import { collection, addDoc, getDocs, query, limit, where, doc, writeBatch, updateDoc, deleteDoc } from "firebase/firestore";
 import {
   onAuthStateChanged,
   signInWithEmailAndPassword,
@@ -19,7 +19,8 @@ import {
   createStockOpname,
   createWaste,
   createAdjustment,
-  createChatMessage
+  createChatMessage,
+  createActivityLog
 } from "./dataModel";
 
 import {
@@ -86,6 +87,7 @@ const MENU = [
   { id: "chat", label: "AI Assistant", icon: "chat" },
   { section: "OPERASIONAL" },
   { id: "dashboard", label: "Dashboard", icon: "grid" },
+  { id: "stok-awal", label: "Stok Awal", icon: "box" },
   { id: "pembelian", label: "Pembelian", icon: "cart" },
   { id: "barang-datang", label: "Barang Datang", icon: "truck" },
   { id: "penjualan", label: "Penjualan", icon: "coin" },
@@ -97,6 +99,7 @@ const MENU = [
   { id: "resep", label: "Resep", icon: "book" },
   { id: "import", label: "Import Excel", icon: "upload" },
   { id: "import-wa", label: "Import Chat WA", icon: "chat" },
+  { id: "riwayat", label: "Riwayat Aktivitas", icon: "trend" },
   { id: "laporan", label: "Laporan AI", icon: "doc" }
 ];
 
@@ -628,15 +631,17 @@ function parsePriceLines(text) {
    FIRESTORE: SIMPAN
    ========================================================= */
 
-async function saveRows(collectionName, rows) {
+async function saveRows(collectionName, rows, onProgress) {
   // writeBatch commits every row in one network round-trip instead of one
   // per row -- a chat message with dozens of items (a long shopping list,
   // a full day's sales) used to take one sequential await per line, which
-  // made response time scale linearly with item count. Firestore caps a
-  // batch at 500 writes, so chunk defensively even though a single chat
-  // message realistically never gets that long.
-  const CHUNK_SIZE = 450;
+  // made response time scale linearly with item count. Chunk size is kept
+  // well under Firestore's 500-op batch cap AND small enough that
+  // onProgress gives a reasonably smooth percentage on large imports
+  // (WhatsApp/Excel), not just one jump from 0 to 100.
+  const CHUNK_SIZE = 100;
   const ids = [];
+  let done = 0;
 
   for (let i = 0; i < rows.length; i += CHUNK_SIZE) {
     const chunk = rows.slice(i, i + CHUNK_SIZE);
@@ -648,9 +653,25 @@ async function saveRows(collectionName, rows) {
     });
     await batch.commit();
     refs.forEach((ref) => ids.push(ref.id));
+    done += chunk.length;
+    if (onProgress) onProgress(done, rows.length);
   }
 
   return ids;
+}
+
+async function deleteDocsBatched(collectionName, ids, onProgress) {
+  const CHUNK_SIZE = 100;
+  let done = 0;
+
+  for (let i = 0; i < ids.length; i += CHUNK_SIZE) {
+    const chunk = ids.slice(i, i + CHUNK_SIZE);
+    const batch = writeBatch(db);
+    chunk.forEach((id) => batch.delete(doc(db, collectionName, id)));
+    await batch.commit();
+    done += chunk.length;
+    if (onProgress) onProgress(done, ids.length);
+  }
 }
 
 /* =========================================================
@@ -1324,6 +1345,50 @@ function DataTable({ columns, rows, emptyText = "Belum ada data." }) {
   );
 }
 
+function FilterBar({ search, onSearchChange, searchPlaceholder, start, onStartChange, end, onEndChange, summary }) {
+  const hasFilter = Boolean(search || start || end);
+  return (
+    <div style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap", marginBottom: 12 }}>
+      <input
+        type="text"
+        value={search}
+        onChange={(e) => onSearchChange(e.target.value)}
+        placeholder={searchPlaceholder || "Cari nama..."}
+        style={{ padding: "6px 10px", borderRadius: 6, border: "1px solid var(--border)", minWidth: 180 }}
+      />
+      <span style={{ fontSize: 13, color: "var(--ink-soft)" }}>Dari</span>
+      <input
+        type="date"
+        value={start}
+        max={end || undefined}
+        onChange={(e) => onStartChange(e.target.value)}
+        style={{ padding: "6px 8px", borderRadius: 6, border: "1px solid var(--border)" }}
+      />
+      <span style={{ fontSize: 13, color: "var(--ink-soft)" }}>s/d</span>
+      <input
+        type="date"
+        value={end}
+        min={start || undefined}
+        onChange={(e) => onEndChange(e.target.value)}
+        style={{ padding: "6px 8px", borderRadius: 6, border: "1px solid var(--border)" }}
+      />
+      {hasFilter && (
+        <button
+          className="secondary-button"
+          onClick={() => {
+            onSearchChange("");
+            onStartChange("");
+            onEndChange("");
+          }}
+        >
+          Reset Filter
+        </button>
+      )}
+      {summary && <span style={{ marginLeft: "auto", fontSize: 13, color: "var(--ink-soft)" }}>{summary}</span>}
+    </div>
+  );
+}
+
 function ChatMessage({ message }) {
   const isUser = message.role === "user";
   return (
@@ -1444,6 +1509,178 @@ export default function App() {
     }
   }
 
+  /* =======================================================
+     PROGRESS SIMPAN + RIWAYAT AKTIVITAS (UNDO)
+     ======================================================= */
+
+  const [saveProgress, setSaveProgress] = useState(null); // { done, total } | null
+  const [activityLog, setActivityLog] = useState([]);
+  const [undoBusyId, setUndoBusyId] = useState(null);
+
+  async function loadActivityLog() {
+    const snapshot = await getDocs(collection(db, COLLECTIONS.ACTIVITY_LOG));
+    const list = snapshot.docs
+      .map((d) => ({ id: d.id, ...d.data() }))
+      .sort((a, b) => (a.createdAt < b.createdAt ? 1 : -1));
+    setActivityLog(list);
+  }
+
+  // Bungkus saveRows: mengurus progress (%) dan mencatat aksi ke riwayat
+  // aktivitas supaya bisa di-undo nanti. Dipakai di semua titik simpan data
+  // (chat, import Excel, import WhatsApp) -- satu tempat, konsisten.
+  async function saveRowsTracked(collectionName, rows, actionType, summary) {
+    if (!rows.length) return [];
+    setSaveProgress({ done: 0, total: rows.length });
+    try {
+      const ids = await saveRows(collectionName, rows, (done, total) => setSaveProgress({ done, total }));
+      const logEntry = createActivityLog({ actionType, collectionName, documentIds: ids, summary });
+      const ref = await addDoc(collection(db, COLLECTIONS.ACTIVITY_LOG), logEntry);
+      setActivityLog((prev) => [{ id: ref.id, ...logEntry }, ...prev]);
+      return ids;
+    } finally {
+      setSaveProgress(null);
+    }
+  }
+
+  async function undoActivity(logEntry) {
+    if (logEntry.undone || undoBusyId) return;
+    setUndoBusyId(logEntry.id);
+    setSaveProgress({ done: 0, total: logEntry.documentIds.length });
+    try {
+      await deleteDocsBatched(logEntry.collectionName, logEntry.documentIds, (done, total) =>
+        setSaveProgress({ done, total })
+      );
+      await updateDoc(doc(db, COLLECTIONS.ACTIVITY_LOG, logEntry.id), {
+        undone: true,
+        undoneAt: new Date().toISOString()
+      });
+      setActivityLog((prev) =>
+        prev.map((a) => (a.id === logEntry.id ? { ...a, undone: true, undoneAt: new Date().toISOString() } : a))
+      );
+      await refreshData();
+      showToast(`Berhasil di-undo: ${logEntry.summary}`, "success");
+    } catch (error) {
+      console.error(error);
+      showToast("Gagal undo: " + (error?.message || "unknown error"));
+    } finally {
+      setUndoBusyId(null);
+      setSaveProgress(null);
+    }
+  }
+
+  /* =======================================================
+     EDIT/HAPUS BARIS -- generik, dipakai di semua halaman data
+     (Pembelian, Barang Datang, Penjualan, Stock Opname, Waste,
+     Stok Awal, Harga Bahan) supaya satu pola konsisten.
+     ======================================================= */
+
+  const [editingRow, setEditingRow] = useState(null); // { collectionName, id, fields }
+  const [rowEditBusy, setRowEditBusy] = useState(false);
+  const [rowDeleteConfirmId, setRowDeleteConfirmId] = useState(null);
+  const [rowDeleteBusy, setRowDeleteBusy] = useState(false);
+
+  function startRowEdit(collectionName, row, fieldKeys) {
+    const fields = {};
+    fieldKeys.forEach((key) => {
+      fields[key] = row[key] ?? "";
+    });
+    setRowDeleteConfirmId(null);
+    setEditingRow({ collectionName, id: row.id, fields });
+  }
+
+  function updateRowEditField(key, value) {
+    setEditingRow((prev) => (prev ? { ...prev, fields: { ...prev.fields, [key]: value } } : prev));
+  }
+
+  function cancelRowEdit() {
+    setEditingRow(null);
+  }
+
+  async function saveRowEdit(numericKeys = []) {
+    if (!editingRow) return;
+    setRowEditBusy(true);
+    try {
+      const changes = { ...editingRow.fields };
+      numericKeys.forEach((key) => {
+        changes[key] = Number(changes[key]) || 0;
+      });
+      await updateDoc(doc(db, editingRow.collectionName, editingRow.id), changes);
+      await refreshData();
+      showToast("Perubahan tersimpan.", "success");
+      setEditingRow(null);
+    } catch (error) {
+      console.error(error);
+      showToast("Gagal menyimpan perubahan: " + (error?.message || "unknown error"));
+    } finally {
+      setRowEditBusy(false);
+    }
+  }
+
+  async function deleteRow(collectionName, id) {
+    setRowDeleteBusy(true);
+    try {
+      await deleteDoc(doc(db, collectionName, id));
+      await refreshData();
+      showToast("Data berhasil dihapus.", "success");
+      setRowDeleteConfirmId(null);
+    } catch (error) {
+      console.error(error);
+      showToast("Gagal menghapus: " + (error?.message || "unknown error"));
+    } finally {
+      setRowDeleteBusy(false);
+    }
+  }
+
+  function fieldInput(key, type, options) {
+    const value = editingRow.fields[key];
+    const style = { padding: "4px 6px", borderRadius: 6, border: "1px solid var(--border)", width: type === "date" ? 130 : type === "number" ? 80 : 120 };
+    if (type === "date") {
+      return <input type="date" value={value || ""} onChange={(e) => updateRowEditField(key, e.target.value)} style={style} />;
+    }
+    if (type === "number") {
+      return <input type="number" value={value ?? ""} onChange={(e) => updateRowEditField(key, e.target.value)} style={style} />;
+    }
+    if (type === "select") {
+      return (
+        <select value={value || ""} onChange={(e) => updateRowEditField(key, e.target.value)} style={style}>
+          {options.map((o) => (
+            <option key={o} value={o}>{o}</option>
+          ))}
+        </select>
+      );
+    }
+    return <input type="text" value={value || ""} onChange={(e) => updateRowEditField(key, e.target.value)} style={{ ...style, width: 140 }} />;
+  }
+
+  function actionCell(collectionName, row, fieldKeys, numericKeys = []) {
+    if (editingRow?.id === row.id) {
+      return (
+        <div style={{ display: "flex", gap: 4 }}>
+          <button className="primary-button" onClick={() => saveRowEdit(numericKeys)} disabled={rowEditBusy}>
+            {rowEditBusy ? "..." : "Simpan"}
+          </button>
+          <button className="secondary-button" onClick={cancelRowEdit} disabled={rowEditBusy}>Batal</button>
+        </div>
+      );
+    }
+    if (rowDeleteConfirmId === row.id) {
+      return (
+        <div style={{ display: "flex", gap: 4 }}>
+          <button className="primary-button" style={{ background: "#c0392b", borderColor: "#c0392b" }} onClick={() => deleteRow(collectionName, row.id)} disabled={rowDeleteBusy}>
+            {rowDeleteBusy ? "..." : "Yakin?"}
+          </button>
+          <button className="secondary-button" onClick={() => setRowDeleteConfirmId(null)} disabled={rowDeleteBusy}>Batal</button>
+        </div>
+      );
+    }
+    return (
+      <div style={{ display: "flex", gap: 4 }}>
+        <button className="secondary-button" onClick={() => startRowEdit(collectionName, row, fieldKeys)}>Edit</button>
+        <button className="secondary-button" onClick={() => setRowDeleteConfirmId(row.id)}>Hapus</button>
+      </div>
+    );
+  }
+
   const [reportStart, setReportStart] = useState(daysAgoISO(29));
   const [reportEnd, setReportEnd] = useState(TODAY);
   const [reportOutlet, setReportOutlet] = useState("ALL");
@@ -1451,6 +1688,31 @@ export default function App() {
 
   const [salesFilterStart, setSalesFilterStart] = useState(daysAgoISO(29));
   const [salesFilterEnd, setSalesFilterEnd] = useState(TODAY);
+  const [salesSearch, setSalesSearch] = useState("");
+
+  const [purchaseSearch, setPurchaseSearch] = useState("");
+  const [purchaseFilterStart, setPurchaseFilterStart] = useState("");
+  const [purchaseFilterEnd, setPurchaseFilterEnd] = useState("");
+
+  const [receivingSearch, setReceivingSearch] = useState("");
+  const [receivingFilterStart, setReceivingFilterStart] = useState("");
+  const [receivingFilterEnd, setReceivingFilterEnd] = useState("");
+
+  const [opnameSearch, setOpnameSearch] = useState("");
+  const [opnameFilterStart, setOpnameFilterStart] = useState("");
+  const [opnameFilterEnd, setOpnameFilterEnd] = useState("");
+
+  const [wasteSearch, setWasteSearch] = useState("");
+  const [wasteFilterStart, setWasteFilterStart] = useState("");
+  const [wasteFilterEnd, setWasteFilterEnd] = useState("");
+
+  const [openingSearch, setOpeningSearch] = useState("");
+  const [openingFilterStart, setOpeningFilterStart] = useState("");
+  const [openingFilterEnd, setOpeningFilterEnd] = useState("");
+
+  const [priceSearch, setPriceSearch] = useState("");
+  const [priceFilterStart, setPriceFilterStart] = useState("");
+  const [priceFilterEnd, setPriceFilterEnd] = useState("");
 
   const [messages, setMessages] = useState(() => [buildWelcomeMessage()]);
   const [chatDate, setChatDate] = useState(TODAY);
@@ -1558,7 +1820,7 @@ export default function App() {
     queueMicrotask(() => {
       setDataLoading(true);
       setDataLoadError("");
-      Promise.all([checkConnection(), refreshData(), loadCategories()])
+      Promise.all([checkConnection(), refreshData(), loadCategories(), loadActivityLog()])
         .catch((error) => {
           console.error("Gagal memuat data awal:", error);
           setDataLoadError(error?.message || "Gagal memuat data dari Firestore.");
@@ -1677,7 +1939,7 @@ export default function App() {
         };
       }
       const rows = items.map((x) => createOpeningStock({ ...x, date, outlet }));
-      await saveRows(COLLECTIONS.OPENING_STOCK, rows);
+      await saveRowsTracked(COLLECTIONS.OPENING_STOCK, rows, "Stok Awal (chat)", `${rows.length} bahan, ${outlet}, ${formatDateID(date)}`);
       await refreshData();
       return {
         text:
@@ -1699,7 +1961,7 @@ export default function App() {
         };
       }
       const rows = items.map((x) => createPurchase({ ...x, date, outlet, supplier }));
-      await saveRows(COLLECTIONS.PURCHASES, rows);
+      await saveRowsTracked(COLLECTIONS.PURCHASES, rows, "Pembelian (chat)", `${rows.length} bahan, ${outlet}, ${formatDateID(date)}`);
       await refreshData();
       return {
         text:
@@ -1763,7 +2025,7 @@ export default function App() {
         }
       }
 
-      await saveRows(COLLECTIONS.RECEIVING, rows);
+      await saveRowsTracked(COLLECTIONS.RECEIVING, rows, "Barang Datang (chat)", `${rows.length} bahan, ${outlet}, ${formatDateID(date)}`);
       await refreshData();
 
       return {
@@ -1785,7 +2047,7 @@ export default function App() {
         };
       }
       const rows = items.map((x) => createSale({ ...x, date, outlet, source: "AI" }));
-      await saveRows(COLLECTIONS.SALES, rows);
+      await saveRowsTracked(COLLECTIONS.SALES, rows, "Penjualan (chat)", `${rows.length} menu, ${outlet}, ${formatDateID(date)}`);
       await refreshData();
       const total = items.reduce((sum, x) => sum + x.quantity, 0);
       return {
@@ -1817,7 +2079,7 @@ export default function App() {
           unit: x.unit
         })
       );
-      await saveRows(COLLECTIONS.STOCK_OPNAME, rows);
+      await saveRowsTracked(COLLECTIONS.STOCK_OPNAME, rows, "Stock Opname (chat)", `${rows.length} bahan, ${outlet}, ${formatDateID(date)}`);
       await refreshData();
       return {
         text:
@@ -1840,7 +2102,7 @@ export default function App() {
         };
       }
       const rows = items.map((x) => createWaste({ ...x, date, outlet, reason }));
-      await saveRows(COLLECTIONS.WASTE, rows);
+      await saveRowsTracked(COLLECTIONS.WASTE, rows, "Waste (chat)", `${rows.length} bahan, ${outlet}, ${formatDateID(date)}`);
       await refreshData();
       return {
         text:
@@ -1860,7 +2122,7 @@ export default function App() {
         };
       }
       const rows = items.map((x) => createAdjustment({ ...x, date, outlet, reason }));
-      await saveRows(COLLECTIONS.ADJUSTMENTS, rows);
+      await saveRowsTracked(COLLECTIONS.ADJUSTMENTS, rows, "Penyesuaian Stok (chat)", `${rows.length} bahan, ${outlet}, ${formatDateID(date)}`);
       await refreshData();
       return {
         text: `PENYESUAIAN STOK (${outlet}) tersimpan.`,
@@ -2151,7 +2413,7 @@ export default function App() {
           .filter((r) => r.itemName || r.menuName)
           .map((r) => ({ ...r, outlet: r.outlet || "DS" }));
         if (!rows.length) continue;
-        await saveRows(target, rows);
+        await saveRowsTracked(target, rows, `${sheet.type} (Import Excel)`, `${rows.length} baris dari sheet "${sheet.sheetName}"`);
       }
 
       await refreshData();
@@ -2215,7 +2477,12 @@ export default function App() {
           })
         );
       });
-      await saveRows(COLLECTIONS.PURCHASES, rows);
+      const dates = [...new Set(rows.map((r) => r.date))].sort();
+      const summary =
+        dates.length === 1
+          ? `${rows.length} baris pembelian, ${dates[0]}`
+          : `${rows.length} baris pembelian, ${dates[0]} s/d ${dates[dates.length - 1]}`;
+      await saveRowsTracked(COLLECTIONS.PURCHASES, rows, "Pembelian (Import WhatsApp)", summary);
       await refreshData();
       showToast(`${rows.length} baris pembelian berhasil disimpan.`, "success");
       setWaText("");
@@ -2448,6 +2715,43 @@ export default function App() {
     );
   }
 
+  function renderStokAwal() {
+    const openingRows = filteredData.openingStock
+      .filter((x) => !openingSearch.trim() || normalizeText(x.itemName).includes(normalizeText(openingSearch)))
+      .filter((x) => !openingFilterStart || x.date >= openingFilterStart)
+      .filter((x) => !openingFilterEnd || x.date <= openingFilterEnd)
+      .sort((a, b) => (a.date < b.date ? 1 : -1));
+    return (
+      <div className="page">
+        <div className="section-header"><div><h1>Stok Awal</h1><p>Saldo awal bahan yang jadi titik mulai perhitungan stok teoritis.</p></div></div>
+        <FilterBar
+          search={openingSearch}
+          onSearchChange={setOpeningSearch}
+          searchPlaceholder="Cari nama bahan..."
+          start={openingFilterStart}
+          onStartChange={setOpeningFilterStart}
+          end={openingFilterEnd}
+          onEndChange={setOpeningFilterEnd}
+          summary={`${openingRows.length} baris`}
+        />
+        <DataTable
+          columns={["Tanggal", "Outlet", "Bahan", "Jumlah", "Satuan", "Aksi"]}
+          rows={openingRows.map((x) => {
+            const editing = editingRow?.id === x.id;
+            return [
+              editing ? fieldInput("date", "date") : formatDateID(x.date),
+              editing ? fieldInput("outlet", "select", ["DS", "SS", "SP"]) : x.outlet,
+              editing ? fieldInput("itemName", "text") : x.itemName,
+              editing ? fieldInput("quantity", "number") : formatNumber(x.quantity),
+              editing ? fieldInput("unit", "text") : x.unit,
+              actionCell(COLLECTIONS.OPENING_STOCK, x, ["date", "outlet", "itemName", "quantity", "unit"], ["quantity"])
+            ];
+          })}
+        />
+      </div>
+    );
+  }
+
   function renderPembelian() {
     return (
       <div className="page">
@@ -2481,62 +2785,116 @@ export default function App() {
           </div>
         </div>
 
-        <DataTable
-          columns={["Tanggal", "Outlet", "Barang", "Jumlah", "Supplier", "Kategori"]}
-          rows={filteredData.purchases
-            .slice()
-            .sort((a, b) => (a.date < b.date ? 1 : -1))
-            .map((x) => [
-              formatDateID(x.date),
-              x.outlet,
-              x.itemName,
-              `${formatNumber(x.quantity)} ${x.unit}`,
-              x.supplier || "-",
-              <select
-                key="cat"
-                value={x.category || ""}
-                onChange={(e) => updatePurchaseCategory(x.id, e.target.value)}
-                style={{ padding: "4px 6px", borderRadius: 6, border: "1px solid var(--border)" }}
-              >
-                <option value="">Belum dikategorikan</option>
-                {categories.map((c) => (
-                  <option key={c.id} value={c.name}>{c.name}</option>
-                ))}
-              </select>
-            ])}
-        />
+        {(() => {
+          const purchaseRows = filteredData.purchases
+            .filter((x) => !purchaseSearch.trim() || normalizeText(x.itemName).includes(normalizeText(purchaseSearch)))
+            .filter((x) => !purchaseFilterStart || x.date >= purchaseFilterStart)
+            .filter((x) => !purchaseFilterEnd || x.date <= purchaseFilterEnd)
+            .sort((a, b) => (a.date < b.date ? 1 : -1));
+          return (
+            <>
+              <FilterBar
+                search={purchaseSearch}
+                onSearchChange={setPurchaseSearch}
+                searchPlaceholder="Cari nama bahan..."
+                start={purchaseFilterStart}
+                onStartChange={setPurchaseFilterStart}
+                end={purchaseFilterEnd}
+                onEndChange={setPurchaseFilterEnd}
+                summary={`${purchaseRows.length} baris`}
+              />
+              <DataTable
+                columns={["Tanggal", "Outlet", "Barang", "Jumlah", "Satuan", "Supplier", "Kategori", "Aksi"]}
+                rows={purchaseRows.map((x) => {
+                  const editing = editingRow?.id === x.id;
+                  return [
+                    editing ? fieldInput("date", "date") : formatDateID(x.date),
+                    editing ? fieldInput("outlet", "select", ["DS", "SS", "SP"]) : x.outlet,
+                    editing ? fieldInput("itemName", "text") : x.itemName,
+                    editing ? fieldInput("quantity", "number") : formatNumber(x.quantity),
+                    editing ? fieldInput("unit", "text") : x.unit,
+                    editing ? fieldInput("supplier", "text") : (x.supplier || "-"),
+                    editing ? (
+                      <select
+                        key="cat"
+                        value={editingRow.fields.category || ""}
+                        onChange={(e) => updateRowEditField("category", e.target.value)}
+                        style={{ padding: "4px 6px", borderRadius: 6, border: "1px solid var(--border)" }}
+                      >
+                        <option value="">Belum dikategorikan</option>
+                        {categories.map((c) => (
+                          <option key={c.id} value={c.name}>{c.name}</option>
+                        ))}
+                      </select>
+                    ) : (
+                      <select
+                        key="cat"
+                        value={x.category || ""}
+                        onChange={(e) => updatePurchaseCategory(x.id, e.target.value)}
+                        style={{ padding: "4px 6px", borderRadius: 6, border: "1px solid var(--border)" }}
+                      >
+                        <option value="">Belum dikategorikan</option>
+                        {categories.map((c) => (
+                          <option key={c.id} value={c.name}>{c.name}</option>
+                        ))}
+                      </select>
+                    ),
+                    actionCell(COLLECTIONS.PURCHASES, x, ["date", "outlet", "itemName", "quantity", "unit", "supplier", "category"], ["quantity"])
+                  ];
+                })}
+              />
+            </>
+          );
+        })()}
       </div>
     );
   }
 
   function renderBarangDatang() {
+    const receivingRows = filteredData.receiving
+      .filter((x) => !receivingSearch.trim() || normalizeText(x.itemName).includes(normalizeText(receivingSearch)))
+      .filter((x) => !receivingFilterStart || x.date >= receivingFilterStart)
+      .filter((x) => !receivingFilterEnd || x.date <= receivingFilterEnd)
+      .sort((a, b) => (a.date < b.date ? 1 : -1));
     return (
       <div className="page">
         <div className="section-header"><div><h1>Barang Datang</h1><p>Opsional — hanya perlu diisi kalau jumlah yang diterima berbeda dari pesanan. Tanpa laporan ini, pembelian otomatis dianggap sesuai dan sudah masuk stok.</p></div></div>
+        <FilterBar
+          search={receivingSearch}
+          onSearchChange={setReceivingSearch}
+          searchPlaceholder="Cari nama bahan..."
+          start={receivingFilterStart}
+          onStartChange={setReceivingFilterStart}
+          end={receivingFilterEnd}
+          onEndChange={setReceivingFilterEnd}
+          summary={`${receivingRows.length} baris`}
+        />
         <DataTable
-          columns={["Tanggal", "Outlet", "Barang", "Dipesan", "Diterima", "Selisih"]}
-          rows={filteredData.receiving
-            .slice()
-            .sort((a, b) => (a.date < b.date ? 1 : -1))
-            .map((x) => [
-              formatDateID(x.date),
-              x.outlet,
-              x.itemName,
-              `${formatNumber(x.orderedQuantity)} ${x.unit}`,
-              `${formatNumber(x.receivedQuantity)} ${x.unit}`,
+          columns={["Tanggal", "Outlet", "Barang", "Dipesan", "Diterima", "Selisih", "Aksi"]}
+          rows={receivingRows
+            .map((x) => {
+              const editing = editingRow?.id === x.id;
+              return [
+              editing ? fieldInput("date", "date") : formatDateID(x.date),
+              editing ? fieldInput("outlet", "select", ["DS", "SS", "SP"]) : x.outlet,
+              editing ? fieldInput("itemName", "text") : x.itemName,
+              editing ? fieldInput("orderedQuantity", "number") : `${formatNumber(x.orderedQuantity)} ${x.unit}`,
+              editing ? fieldInput("receivedQuantity", "number") : `${formatNumber(x.receivedQuantity)} ${x.unit}`,
               Math.abs(x.difference) > 0.0001
                 ? <span key="d" className="badge badge-warning">{formatNumber(x.difference)} {x.unit}</span>
-                : <span key="d" className="badge badge-ok">Sesuai</span>
-            ])}
+                : <span key="d" className="badge badge-ok">Sesuai</span>,
+              actionCell(COLLECTIONS.RECEIVING, x, ["date", "outlet", "itemName", "orderedQuantity", "receivedQuantity"], ["orderedQuantity", "receivedQuantity"])
+              ];
+            })}
         />
       </div>
     );
   }
 
   function renderPenjualan() {
-    const periodSales = filteredData.sales.filter(
-      (s) => (!salesFilterStart || s.date >= salesFilterStart) && (!salesFilterEnd || s.date <= salesFilterEnd)
-    );
+    const periodSales = filteredData.sales
+      .filter((s) => (!salesFilterStart || s.date >= salesFilterStart) && (!salesFilterEnd || s.date <= salesFilterEnd))
+      .filter((s) => !salesSearch.trim() || normalizeText(s.menuName).includes(normalizeText(salesSearch)));
     const periodPortions = periodSales.reduce((s, r) => s + Number(r.quantity || 0), 0);
     const periodRevenue = computeRevenue(periodSales, rawData.recipes);
 
@@ -2545,42 +2903,33 @@ export default function App() {
         <div className="section-header"><div><h1>Penjualan</h1><p>Data penjualan yang masuk melalui chat atau import.</p></div></div>
 
         <div className="card">
-          <div style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap", marginBottom: 12 }}>
-            <span style={{ fontSize: 13, color: "var(--ink-soft)" }}>Dari</span>
-            <input
-              type="date"
-              value={salesFilterStart}
-              max={salesFilterEnd || undefined}
-              onChange={(e) => setSalesFilterStart(e.target.value)}
-              style={{ padding: "6px 8px", borderRadius: 6, border: "1px solid var(--border)" }}
-            />
-            <span style={{ fontSize: 13, color: "var(--ink-soft)" }}>s/d</span>
-            <input
-              type="date"
-              value={salesFilterEnd}
-              min={salesFilterStart || undefined}
-              onChange={(e) => setSalesFilterEnd(e.target.value)}
-              style={{ padding: "6px 8px", borderRadius: 6, border: "1px solid var(--border)" }}
-            />
-            <span style={{ marginLeft: "auto", fontSize: 13, color: "var(--ink-soft)" }}>
-              {formatNumber(periodPortions)} porsi · <strong style={{ color: "var(--ink)" }}>Rp {formatNumber(periodRevenue)}</strong>
-            </span>
-          </div>
+          <FilterBar
+            search={salesSearch}
+            onSearchChange={setSalesSearch}
+            searchPlaceholder="Cari nama menu..."
+            start={salesFilterStart}
+            onStartChange={setSalesFilterStart}
+            end={salesFilterEnd}
+            onEndChange={setSalesFilterEnd}
+            summary={`${formatNumber(periodPortions)} porsi · Rp ${formatNumber(periodRevenue)}`}
+          />
 
           <DataTable
-            columns={["Tanggal", "Outlet", "Menu", "Jumlah", "Total"]}
+            columns={["Tanggal", "Outlet", "Menu", "Jumlah", "Total", "Aksi"]}
             rows={periodSales
               .slice()
               .sort((a, b) => (a.date < b.date ? 1 : -1))
               .map((x) => {
                 const recipe = findRecipeByMenu(x.menuName, rawData.recipes);
                 const price = recipe ? Number(recipe.sellPrice || 0) : 0;
+                const editing = editingRow?.id === x.id;
                 return [
-                  formatDateID(x.date),
-                  x.outlet,
-                  x.menuName,
-                  `${formatNumber(x.quantity)} porsi`,
-                  price > 0 ? `Rp ${formatNumber(x.quantity * price)}` : "-"
+                  editing ? fieldInput("date", "date") : formatDateID(x.date),
+                  editing ? fieldInput("outlet", "select", ["DS", "SS", "SP"]) : x.outlet,
+                  editing ? fieldInput("menuName", "text") : x.menuName,
+                  editing ? fieldInput("quantity", "number") : `${formatNumber(x.quantity)} porsi`,
+                  price > 0 ? `Rp ${formatNumber(x.quantity * price)}` : "-",
+                  actionCell(COLLECTIONS.SALES, x, ["date", "outlet", "menuName", "quantity"], ["quantity"])
                 ];
               })}
           />
@@ -2590,15 +2939,37 @@ export default function App() {
   }
 
   function renderStok() {
+    const opnameRows = filteredData.stockOpname
+      .filter((x) => !opnameSearch.trim() || normalizeText(x.itemName).includes(normalizeText(opnameSearch)))
+      .filter((x) => !opnameFilterStart || x.date >= opnameFilterStart)
+      .filter((x) => !opnameFilterEnd || x.date <= opnameFilterEnd)
+      .sort((a, b) => (a.date < b.date ? 1 : -1));
     return (
       <div className="page">
         <div className="section-header"><div><h1>Stock Opname</h1><p>Stok fisik terakhir yang dilaporkan.</p></div></div>
+        <FilterBar
+          search={opnameSearch}
+          onSearchChange={setOpnameSearch}
+          searchPlaceholder="Cari nama bahan..."
+          start={opnameFilterStart}
+          onStartChange={setOpnameFilterStart}
+          end={opnameFilterEnd}
+          onEndChange={setOpnameFilterEnd}
+          summary={`${opnameRows.length} baris`}
+        />
         <DataTable
-          columns={["Tanggal", "Outlet", "Barang", "Jumlah"]}
-          rows={filteredData.stockOpname
-            .slice()
-            .sort((a, b) => (a.date < b.date ? 1 : -1))
-            .map((x) => [formatDateID(x.date), x.outlet, x.itemName, `${formatNumber(x.actualQuantity)} ${x.unit}`])}
+          columns={["Tanggal", "Outlet", "Barang", "Jumlah", "Satuan", "Aksi"]}
+          rows={opnameRows.map((x) => {
+            const editing = editingRow?.id === x.id;
+            return [
+              editing ? fieldInput("date", "date") : formatDateID(x.date),
+              editing ? fieldInput("outlet", "select", ["DS", "SS", "SP"]) : x.outlet,
+              editing ? fieldInput("itemName", "text") : x.itemName,
+              editing ? fieldInput("actualQuantity", "number") : formatNumber(x.actualQuantity),
+              editing ? fieldInput("unit", "text") : x.unit,
+              actionCell(COLLECTIONS.STOCK_OPNAME, x, ["date", "outlet", "itemName", "actualQuantity", "unit"], ["actualQuantity"])
+            ];
+          })}
         />
       </div>
     );
@@ -2639,6 +3010,11 @@ export default function App() {
 
   function renderVariance() {
     const items = varianceReport.items.slice().sort((a, b) => a.variance - b.variance);
+    const wasteRows = filteredData.waste
+      .filter((x) => !wasteSearch.trim() || normalizeText(x.itemName).includes(normalizeText(wasteSearch)))
+      .filter((x) => !wasteFilterStart || x.date >= wasteFilterStart)
+      .filter((x) => !wasteFilterEnd || x.date <= wasteFilterEnd)
+      .sort((a, b) => (a.date < b.date ? 1 : -1));
     return (
       <div className="page">
         <div className="section-header">
@@ -2661,6 +3037,35 @@ export default function App() {
             ];
           })}
         />
+
+        <div className="card" style={{ marginTop: 16 }}>
+          <div className="card-title">Catatan Waste</div>
+          <FilterBar
+            search={wasteSearch}
+            onSearchChange={setWasteSearch}
+            searchPlaceholder="Cari nama bahan..."
+            start={wasteFilterStart}
+            onStartChange={setWasteFilterStart}
+            end={wasteFilterEnd}
+            onEndChange={setWasteFilterEnd}
+            summary={`${wasteRows.length} baris`}
+          />
+          <DataTable
+            columns={["Tanggal", "Outlet", "Bahan", "Jumlah", "Satuan", "Alasan", "Aksi"]}
+            rows={wasteRows.map((x) => {
+              const editing = editingRow?.id === x.id;
+              return [
+                editing ? fieldInput("date", "date") : formatDateID(x.date),
+                editing ? fieldInput("outlet", "select", ["DS", "SS", "SP"]) : x.outlet,
+                editing ? fieldInput("itemName", "text") : x.itemName,
+                editing ? fieldInput("quantity", "number") : formatNumber(x.quantity),
+                editing ? fieldInput("unit", "text") : x.unit,
+                editing ? fieldInput("reason", "text") : (x.reason || "-"),
+                actionCell(COLLECTIONS.WASTE, x, ["date", "outlet", "itemName", "quantity", "unit", "reason"], ["quantity"])
+              ];
+            })}
+          />
+        </div>
       </div>
     );
   }
@@ -2671,15 +3076,52 @@ export default function App() {
       const key = normalizeText(p.itemName);
       if (!latestByItem[key] || p.effectiveDate > latestByItem[key].effectiveDate) latestByItem[key] = p;
     });
-    const rows = Object.values(latestByItem).sort((a, b) => a.itemName.localeCompare(b.itemName));
+    const latestRows = Object.values(latestByItem).sort((a, b) => a.itemName.localeCompare(b.itemName));
+
+    const historyRows = priceHistory
+      .filter((x) => !priceSearch.trim() || normalizeText(x.itemName).includes(normalizeText(priceSearch)))
+      .filter((x) => !priceFilterStart || x.effectiveDate >= priceFilterStart)
+      .filter((x) => !priceFilterEnd || x.effectiveDate <= priceFilterEnd)
+      .slice()
+      .sort((a, b) => (a.effectiveDate < b.effectiveDate ? 1 : -1));
 
     return (
       <div className="page">
         <div className="section-header"><div><h1>Harga Bahan</h1><p>Harga terbaru per bahan (riwayat lengkap tersimpan untuk perbandingan biaya resep).</p></div></div>
-        <DataTable
-          columns={["Bahan", "Harga", "Satuan", "Berlaku sejak"]}
-          rows={rows.map((x) => [x.itemName, `Rp ${formatNumber(x.price)}`, x.unit, formatDateID(x.effectiveDate)])}
-        />
+        <div className="card" style={{ marginBottom: 16 }}>
+          <div className="card-title">Harga Terbaru</div>
+          <DataTable
+            columns={["Bahan", "Harga", "Satuan", "Berlaku sejak"]}
+            rows={latestRows.map((x) => [x.itemName, `Rp ${formatNumber(x.price)}`, x.unit, formatDateID(x.effectiveDate)])}
+          />
+        </div>
+
+        <div className="card">
+          <div className="card-title">Riwayat Lengkap</div>
+          <FilterBar
+            search={priceSearch}
+            onSearchChange={setPriceSearch}
+            searchPlaceholder="Cari nama bahan..."
+            start={priceFilterStart}
+            onStartChange={setPriceFilterStart}
+            end={priceFilterEnd}
+            onEndChange={setPriceFilterEnd}
+            summary={`${historyRows.length} baris`}
+          />
+          <DataTable
+            columns={["Bahan", "Harga", "Satuan", "Berlaku sejak", "Aksi"]}
+            rows={historyRows.map((x) => {
+              const editing = editingRow?.id === x.id;
+              return [
+                editing ? fieldInput("itemName", "text") : x.itemName,
+                editing ? fieldInput("price", "number") : `Rp ${formatNumber(x.price)}`,
+                editing ? fieldInput("unit", "text") : x.unit,
+                editing ? fieldInput("effectiveDate", "date") : formatDateID(x.effectiveDate),
+                actionCell("price_history", x, ["itemName", "price", "unit", "effectiveDate"], ["price"])
+              ];
+            })}
+          />
+        </div>
       </div>
     );
   }
@@ -3060,6 +3502,58 @@ export default function App() {
     );
   }
 
+  function renderRiwayat() {
+    return (
+      <div className="page">
+        <div className="section-header">
+          <div>
+            <h1>Riwayat Aktivitas</h1>
+            <p>
+              Setiap kali data disimpan lewat chat, Import Excel, atau Import Chat WA, aksinya tercatat di sini
+              dan bisa di-undo. Undo menghapus baris yang tersimpan pada aksi itu saja, tidak menyentuh data
+              lain. Data yang sudah ada di database sebelum fitur ini aktif tidak tercatat di sini — perbaiki
+              lewat halaman masing-masing (Pembelian, Penjualan, dst).
+            </p>
+          </div>
+        </div>
+
+        <div className="card">
+          {activityLog.length === 0 ? (
+            <div className="empty-state">
+              <div className="empty-icon"><Icon name="trend" size={26} /></div>
+              <div className="empty-title">Belum ada aktivitas tercatat.</div>
+            </div>
+          ) : (
+            <DataTable
+              columns={["Waktu", "Aksi", "Ringkasan", "Jumlah Baris", "Status", ""]}
+              rows={activityLog.map((a) => [
+                new Date(a.createdAt).toLocaleString("id-ID"),
+                a.actionType,
+                a.summary,
+                a.documentIds.length,
+                a.undone ? (
+                  <span key="s" className="badge badge-warning">Sudah di-undo</span>
+                ) : (
+                  <span key="s" className="badge badge-ok">Aktif</span>
+                ),
+                a.undone ? null : (
+                  <button
+                    key="u"
+                    className="secondary-button"
+                    onClick={() => undoActivity(a)}
+                    disabled={undoBusyId === a.id}
+                  >
+                    {undoBusyId === a.id ? "Meng-undo..." : "Undo"}
+                  </button>
+                )
+              ])}
+            />
+          )}
+        </div>
+      </div>
+    );
+  }
+
   async function handleDownloadReport() {
     if (reportStart && reportEnd && reportStart > reportEnd) {
       showToast("Tanggal mulai tidak boleh lebih besar dari tanggal akhir.");
@@ -3189,6 +3683,7 @@ export default function App() {
   function renderContent() {
     switch (activeMenu) {
       case "dashboard": return renderDashboard();
+      case "stok-awal": return renderStokAwal();
       case "pembelian": return renderPembelian();
       case "barang-datang": return renderBarangDatang();
       case "penjualan": return renderPenjualan();
@@ -3199,6 +3694,7 @@ export default function App() {
       case "resep": return renderResep();
       case "import": return renderImport();
       case "import-wa": return renderImportWa();
+      case "riwayat": return renderRiwayat();
       case "laporan": return renderLaporan();
       default: return null;
     }
@@ -3287,6 +3783,21 @@ export default function App() {
           <span className="toast-icon">{toast.type === "error" ? "⚠️" : "✓"}</span>
           <span className="toast-message">{toast.message}</span>
           <button className="toast-close" onClick={() => setToast(null)} aria-label="Tutup notifikasi">✕</button>
+        </div>
+      )}
+
+      {saveProgress && (
+        <div className="save-progress-toast" role="status">
+          <div className="save-progress-label">
+            Menyimpan... {Math.round((saveProgress.done / saveProgress.total) * 100)}%
+            ({formatNumber(saveProgress.done)}/{formatNumber(saveProgress.total)})
+          </div>
+          <div className="save-progress-track">
+            <div
+              className="save-progress-fill"
+              style={{ width: `${Math.round((saveProgress.done / saveProgress.total) * 100)}%` }}
+            />
+          </div>
         </div>
       )}
 

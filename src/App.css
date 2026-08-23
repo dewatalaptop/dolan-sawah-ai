@@ -964,3 +964,53 @@ tbody tr:hover { background: var(--green-050); }
     to { opacity: 1; transform: translateY(0); }
   }
 }
+
+/* =========================================================
+   PROGRESS SIMPAN (muncul di mana pun ada saveRowsTracked aktif)
+   ========================================================= */
+
+.save-progress-toast {
+  position: fixed;
+  bottom: 20px;
+  left: 50%;
+  transform: translateX(-50%);
+  min-width: 240px;
+  max-width: min(360px, calc(100vw - 32px));
+  padding: 12px 14px;
+  border-radius: var(--radius-md);
+  box-shadow: var(--shadow-lg);
+  background: var(--card-bg, #fff);
+  border: 1px solid var(--border);
+  font-size: 13px;
+  z-index: 65;
+}
+
+.save-progress-label {
+  margin-bottom: 8px;
+  color: var(--ink);
+  font-weight: 600;
+}
+
+.save-progress-track {
+  height: 6px;
+  border-radius: 999px;
+  background: var(--border);
+  overflow: hidden;
+}
+
+.save-progress-fill {
+  height: 100%;
+  background: var(--green-500, #3a8a5f);
+  border-radius: 999px;
+  transition: width 0.2s ease;
+}
+
+@media (max-width: 860px) {
+  .save-progress-toast {
+    bottom: 150px;
+    left: 16px;
+    right: 16px;
+    max-width: none;
+    transform: none;
+  }
+}

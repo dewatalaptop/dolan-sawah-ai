@@ -21,7 +21,9 @@ export const COLLECTIONS = {
 
   CHAT: "chat_messages",
 
-  PURCHASE_CATEGORIES: "purchase_categories"
+  PURCHASE_CATEGORIES: "purchase_categories",
+
+  ACTIVITY_LOG: "activity_log"
 };
 
 // ============================================================
@@ -169,6 +171,22 @@ export function createPurchaseCategory(data = {}) {
   return {
     name: data.name || "",
     createdAt: new Date().toISOString()
+  };
+}
+
+// ============================================================
+// ACTIVITY LOG (satu entri per aksi simpan -- dipakai untuk undo)
+// ============================================================
+
+export function createActivityLog(data = {}) {
+  return {
+    createdAt: new Date().toISOString(),
+    actionType: data.actionType || "",
+    collectionName: data.collectionName || "",
+    documentIds: Array.isArray(data.documentIds) ? data.documentIds : [],
+    summary: data.summary || "",
+    undone: false,
+    undoneAt: null
   };
 }
 
