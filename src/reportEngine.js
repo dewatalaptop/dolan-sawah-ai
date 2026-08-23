@@ -269,7 +269,76 @@ export function buildReportWorkbook({
   );
 
   // ----------------------------------------------------------
-  // SHEET 6: PENJUALAN -- detail tiap transaksi per tanggal,
+  // SHEET 6: DETAIL PENJUALAN PER MENU -- matriks tanggal x menu
+  // (porsi & omzet per menu per hari) supaya tren tiap menu dari
+  // hari ke hari langsung terbaca tanpa harus filter/sort manual.
+  // ----------------------------------------------------------
+
+  const menuOrder = [
+    ...new Set([
+      ...(recipes || []).map((r) => r.menuName).filter(Boolean),
+      ...periodData.sales.map((r) => r.menuName).filter(Boolean)
+    ])
+  ];
+
+  const menuMatrixDates = datesInRange(startDate, endDate);
+  const menuMatrixRows = menuMatrixDates.map((date) => {
+    const dayRows = periodData.sales.filter((r) => r.date === date);
+    const row = { Tanggal: date, Hari: dayName(date) };
+    let totalQty = 0;
+    menuOrder.forEach((menu) => {
+      const qty = dayRows
+        .filter((r) => r.menuName === menu)
+        .reduce((s, r) => s + Number(r.quantity || 0), 0);
+      row[menu] = round2(qty);
+      totalQty += qty;
+    });
+    row["Total Porsi"] = round2(totalQty);
+    let totalOmzet = 0;
+    menuOrder.forEach((menu) => {
+      const qty = dayRows
+        .filter((r) => r.menuName === menu)
+        .reduce((s, r) => s + Number(r.quantity || 0), 0);
+      const price = findMenuPrice(menu, recipes);
+      const omzet = qty * price;
+      row[`${menu} (Rp)`] = price > 0 ? round2(omzet) : "";
+      totalOmzet += omzet;
+    });
+    row["Total Omzet (Rp)"] = hasAnyPrice ? round2(totalOmzet) : "";
+    return row;
+  });
+
+  if (menuMatrixRows.length) {
+    const totalRow = { Tanggal: "TOTAL", Hari: "" };
+    let grandQty = 0;
+    menuOrder.forEach((menu) => {
+      const qty = menuMatrixRows.reduce((s, r) => s + Number(r[menu] || 0), 0);
+      totalRow[menu] = round2(qty);
+      grandQty += qty;
+    });
+    totalRow["Total Porsi"] = round2(grandQty);
+    let grandOmzet = 0;
+    menuOrder.forEach((menu) => {
+      const omzet = menuMatrixRows.reduce((s, r) => s + Number(r[`${menu} (Rp)`] || 0), 0);
+      totalRow[`${menu} (Rp)`] = hasAnyPrice ? round2(omzet) : "";
+      grandOmzet += omzet;
+    });
+    totalRow["Total Omzet (Rp)"] = hasAnyPrice ? round2(grandOmzet) : "";
+    menuMatrixRows.push(totalRow);
+  }
+
+  XLSX.utils.book_append_sheet(
+    workbook,
+    sheetFromRows(
+      menuMatrixRows.length
+        ? menuMatrixRows
+        : [{ Tanggal: "-", Hari: "", "Total Porsi": "", "Total Omzet (Rp)": "" }]
+    ),
+    "Detail Penjualan per Menu"
+  );
+
+  // ----------------------------------------------------------
+  // SHEET 7: PENJUALAN -- detail tiap transaksi per tanggal,
   // BUKAN diringkas jadi total.
   // ----------------------------------------------------------
 
@@ -291,7 +360,7 @@ export function buildReportWorkbook({
   XLSX.utils.book_append_sheet(workbook, sheetFromRows(salesRows.length ? salesRows : [{ Tanggal: "-", Hari: "", Outlet: "", Menu: "Tidak ada data di periode ini", Qty: "", "Harga Jual": "", "Total (Rp)": "" }]), "Penjualan");
 
   // ----------------------------------------------------------
-  // SHEET 7: PEMBELIAN
+  // SHEET 8: PEMBELIAN
   // ----------------------------------------------------------
 
   const purchaseRows = periodData.purchases
@@ -310,7 +379,7 @@ export function buildReportWorkbook({
   XLSX.utils.book_append_sheet(workbook, sheetFromRows(purchaseRows.length ? purchaseRows : [{ Tanggal: "-", Outlet: "", Supplier: "", Bahan: "Tidak ada data di periode ini", Qty: "", Unit: "", Harga: "", Total: "" }]), "Pembelian");
 
   // ----------------------------------------------------------
-  // SHEET 8: BARANG DATANG
+  // SHEET 9: BARANG DATANG
   // ----------------------------------------------------------
 
   const receivingRows = periodData.receiving
@@ -329,7 +398,7 @@ export function buildReportWorkbook({
   XLSX.utils.book_append_sheet(workbook, sheetFromRows(receivingRows.length ? receivingRows : [{ Tanggal: "-", Outlet: "", Supplier: "", Bahan: "Tidak ada data di periode ini", Dipesan: "", Diterima: "", Unit: "", Selisih: "" }]), "Barang Datang");
 
   // ----------------------------------------------------------
-  // SHEET 9: STOCK OPNAME
+  // SHEET 10: STOCK OPNAME
   // ----------------------------------------------------------
 
   const opnameRows = periodData.stockOpname
@@ -345,7 +414,7 @@ export function buildReportWorkbook({
   XLSX.utils.book_append_sheet(workbook, sheetFromRows(opnameRows.length ? opnameRows : [{ Tanggal: "-", Outlet: "", Bahan: "Tidak ada data di periode ini", "Stok Aktual": "", Unit: "" }]), "Stock Opname");
 
   // ----------------------------------------------------------
-  // SHEET 10: WASTE
+  // SHEET 11: WASTE
   // ----------------------------------------------------------
 
   const wasteRows = periodData.waste
