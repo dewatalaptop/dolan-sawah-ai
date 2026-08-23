@@ -19,7 +19,9 @@ export const COLLECTIONS = {
   WASTE: "waste",
   ADJUSTMENTS: "adjustments",
 
-  CHAT: "chat_messages"
+  CHAT: "chat_messages",
+
+  PURCHASE_CATEGORIES: "purchase_categories"
 };
 
 // ============================================================
@@ -148,11 +150,25 @@ export function createPurchase(data = {}) {
     total:
       Number(data.total || 0),
 
+    category:
+      data.category || "",
+
     outlet:
       data.outlet || "Dolan Sawah",
 
     createdAt:
       new Date().toISOString()
+  };
+}
+
+// ============================================================
+// PURCHASE CATEGORY (dibuat manual oleh pengguna)
+// ============================================================
+
+export function createPurchaseCategory(data = {}) {
+  return {
+    name: data.name || "",
+    createdAt: new Date().toISOString()
   };
 }
 

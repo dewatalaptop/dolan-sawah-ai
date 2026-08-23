@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { collection, addDoc, getDocs, query, limit, where } from "firebase/firestore";
+import { collection, addDoc, getDocs, query, limit, where, doc, writeBatch, updateDoc } from "firebase/firestore";
 import {
   onAuthStateChanged,
   signInWithEmailAndPassword,
@@ -13,6 +13,7 @@ import {
   COLLECTIONS,
   createOpeningStock,
   createPurchase,
+  createPurchaseCategory,
   createReceiving,
   createSale,
   createStockOpname,
@@ -614,11 +615,27 @@ function parsePriceLines(text) {
    ========================================================= */
 
 async function saveRows(collectionName, rows) {
+  // writeBatch commits every row in one network round-trip instead of one
+  // per row -- a chat message with dozens of items (a long shopping list,
+  // a full day's sales) used to take one sequential await per line, which
+  // made response time scale linearly with item count. Firestore caps a
+  // batch at 500 writes, so chunk defensively even though a single chat
+  // message realistically never gets that long.
+  const CHUNK_SIZE = 450;
   const ids = [];
-  for (const row of rows) {
-    const ref = await addDoc(collection(db, collectionName), row);
-    ids.push(ref.id);
+
+  for (let i = 0; i < rows.length; i += CHUNK_SIZE) {
+    const chunk = rows.slice(i, i + CHUNK_SIZE);
+    const batch = writeBatch(db);
+    const refs = chunk.map((row) => {
+      const ref = doc(collection(db, collectionName));
+      batch.set(ref, row);
+      return ref;
+    });
+    await batch.commit();
+    refs.forEach((ref) => ids.push(ref.id));
   }
+
   return ids;
 }
 
@@ -1381,6 +1398,38 @@ export default function App() {
     toastTimerRef.current = setTimeout(() => setToast(null), 5000);
   }
 
+  const [categories, setCategories] = useState([]);
+  const [newCategoryName, setNewCategoryName] = useState("");
+  const [categoryBusy, setCategoryBusy] = useState(false);
+
+  async function loadCategories() {
+    const snapshot = await getDocs(collection(db, COLLECTIONS.PURCHASE_CATEGORIES));
+    const list = snapshot.docs
+      .map((d) => ({ id: d.id, ...d.data() }))
+      .sort((a, b) => a.name.localeCompare(b.name));
+    setCategories(list);
+  }
+
+  async function addCategory() {
+    const name = newCategoryName.trim();
+    if (!name) return;
+    if (categories.some((c) => c.name.toLowerCase() === name.toLowerCase())) {
+      showToast(`Kategori "${name}" sudah ada.`);
+      return;
+    }
+    setCategoryBusy(true);
+    try {
+      const ref = await addDoc(collection(db, COLLECTIONS.PURCHASE_CATEGORIES), createPurchaseCategory({ name }));
+      setCategories((prev) => [...prev, { id: ref.id, name }].sort((a, b) => a.name.localeCompare(b.name)));
+      setNewCategoryName("");
+    } catch (error) {
+      console.error(error);
+      showToast("Gagal menambah kategori: " + (error?.message || "unknown error"));
+    } finally {
+      setCategoryBusy(false);
+    }
+  }
+
   const [reportStart, setReportStart] = useState(daysAgoISO(29));
   const [reportEnd, setReportEnd] = useState(TODAY);
   const [reportOutlet, setReportOutlet] = useState("ALL");
@@ -1403,6 +1452,21 @@ export default function App() {
     receiving: [], sales: [], stockOpname: [], waste: [], adjustments: []
   });
   const [priceHistory, setPriceHistory] = useState([]);
+
+  async function updatePurchaseCategory(purchaseId, category) {
+    const prevRows = rawData.purchases;
+    setRawData((prev) => ({
+      ...prev,
+      purchases: prev.purchases.map((p) => (p.id === purchaseId ? { ...p, category } : p))
+    }));
+    try {
+      await updateDoc(doc(db, COLLECTIONS.PURCHASES, purchaseId), { category });
+    } catch (error) {
+      console.error(error);
+      setRawData((prev) => ({ ...prev, purchases: prevRows }));
+      showToast("Gagal menyimpan kategori: " + (error?.message || "unknown error"));
+    }
+  }
 
   const [importResult, setImportResult] = useState(null);
   const [importBusy, setImportBusy] = useState(false);
@@ -1475,7 +1539,7 @@ export default function App() {
     queueMicrotask(() => {
       setDataLoading(true);
       setDataLoadError("");
-      Promise.all([checkConnection(), refreshData()])
+      Promise.all([checkConnection(), refreshData(), loadCategories()])
         .catch((error) => {
           console.error("Gagal memuat data awal:", error);
           setDataLoadError(error?.message || "Gagal memuat data dari Firestore.");
@@ -2304,12 +2368,58 @@ export default function App() {
     return (
       <div className="page">
         <div className="section-header"><div><h1>Pembelian</h1><p>Barang yang dipesan ke supplier.</p></div></div>
+
+        <div className="card" style={{ marginBottom: 16 }}>
+          <div className="card-title">Kategori Pembelian</div>
+          <p style={{ fontSize: 13, color: "var(--ink-soft)", margin: "0 0 12px" }}>
+            Buat kategori sendiri (mis. Bahan Baku, Kemasan, Kebersihan), lalu pilih kategori untuk tiap bahan di
+            tabel pembelian di bawah.
+          </p>
+          <div style={{ display: "flex", gap: 8, flexWrap: "wrap", alignItems: "center" }}>
+            <input
+              type="text"
+              value={newCategoryName}
+              onChange={(e) => setNewCategoryName(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === "Enter") addCategory();
+              }}
+              placeholder="Nama kategori baru..."
+              style={{ padding: "8px 10px", borderRadius: 6, border: "1px solid var(--border)", minWidth: 200 }}
+            />
+            <button className="primary-button" onClick={addCategory} disabled={categoryBusy || !newCategoryName.trim()}>
+              + Tambah Kategori
+            </button>
+            {categories.length > 0 && (
+              <span style={{ fontSize: 13, color: "var(--ink-soft)" }}>
+                {categories.map((c) => c.name).join(", ")}
+              </span>
+            )}
+          </div>
+        </div>
+
         <DataTable
-          columns={["Tanggal", "Outlet", "Barang", "Jumlah", "Supplier"]}
+          columns={["Tanggal", "Outlet", "Barang", "Jumlah", "Supplier", "Kategori"]}
           rows={filteredData.purchases
             .slice()
             .sort((a, b) => (a.date < b.date ? 1 : -1))
-            .map((x) => [formatDateID(x.date), x.outlet, x.itemName, `${formatNumber(x.quantity)} ${x.unit}`, x.supplier || "-"])}
+            .map((x) => [
+              formatDateID(x.date),
+              x.outlet,
+              x.itemName,
+              `${formatNumber(x.quantity)} ${x.unit}`,
+              x.supplier || "-",
+              <select
+                key="cat"
+                value={x.category || ""}
+                onChange={(e) => updatePurchaseCategory(x.id, e.target.value)}
+                style={{ padding: "4px 6px", borderRadius: 6, border: "1px solid var(--border)" }}
+              >
+                <option value="">Belum dikategorikan</option>
+                {categories.map((c) => (
+                  <option key={c.id} value={c.name}>{c.name}</option>
+                ))}
+              </select>
+            ])}
         />
       </div>
     );
