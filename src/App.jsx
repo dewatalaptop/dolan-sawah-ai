@@ -37,9 +37,11 @@ import { processExcelFile } from "./excelEngine";
 
 import { parseWhatsAppExport } from "./whatsappImportEngine";
 
+import { findSimilarName, findPrefixCandidate } from "./similarityEngine";
+
 import { buildReportWorkbook, downloadReportWorkbook } from "./reportEngine";
 
-import { askAI, buildReportPrompt } from "./aiEngine";
+import { askAI, buildReportPrompt, analyzeIngredientPairs } from "./aiEngine";
 
 /* =========================================================
    KONSTANTA
@@ -780,6 +782,82 @@ function computeRevenue(sales, recipes) {
     const price = recipe ? Number(recipe.sellPrice || 0) : 0;
     return sum + price * Number(s.quantity || 0);
   }, 0);
+}
+
+// Kumpulan semua nama bahan yang sudah pernah tercatat di mana pun --
+// dipakai sebagai "kosakata dikenal" untuk deteksi nama mirip (typo,
+// variasi ejaan) supaya tidak diam-diam terpecah jadi bahan berbeda.
+function getKnownIngredientNames(rawData) {
+  const names = new Set();
+  (rawData.purchases || []).forEach((p) => names.add(p.itemName));
+  (rawData.receiving || []).forEach((p) => names.add(p.itemName));
+  (rawData.stockOpname || []).forEach((p) => names.add(p.itemName));
+  (rawData.waste || []).forEach((p) => names.add(p.itemName));
+  (rawData.adjustments || []).forEach((p) => names.add(p.itemName));
+  (rawData.openingStock || []).forEach((p) => names.add(p.itemName));
+  (rawData.recipes || []).forEach((r) => (r.ingredients || []).forEach((i) => names.add(i.itemName)));
+  names.delete("");
+  names.delete(undefined);
+  return [...names];
+}
+
+// Menghitung daftar "kandidat mirip" untuk sekumpulan nama bahan baru,
+// dibanding `pool` (nama-nama yang sudah dikenal -- akan bertambah terus
+// selagi diproses, supaya nama yang mirip ANTAR baris dalam batch yang
+// sama juga tertangkap). Dua tahap: (1) kemiripan tulisan (typo/ejaan) --
+// cepat, tanpa AI; (2) kandidat "kata tambahan di belakang" yang tidak
+// bisa diputuskan cuma dari tulisan (mis. "Kelapa Parut" vs "Kelapa Parut
+// 30rb") -- dikirim ke AI untuk dinilai, dan HANYA yang dinilai AI sebagai
+// "kemungkinan sama" yang lanjut ditanyakan ke pengguna. Kalau AI gagal
+// dipanggil, tahap kedua ini dilewati saja (tidak mengganggu penyimpanan).
+async function computeSimilarityChecks(names, pool) {
+  const seenLower = new Set(pool.map((n) => n.toLowerCase()));
+  const checks = [];
+  const aiCandidates = [];
+
+  names.forEach((name) => {
+    if (!name) return;
+    const key = String(name).toLowerCase();
+    if (seenLower.has(key)) return;
+
+    const similar = findSimilarName(name, pool);
+    if (similar) {
+      if (!checks.some((c) => c.name.toLowerCase() === key)) {
+        checks.push({ name, matchedName: similar.match, score: similar.score, choice: null, source: "typo" });
+      }
+    } else {
+      const prefixMatch = findPrefixCandidate(name, pool);
+      if (prefixMatch && !aiCandidates.some((c) => c.name.toLowerCase() === key)) {
+        aiCandidates.push({ name, matchedName: prefixMatch });
+      }
+    }
+
+    seenLower.add(key);
+    pool.push(name);
+  });
+
+  if (aiCandidates.length > 0) {
+    const verdicts = await analyzeIngredientPairs(aiCandidates);
+    if (Array.isArray(verdicts)) {
+      verdicts.forEach((v) => {
+        if (!v || !v.same) return;
+        const key = String(v.name || "").toLowerCase();
+        if (checks.some((c) => c.name.toLowerCase() === key)) return;
+        const original = aiCandidates.find((c) => c.name.toLowerCase() === key);
+        if (!original) return;
+        checks.push({
+          name: original.name,
+          matchedName: v.matchedName || original.matchedName,
+          score: null,
+          choice: null,
+          source: "ai",
+          reason: v.reason || ""
+        });
+      });
+    }
+  }
+
+  return checks;
 }
 
 function computeRecipeCost(recipe, priceHistory, date = TODAY) {
@@ -1681,6 +1759,75 @@ export default function App() {
     );
   }
 
+  /* =======================================================
+     KONFIRMASI NAMA BAHAN MIRIP (chat) -- sebelum menyimpan bahan
+     baru yang mirip dengan yang sudah tercatat, tanya dulu apakah
+     ini bahan yang sama atau memang berbeda. Dipakai oleh semua
+     handler item-based di processMessage (bukan penjualan, karena
+     itu berbasis nama menu resep, bukan nama bahan mentah).
+     ======================================================= */
+
+  const [pendingSimilarity, setPendingSimilarity] = useState(null); // { collectionName, rows, actionType, summary, nameKey, checks }
+
+  // Kalau tidak ada nama yang mirip (tapi belum identik) dengan yang
+  // sudah dikenal, langsung simpan seperti biasa. Kalau ada, tunda dulu
+  // dan minta konfirmasi lewat UI di bawah chat sebelum benar-benar
+  // menyimpan apa pun.
+  async function saveWithSimilarityCheck(collectionName, rows, actionType, summary, nameKey = "itemName") {
+    // `pool` menyimpan nama dengan kapitalisasi ASLI (bukan lowercase)
+    // supaya hasil pencocokan yang ditampilkan/disimpan tetap rapi
+    // (mis. "Paha Tepong", bukan "paha tepong").
+    const pool = getKnownIngredientNames(rawData);
+    const names = rows.map((row) => row[nameKey]).filter(Boolean);
+    const checks = await computeSimilarityChecks(names, pool);
+
+    if (checks.length > 0) {
+      setPendingSimilarity({ collectionName, rows, actionType, summary, nameKey, checks });
+      return { deferred: true, count: checks.length };
+    }
+
+    await saveRowsTracked(collectionName, rows, actionType, summary);
+    return { deferred: false, count: 0 };
+  }
+
+  function choosePendingSimilarity(index, choice) {
+    setPendingSimilarity((prev) => {
+      if (!prev) return prev;
+      return { ...prev, checks: prev.checks.map((c, i) => (i === index ? { ...c, choice } : c)) };
+    });
+  }
+
+  async function confirmPendingSimilarity() {
+    if (!pendingSimilarity) return;
+    const { collectionName, rows, actionType, summary, nameKey, checks } = pendingSimilarity;
+    const renameMap = new Map();
+    checks.forEach((c) => {
+      if (c.choice === "merge") renameMap.set(c.name.toLowerCase(), c.matchedName);
+    });
+    const finalRows = rows.map((row) => {
+      const name = row[nameKey];
+      const renamed = renameMap.get(String(name || "").toLowerCase());
+      return renamed ? { ...row, [nameKey]: renamed } : row;
+    });
+
+    setPendingSimilarity(null);
+    await saveRowsTracked(collectionName, finalRows, actionType, summary);
+    await refreshData();
+
+    const sendDate = chatDate;
+    const successText = `${finalRows.length} baris berhasil disimpan setelah konfirmasi kemiripan nama bahan.`;
+    setMessages((prev) => [...prev, { id: `assistant-${Date.now()}`, role: "assistant", text: successText, tags: ["TERSIMPAN"] }]);
+    persistChatMessage(sendDate, "assistant", successText, ["TERSIMPAN"]);
+  }
+
+  function cancelPendingSimilarity() {
+    setPendingSimilarity(null);
+    const sendDate = chatDate;
+    const cancelText = "Dibatalkan — data tidak disimpan. Kirim ulang dengan nama bahan yang lebih jelas kalau perlu.";
+    setMessages((prev) => [...prev, { id: `assistant-${Date.now()}`, role: "assistant", text: cancelText, tags: [] }]);
+    persistChatMessage(sendDate, "assistant", cancelText, []);
+  }
+
   const [reportStart, setReportStart] = useState(daysAgoISO(29));
   const [reportEnd, setReportEnd] = useState(TODAY);
   const [reportOutlet, setReportOutlet] = useState("ALL");
@@ -1750,6 +1897,7 @@ export default function App() {
   const [waText, setWaText] = useState("");
   const [waResult, setWaResult] = useState(null);
   const [waSaveBusy, setWaSaveBusy] = useState(false);
+  const [waAnalyzing, setWaAnalyzing] = useState(false);
   const [waShowReview, setWaShowReview] = useState(false);
 
   const [editingRecipeId, setEditingRecipeId] = useState(null);
@@ -1939,7 +2087,13 @@ export default function App() {
         };
       }
       const rows = items.map((x) => createOpeningStock({ ...x, date, outlet }));
-      await saveRowsTracked(COLLECTIONS.OPENING_STOCK, rows, "Stok Awal (chat)", `${rows.length} bahan, ${outlet}, ${formatDateID(date)}`);
+      const saveResult = await saveWithSimilarityCheck(COLLECTIONS.OPENING_STOCK, rows, "Stok Awal (chat)", `${rows.length} bahan, ${outlet}, ${formatDateID(date)}`);
+      if (saveResult.deferred) {
+        return {
+          text: `Ada ${saveResult.count} nama bahan yang mirip dengan yang sudah tercatat. Mohon konfirmasi dulu di bawah sebelum saya simpan.`,
+          tags: ["STOK AWAL", "PERLU KONFIRMASI"]
+        };
+      }
       await refreshData();
       return {
         text:
@@ -1961,7 +2115,13 @@ export default function App() {
         };
       }
       const rows = items.map((x) => createPurchase({ ...x, date, outlet, supplier }));
-      await saveRowsTracked(COLLECTIONS.PURCHASES, rows, "Pembelian (chat)", `${rows.length} bahan, ${outlet}, ${formatDateID(date)}`);
+      const saveResult = await saveWithSimilarityCheck(COLLECTIONS.PURCHASES, rows, "Pembelian (chat)", `${rows.length} bahan, ${outlet}, ${formatDateID(date)}`);
+      if (saveResult.deferred) {
+        return {
+          text: `Ada ${saveResult.count} nama bahan yang mirip dengan yang sudah tercatat. Mohon konfirmasi dulu di bawah sebelum saya simpan.`,
+          tags: ["PEMBELIAN", "PERLU KONFIRMASI"]
+        };
+      }
       await refreshData();
       return {
         text:
@@ -2025,7 +2185,13 @@ export default function App() {
         }
       }
 
-      await saveRowsTracked(COLLECTIONS.RECEIVING, rows, "Barang Datang (chat)", `${rows.length} bahan, ${outlet}, ${formatDateID(date)}`);
+      const saveResult = await saveWithSimilarityCheck(COLLECTIONS.RECEIVING, rows, "Barang Datang (chat)", `${rows.length} bahan, ${outlet}, ${formatDateID(date)}`);
+      if (saveResult.deferred) {
+        return {
+          text: `Ada ${saveResult.count} nama bahan yang mirip dengan yang sudah tercatat. Mohon konfirmasi dulu di bawah sebelum saya simpan.`,
+          tags: ["BARANG DATANG", "PERLU KONFIRMASI"]
+        };
+      }
       await refreshData();
 
       return {
@@ -2079,7 +2245,13 @@ export default function App() {
           unit: x.unit
         })
       );
-      await saveRowsTracked(COLLECTIONS.STOCK_OPNAME, rows, "Stock Opname (chat)", `${rows.length} bahan, ${outlet}, ${formatDateID(date)}`);
+      const saveResult = await saveWithSimilarityCheck(COLLECTIONS.STOCK_OPNAME, rows, "Stock Opname (chat)", `${rows.length} bahan, ${outlet}, ${formatDateID(date)}`);
+      if (saveResult.deferred) {
+        return {
+          text: `Ada ${saveResult.count} nama bahan yang mirip dengan yang sudah tercatat. Mohon konfirmasi dulu di bawah sebelum saya simpan.`,
+          tags: ["STOCK OPNAME", "PERLU KONFIRMASI"]
+        };
+      }
       await refreshData();
       return {
         text:
@@ -2102,7 +2274,13 @@ export default function App() {
         };
       }
       const rows = items.map((x) => createWaste({ ...x, date, outlet, reason }));
-      await saveRowsTracked(COLLECTIONS.WASTE, rows, "Waste (chat)", `${rows.length} bahan, ${outlet}, ${formatDateID(date)}`);
+      const saveResult = await saveWithSimilarityCheck(COLLECTIONS.WASTE, rows, "Waste (chat)", `${rows.length} bahan, ${outlet}, ${formatDateID(date)}`);
+      if (saveResult.deferred) {
+        return {
+          text: `Ada ${saveResult.count} nama bahan yang mirip dengan yang sudah tercatat. Mohon konfirmasi dulu di bawah sebelum saya simpan.`,
+          tags: ["WASTE", "PERLU KONFIRMASI"]
+        };
+      }
       await refreshData();
       return {
         text:
@@ -2122,7 +2300,13 @@ export default function App() {
         };
       }
       const rows = items.map((x) => createAdjustment({ ...x, date, outlet, reason }));
-      await saveRowsTracked(COLLECTIONS.ADJUSTMENTS, rows, "Penyesuaian Stok (chat)", `${rows.length} bahan, ${outlet}, ${formatDateID(date)}`);
+      const saveResult = await saveWithSimilarityCheck(COLLECTIONS.ADJUSTMENTS, rows, "Penyesuaian Stok (chat)", `${rows.length} bahan, ${outlet}, ${formatDateID(date)}`);
+      if (saveResult.deferred) {
+        return {
+          text: `Ada ${saveResult.count} nama bahan yang mirip dengan yang sudah tercatat. Mohon konfirmasi dulu di bawah sebelum saya simpan.`,
+          tags: ["PENYESUAIAN", "PERLU KONFIRMASI"]
+        };
+      }
       await refreshData();
       return {
         text: `PENYESUAIAN STOK (${outlet}) tersimpan.`,
@@ -2430,9 +2614,27 @@ export default function App() {
      IMPORT CHAT WHATSAPP (rekap belanja multi-tanggal/outlet)
      ======================================================= */
 
-  function handleWaParse() {
-    setWaResult(parseWhatsAppExport(waText));
-    setWaShowReview(false);
+  async function handleWaParse() {
+    const result = parseWhatsAppExport(waText);
+
+    // Deteksi nama bahan yang mirip -- baik terhadap yang sudah tercatat
+    // di database, MAUPUN antar baris di dalam batch import ini sendiri
+    // (rekap WhatsApp panjang sering menulis bahan yang sama dengan ejaan
+    // berbeda, atau catatan tambahan seperti harga/takaran, di hari yang
+    // berbeda-beda).
+    const pool = getKnownIngredientNames(rawData);
+    const allNames = [];
+    result.groups.forEach((g) => g.items.forEach((item) => allNames.push(item.itemName)));
+    result.reviewItems.forEach((item) => allNames.push(item.itemName));
+
+    setWaAnalyzing(true);
+    try {
+      const similarityChecks = await computeSimilarityChecks(allNames, pool);
+      setWaResult({ ...result, similarityChecks });
+      setWaShowReview(false);
+    } finally {
+      setWaAnalyzing(false);
+    }
   }
 
   function updateWaReviewItem(index, field, value) {
@@ -2442,12 +2644,26 @@ export default function App() {
     }));
   }
 
+  function chooseWaSimilarity(index, choice) {
+    setWaResult((prev) => ({
+      ...prev,
+      similarityChecks: prev.similarityChecks.map((c, i) => (i === index ? { ...c, choice } : c))
+    }));
+  }
+
   async function handleWaSave() {
     if (!waResult) return;
     const totalRows = waResult.totalConfident + waResult.reviewItems.length;
     if (!totalRows) return;
+    if (waResult.similarityChecks.some((c) => !c.choice)) return;
     setWaSaveBusy(true);
     try {
+      const renameMap = new Map();
+      waResult.similarityChecks.forEach((c) => {
+        if (c.choice === "merge") renameMap.set(c.name.toLowerCase(), c.matchedName);
+      });
+      const applyRename = (name) => renameMap.get(String(name || "").toLowerCase()) || name;
+
       const rows = [];
       waResult.groups.forEach((g) => {
         g.items.forEach((item) => {
@@ -2455,7 +2671,7 @@ export default function App() {
             createPurchase({
               date: g.date,
               outlet: g.outlet,
-              itemName: item.itemName,
+              itemName: applyRename(item.itemName),
               quantity: item.quantity,
               unit: item.unit
             })
@@ -2471,7 +2687,7 @@ export default function App() {
           createPurchase({
             date: item.date || getTodayISO(),
             outlet: item.outlet || "DS",
-            itemName: item.itemName,
+            itemName: applyRename(item.itemName),
             quantity: Number(item.quantity) || 1,
             unit: item.unit
           })
@@ -3369,8 +3585,8 @@ export default function App() {
             style={{ width: "100%", padding: 10, borderRadius: 8, border: "1px solid var(--border)", fontFamily: "inherit", fontSize: 13, resize: "vertical" }}
           />
           <div className="form-footer">
-            <button className="primary-button" onClick={handleWaParse} disabled={!waText.trim()}>
-              Proses Teks
+            <button className="primary-button" onClick={handleWaParse} disabled={!waText.trim() || waAnalyzing}>
+              {waAnalyzing ? "Menganalisa..." : "Proses Teks"}
             </button>
           </div>
         </div>
@@ -3404,12 +3620,63 @@ export default function App() {
 
               {waResult.totalConfident + waResult.reviewItems.length > 0 && (
                 <div className="form-footer">
-                  <button className="primary-button" onClick={handleWaSave} disabled={waSaveBusy}>
+                  <span className="message">
+                    {waResult.similarityChecks.length > 0 &&
+                      `Konfirmasi dulu ${waResult.similarityChecks.filter((c) => !c.choice).length} kemiripan nama bahan di bawah sebelum menyimpan.`}
+                  </span>
+                  <button
+                    className="primary-button"
+                    onClick={handleWaSave}
+                    disabled={waSaveBusy || waResult.similarityChecks.some((c) => !c.choice)}
+                  >
                     {waSaveBusy ? "Menyimpan..." : "Simpan Semua ke Database"}
                   </button>
                 </div>
               )}
             </div>
+
+            {waResult.similarityChecks.length > 0 && (
+              <div className="similarity-confirm-card">
+                <div className="similarity-confirm-title">
+                  ⚠️ {waResult.similarityChecks.length} nama bahan mirip dengan yang sudah tercatat
+                </div>
+                <p className="similarity-confirm-desc">
+                  Konfirmasi satu per satu sebelum bisa menyimpan: apakah bahan baru ini sama dengan yang sudah
+                  ada, atau memang bahan yang berbeda?
+                </p>
+                <div className="similarity-confirm-list">
+                  {waResult.similarityChecks.map((c, i) => (
+                    <div key={i} className="similarity-confirm-item">
+                      <div className="similarity-confirm-names">
+                        <span className="similarity-confirm-new">"{c.name}"</span>
+                        <span className="similarity-confirm-vs">mirip dengan</span>
+                        <span className="similarity-confirm-existing">"{c.matchedName}"</span>
+                        {c.source === "ai" ? (
+                          <span className="similarity-confirm-score similarity-confirm-score-ai">🤖 dinilai AI</span>
+                        ) : (
+                          <span className="similarity-confirm-score">({Math.round(c.score * 100)}% mirip)</span>
+                        )}
+                      </div>
+                      {c.reason && <p className="similarity-confirm-reason">{c.reason}</p>}
+                      <div className="similarity-confirm-choices">
+                        <button
+                          className={`chip-choice ${c.choice === "merge" ? "active" : ""}`}
+                          onClick={() => chooseWaSimilarity(i, "merge")}
+                        >
+                          Sama, pakai "{c.matchedName}"
+                        </button>
+                        <button
+                          className={`chip-choice ${c.choice === "separate" ? "active" : ""}`}
+                          onClick={() => chooseWaSimilarity(i, "separate")}
+                        >
+                          Bahan berbeda, tetap "{c.name}"
+                        </button>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
 
             {waResult.excludedPr.length > 0 && (
               <div className="card">
@@ -3998,6 +4265,59 @@ export default function App() {
               )}
               <div style={{ height: 12 }} />
             </div>
+
+            {pendingSimilarity && (
+              <div className="similarity-confirm-card">
+                <div className="similarity-confirm-title">
+                  ⚠️ {pendingSimilarity.checks.length} nama bahan mirip dengan yang sudah tercatat
+                </div>
+                <p className="similarity-confirm-desc">
+                  Konfirmasi satu per satu: apakah bahan baru ini sama dengan yang sudah ada, atau memang bahan
+                  yang berbeda? Belum ada yang tersimpan sampai semua dikonfirmasi.
+                </p>
+                <div className="similarity-confirm-list">
+                  {pendingSimilarity.checks.map((c, i) => (
+                    <div key={i} className="similarity-confirm-item">
+                      <div className="similarity-confirm-names">
+                        <span className="similarity-confirm-new">"{c.name}"</span>
+                        <span className="similarity-confirm-vs">mirip dengan</span>
+                        <span className="similarity-confirm-existing">"{c.matchedName}"</span>
+                        {c.source === "ai" ? (
+                          <span className="similarity-confirm-score similarity-confirm-score-ai">🤖 dinilai AI</span>
+                        ) : (
+                          <span className="similarity-confirm-score">({Math.round(c.score * 100)}% mirip)</span>
+                        )}
+                      </div>
+                      {c.reason && <p className="similarity-confirm-reason">{c.reason}</p>}
+                      <div className="similarity-confirm-choices">
+                        <button
+                          className={`chip-choice ${c.choice === "merge" ? "active" : ""}`}
+                          onClick={() => choosePendingSimilarity(i, "merge")}
+                        >
+                          Sama, pakai "{c.matchedName}"
+                        </button>
+                        <button
+                          className={`chip-choice ${c.choice === "separate" ? "active" : ""}`}
+                          onClick={() => choosePendingSimilarity(i, "separate")}
+                        >
+                          Bahan berbeda, tetap "{c.name}"
+                        </button>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+                <div className="similarity-confirm-footer">
+                  <button className="secondary-button" onClick={cancelPendingSimilarity}>Batalkan Semua</button>
+                  <button
+                    className="primary-button"
+                    onClick={confirmPendingSimilarity}
+                    disabled={pendingSimilarity.checks.some((c) => !c.choice)}
+                  >
+                    Lanjutkan & Simpan
+                  </button>
+                </div>
+              </div>
+            )}
 
             <div className="quick-actions">
               <button onClick={() => quickAction(`Stok awal hari ini ${chatOutlet}\nAyam 35 kg\nBeras 50 kg`)}>Stok Awal</button>

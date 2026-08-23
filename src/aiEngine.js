@@ -60,3 +60,49 @@ export async function askAI(prompt) {
 
   return text;
 }
+
+// ============================================================
+// ANALISA KEMIRIPAN NAMA BAHAN (AI ikut menilai kandidat yang
+// tidak bisa diputuskan cuma dari kemiripan tulisan -- mis.
+// "Kelapa Parut" vs "Kelapa Parut 30rb", "Jantung Pisang" vs
+// "Jantung Pisang Seadanya" -- vs yang MEMANG beda produk
+// walau namanya mirip, mis. "Kecap" vs "Kecap Manis")
+// ============================================================
+
+const INGREDIENT_MATCH_SYSTEM_PROMPT =
+  "Anda membantu tim operasional warung makan (Dolan Sawah Group) menilai pasangan nama " +
+  "bahan/barang belanja yang ditulis staf secara manual di chat. Untuk tiap pasangan, " +
+  "tentukan apakah keduanya kemungkinan besar merujuk ke BARANG FISIK YANG SAMA (beda tulisan " +
+  "karena tambahan catatan harga, takaran, atau kata seperti 'seadanya'/'secukupnya'), atau " +
+  "BARANG YANG BERBEDA meski namanya mirip/beririsan (mis. varian rasa, jenis, atau cara olah " +
+  "yang berbeda seperti 'Kecap' vs 'Kecap Manis', 'Gula' vs 'Gula Aren', 'Kelapa Parut Santan' " +
+  "vs 'Kelapa Parut Gudangan', 'Tahu' vs 'Tahu Pong'). Balas HANYA dengan JSON array valid, " +
+  "tanpa teks lain di luar JSON, dengan format persis: " +
+  '[{"name":"...","matchedName":"...","same":true,"reason":"..."}]. ' +
+  '"reason" singkat (maksimal 12 kata) dalam Bahasa Indonesia, jelaskan alasannya.';
+
+export async function analyzeIngredientPairs(pairs) {
+  if (!client || !pairs.length) return null;
+
+  const prompt =
+    "Pasangan nama bahan berikut ditulis berdekatan dalam catatan belanja yang sama, " +
+    "sehingga salah satu KEMUNGKINAN adalah catatan tambahan dari yang lain:\n\n" +
+    JSON.stringify(pairs.map((p) => ({ name: p.name, matchedName: p.matchedName })));
+
+  try {
+    const response = await client.chat.completions.create({
+      model: MODEL_NAME,
+      messages: [
+        { role: "system", content: INGREDIENT_MATCH_SYSTEM_PROMPT },
+        { role: "user", content: prompt }
+      ]
+    });
+    const text = response?.choices?.[0]?.message?.content || "";
+    const jsonMatch = text.match(/\[[\s\S]*\]/);
+    if (!jsonMatch) return null;
+    const parsed = JSON.parse(jsonMatch[0]);
+    return Array.isArray(parsed) ? parsed : null;
+  } catch {
+    return null;
+  }
+}

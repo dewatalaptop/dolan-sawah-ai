@@ -477,6 +477,106 @@ tbody tr:hover { background: var(--green-050); }
 .logic-text strong { color: var(--orange-600); }
 
 /* =========================================================
+   KONFIRMASI KEMIRIPAN NAMA BAHAN (chat + import WA)
+   ========================================================= */
+
+.similarity-confirm-card {
+  border: 1px solid var(--orange-100);
+  border-radius: var(--radius-lg);
+  background: linear-gradient(135deg, var(--orange-050), var(--surface));
+  padding: 16px 18px;
+  margin: 0 0 14px;
+}
+
+.similarity-confirm-title {
+  font-size: 13.5px;
+  font-weight: 750;
+  color: #8a3d17;
+}
+
+.similarity-confirm-desc {
+  margin: 6px 0 14px;
+  font-size: 12px;
+  line-height: 1.6;
+  color: var(--ink-soft);
+}
+
+.similarity-confirm-list {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.similarity-confirm-item {
+  padding: 10px 12px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  background: var(--surface);
+}
+
+.similarity-confirm-names {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 6px;
+  font-size: 13px;
+  margin-bottom: 8px;
+}
+
+.similarity-confirm-new { font-weight: 700; color: var(--ink); }
+.similarity-confirm-vs { color: var(--ink-faint); font-size: 11.5px; }
+.similarity-confirm-existing { font-weight: 700; color: var(--ink); }
+.similarity-confirm-score { color: var(--ink-faint); font-size: 11px; }
+
+.similarity-confirm-score-ai {
+  color: #5b3ea6;
+  background: #efe9fb;
+  padding: 2px 8px;
+  border-radius: 999px;
+  font-weight: 600;
+}
+
+.similarity-confirm-reason {
+  margin: -2px 0 8px;
+  font-size: 11.5px;
+  font-style: italic;
+  color: var(--ink-faint);
+}
+
+.similarity-confirm-choices {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.chip-choice {
+  padding: 6px 12px;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  background: var(--surface);
+  color: var(--ink-soft);
+  font-size: 12px;
+  cursor: pointer;
+  transition: all 0.15s ease;
+}
+
+.chip-choice:hover { border-color: var(--green-500); color: var(--green-700); }
+
+.chip-choice.active {
+  background: var(--green-500);
+  border-color: var(--green-500);
+  color: #fff;
+  font-weight: 600;
+}
+
+.similarity-confirm-footer {
+  display: flex;
+  justify-content: flex-end;
+  gap: 10px;
+  margin-top: 14px;
+}
+
+/* =========================================================
    BUTTONS
    ========================================================= */
 
