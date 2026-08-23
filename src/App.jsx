@@ -34,6 +34,8 @@ import { getPriceHistory, savePrice, getCurrentPrice } from "./priceEngine";
 
 import { processExcelFile } from "./excelEngine";
 
+import { parseWhatsAppExport } from "./whatsappImportEngine";
+
 import { buildReportWorkbook, downloadReportWorkbook } from "./reportEngine";
 
 import { askAI, buildReportPrompt } from "./aiEngine";
@@ -94,6 +96,7 @@ const MENU = [
   { id: "harga", label: "Harga Bahan", icon: "tag" },
   { id: "resep", label: "Resep", icon: "book" },
   { id: "import", label: "Import Excel", icon: "upload" },
+  { id: "import-wa", label: "Import Chat WA", icon: "chat" },
   { id: "laporan", label: "Laporan AI", icon: "doc" }
 ];
 
@@ -170,7 +173,16 @@ function unitNormalize(unit) {
     u.includes("pack") ||
     u.includes("bungkus") ||
     u.includes("kemasan") ||
-    u.includes("ikat")
+    u.includes("ikat") ||
+    u.includes("dus") ||
+    u.includes("krat") ||
+    u.includes("bal") ||
+    u.includes("sak") ||
+    u.includes("kotak") ||
+    u.includes("kranjang") ||
+    u.includes("keranjang") ||
+    u.includes("botol") ||
+    u.includes("karton")
   ) {
     return "unit";
   }
@@ -355,6 +367,8 @@ function detectDataType(text) {
 
   if (
     t.includes("pembelian") ||
+    t.includes("pembelanjaan") ||
+    t.includes("belanja") ||
     t.includes("pesan barang") ||
     t.includes("po ke") ||
     t.includes("order barang") ||
@@ -413,7 +427,7 @@ function parseItemLines(text) {
     // satuan di sini otomatis mencegah angka tanggal/metadata terbaca
     // sebagai quantity barang, tanpa perlu parser tanggal terpisah.
     const match = line.match(
-      /([\d.,]+)\s*(kg|kilogram|gram|gr|g|liter|ltr|l|ml|porsi|pcs|buah|butir|ekor|pack|bungkus|kemasan|ikat)\b/i
+      /([\d.,]+)\s*(kg|kilogram|gram|gr|g|liter|ltr|l|ml|porsi|pcs|buah|butir|ekor|pack|bungkus|kemasan|ikat|dus|krat|bal|sak|kotak|kranjang|keranjang|botol|karton)\b/i
     );
 
     if (!match || !match[1]) continue;
@@ -1471,6 +1485,11 @@ export default function App() {
   const [importResult, setImportResult] = useState(null);
   const [importBusy, setImportBusy] = useState(false);
 
+  const [waText, setWaText] = useState("");
+  const [waResult, setWaResult] = useState(null);
+  const [waSaveBusy, setWaSaveBusy] = useState(false);
+  const [waShowReview, setWaShowReview] = useState(false);
+
   const [editingRecipeId, setEditingRecipeId] = useState(null);
   const [editMenuName, setEditMenuName] = useState("");
   const [editIngredients, setEditIngredients] = useState([]);
@@ -2142,6 +2161,71 @@ export default function App() {
       showToast(`Gagal menyimpan hasil import: ${error.message}`);
     } finally {
       setImportBusy(false);
+    }
+  }
+
+  /* =======================================================
+     IMPORT CHAT WHATSAPP (rekap belanja multi-tanggal/outlet)
+     ======================================================= */
+
+  function handleWaParse() {
+    setWaResult(parseWhatsAppExport(waText));
+    setWaShowReview(false);
+  }
+
+  function updateWaReviewItem(index, field, value) {
+    setWaResult((prev) => ({
+      ...prev,
+      reviewItems: prev.reviewItems.map((item, i) => (i === index ? { ...item, [field]: value } : item))
+    }));
+  }
+
+  async function handleWaSave() {
+    if (!waResult) return;
+    const totalRows = waResult.totalConfident + waResult.reviewItems.length;
+    if (!totalRows) return;
+    setWaSaveBusy(true);
+    try {
+      const rows = [];
+      waResult.groups.forEach((g) => {
+        g.items.forEach((item) => {
+          rows.push(
+            createPurchase({
+              date: g.date,
+              outlet: g.outlet,
+              itemName: item.itemName,
+              quantity: item.quantity,
+              unit: item.unit
+            })
+          );
+        });
+      });
+      // Baris "perlu ditinjau" tetap ikut tersimpan memakai tebakan
+      // terbaik (atau editan pengguna) -- tanggal/outlet kosong di-default
+      // ke hari ini/DS supaya tidak ada data yang batal tersimpan hanya
+      // karena belum sempat ditinjau.
+      waResult.reviewItems.forEach((item) => {
+        rows.push(
+          createPurchase({
+            date: item.date || getTodayISO(),
+            outlet: item.outlet || "DS",
+            itemName: item.itemName,
+            quantity: Number(item.quantity) || 1,
+            unit: item.unit
+          })
+        );
+      });
+      await saveRows(COLLECTIONS.PURCHASES, rows);
+      await refreshData();
+      showToast(`${rows.length} baris pembelian berhasil disimpan.`, "success");
+      setWaText("");
+      setWaResult(null);
+      setWaShowReview(false);
+    } catch (error) {
+      console.error(error);
+      showToast(`Gagal menyimpan hasil import chat: ${error.message}`);
+    } finally {
+      setWaSaveBusy(false);
     }
   }
 
@@ -2820,6 +2904,162 @@ export default function App() {
     );
   }
 
+  function renderImportWa() {
+    return (
+      <div className="page">
+        <div className="section-header">
+          <div>
+            <h1>Import Chat WhatsApp</h1>
+            <p>
+              Tempel apa adanya rekap belanja dari WhatsApp — boleh berisi banyak tanggal dan banyak outlet
+              sekaligus. Semua dicatat sebagai pembelian; kirim "barang datang" terpisah hanya kalau jumlah yang
+              diterima berbeda dari yang dicatat di sini.
+            </p>
+          </div>
+        </div>
+
+        <div className="card">
+          <textarea
+            value={waText}
+            onChange={(e) => setWaText(e.target.value)}
+            placeholder={"Tempel ekspor chat WhatsApp di sini...\n\nContoh:\n[01/08/26, 14.08.09] Ana Checker:\nDS\n* Bawang merah 5 kg\n* Tempe 20"}
+            rows={10}
+            style={{ width: "100%", padding: 10, borderRadius: 8, border: "1px solid var(--border)", fontFamily: "inherit", fontSize: 13, resize: "vertical" }}
+          />
+          <div className="form-footer">
+            <button className="primary-button" onClick={handleWaParse} disabled={!waText.trim()}>
+              Proses Teks
+            </button>
+          </div>
+        </div>
+
+        {waResult && (
+          <>
+            <div className="card">
+              <div className="card-title">
+                Akan disimpan: {waResult.totalConfident + waResult.reviewItems.length} baris pembelian
+                ({waResult.groups.length} kombinasi tanggal/outlet sudah pasti
+                {waResult.reviewItems.length > 0 && `, ${waResult.reviewItems.length} pakai tebakan otomatis`})
+              </div>
+              {waResult.groups.length > 0 && (
+                <DataTable
+                  columns={["Tanggal", "Outlet", "Jumlah Item"]}
+                  rows={waResult.groups.map((g) => [formatDateID(g.date), g.outlet, g.items.length])}
+                />
+              )}
+
+              {waResult.reviewItems.length > 0 && (
+                <div style={{ margin: "12px 0" }}>
+                  <button className="secondary-button" onClick={() => setWaShowReview(true)}>
+                    ⚠️ Tinjau &amp; Perbaiki ({waResult.reviewItems.length} baris pakai tebakan)
+                  </button>
+                  <p style={{ fontSize: 13, color: "var(--ink-soft)", margin: "8px 0 0" }}>
+                    Baris ini tetap akan tersimpan memakai tebakan otomatis (jumlah 1, satuan "unit", atau
+                    tanggal/outlet default) kalau tidak Anda perbaiki dulu di sini.
+                  </p>
+                </div>
+              )}
+
+              {waResult.totalConfident + waResult.reviewItems.length > 0 && (
+                <div className="form-footer">
+                  <button className="primary-button" onClick={handleWaSave} disabled={waSaveBusy}>
+                    {waSaveBusy ? "Menyimpan..." : "Simpan Semua ke Database"}
+                  </button>
+                </div>
+              )}
+            </div>
+
+            {waResult.excludedPr.length > 0 && (
+              <div className="card">
+                <div className="card-title">
+                  ℹ️ {waResult.excludedPr.length} baris diabaikan (rencana/PR, bukan realisasi belanja)
+                </div>
+                <p style={{ fontSize: 13, color: "var(--ink-soft)", margin: "0 0 12px" }}>
+                  Baris di bawah "*PR*" dianggap rencana, bukan belanja yang sudah terjadi — sengaja tidak
+                  disimpan. Kalau sebagian sudah benar-benar dibeli, masukkan manual lewat chat AI Assistant.
+                </p>
+                <DataTable columns={["Baris Asli"]} rows={waResult.excludedPr.map((s) => [s.line])} />
+              </div>
+            )}
+          </>
+        )}
+
+        {waShowReview && waResult && (
+          <div
+            style={{
+              position: "fixed", inset: 0, background: "rgba(0,0,0,0.4)", zIndex: 70,
+              display: "flex", alignItems: "center", justifyContent: "center", padding: 16
+            }}
+            onClick={() => setWaShowReview(false)}
+          >
+            <div
+              className="card"
+              style={{ maxWidth: 900, width: "100%", maxHeight: "85vh", overflowY: "auto" }}
+              onClick={(e) => e.stopPropagation()}
+            >
+              <div className="card-title">Tinjau &amp; Perbaiki {waResult.reviewItems.length} Baris</div>
+              <p style={{ fontSize: 13, color: "var(--ink-soft)", margin: "0 0 12px" }}>
+                Baris asli dari chat ditampilkan sebagai referensi. Ubah field di sebelah kanan kalau tebakannya
+                salah, atau biarkan saja untuk memakai tebakan apa adanya.
+              </p>
+              <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+                {waResult.reviewItems.map((item, i) => (
+                  <div key={i} style={{ border: "1px solid var(--border)", borderRadius: 8, padding: 10 }}>
+                    <div style={{ fontSize: 12, color: "var(--ink-soft)", marginBottom: 6 }}>
+                      Baris asli: "{item.rawLine}" — {item.reason}
+                    </div>
+                    <div style={{ display: "flex", gap: 6, flexWrap: "wrap", alignItems: "center" }}>
+                      <input
+                        type="date"
+                        value={item.date}
+                        onChange={(e) => updateWaReviewItem(i, "date", e.target.value)}
+                        style={{ padding: "6px 8px", borderRadius: 6, border: "1px solid var(--border)" }}
+                      />
+                      <select
+                        value={item.outlet}
+                        onChange={(e) => updateWaReviewItem(i, "outlet", e.target.value)}
+                        style={{ padding: "6px 8px", borderRadius: 6, border: "1px solid var(--border)" }}
+                      >
+                        <option value="">(default DS)</option>
+                        {OUTLETS.filter((o) => o.id !== "ALL").map((o) => (
+                          <option key={o.id} value={o.id}>{o.id}</option>
+                        ))}
+                      </select>
+                      <input
+                        type="text"
+                        value={item.itemName}
+                        onChange={(e) => updateWaReviewItem(i, "itemName", e.target.value)}
+                        style={{ padding: "6px 8px", borderRadius: 6, border: "1px solid var(--border)", flex: "1 1 160px" }}
+                      />
+                      <input
+                        type="number"
+                        value={item.quantity}
+                        onChange={(e) => updateWaReviewItem(i, "quantity", e.target.value)}
+                        style={{ padding: "6px 8px", borderRadius: 6, border: "1px solid var(--border)", width: 80 }}
+                      />
+                      <input
+                        type="text"
+                        value={item.unit}
+                        onChange={(e) => updateWaReviewItem(i, "unit", e.target.value)}
+                        style={{ padding: "6px 8px", borderRadius: 6, border: "1px solid var(--border)", width: 70 }}
+                      />
+                    </div>
+                  </div>
+                ))}
+              </div>
+              <div className="form-footer">
+                <button className="secondary-button" onClick={() => setWaShowReview(false)}>Tutup</button>
+                <button className="primary-button" onClick={handleWaSave} disabled={waSaveBusy}>
+                  {waSaveBusy ? "Menyimpan..." : "Simpan Semua ke Database"}
+                </button>
+              </div>
+            </div>
+          </div>
+        )}
+      </div>
+    );
+  }
+
   async function handleDownloadReport() {
     if (reportStart && reportEnd && reportStart > reportEnd) {
       showToast("Tanggal mulai tidak boleh lebih besar dari tanggal akhir.");
@@ -2958,6 +3198,7 @@ export default function App() {
       case "harga": return renderHarga();
       case "resep": return renderResep();
       case "import": return renderImport();
+      case "import-wa": return renderImportWa();
       case "laporan": return renderLaporan();
       default: return null;
     }
