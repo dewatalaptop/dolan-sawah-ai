@@ -84,17 +84,31 @@ function parseItemLine(rawText) {
   const match = text.match(
     new RegExp(`^(.+?)\\s+(\\d+(?:[.,]\\d+)?(?:\\/\\d+)?)\\s*(${UNIT_WORDS})?\\s*$`, "i")
   );
-  if (!match) return null;
+  if (match) {
+    const itemName = titleCase(match[1]);
+    const quantity = parseQuantityToken(match[2]);
+    if (itemName && quantity) {
+      return {
+        itemName,
+        quantity,
+        unit: match[3] ? unitNormalize(match[3]) : "unit"
+      };
+    }
+  }
 
-  const itemName = titleCase(match[1]);
-  const quantity = parseQuantityToken(match[2]);
-  if (!itemName || !quantity) return null;
+  // Barang tanpa angka pasti tapi pakai kata baku "seadanya"/"secukupnya"
+  // (mis. "Bunga pepaya seadanya") -- ini bukan barang yang tidak jelas,
+  // staf memang sengaja tidak menakar persis. Dianggap terbaca (jumlah 1,
+  // satuan "secukupnya") supaya tidak masuk daftar tinjau manual.
+  const asNeeded = text.match(/^(.+?)\s+(?:seadanya|secukupnya)\s*$/i);
+  if (asNeeded) {
+    const itemName = titleCase(asNeeded[1]);
+    if (itemName) {
+      return { itemName, quantity: 1, unit: "secukupnya" };
+    }
+  }
 
-  return {
-    itemName,
-    quantity,
-    unit: match[3] ? unitNormalize(match[3]) : "unit"
-  };
+  return null;
 }
 
 // Tebakan terbaik untuk baris yang gagal diurai parseItemLine -- seluruh

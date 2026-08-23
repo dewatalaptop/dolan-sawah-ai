@@ -47,7 +47,19 @@ import { askAI, buildReportPrompt, analyzeIngredientPairs } from "./aiEngine";
    KONSTANTA
    ========================================================= */
 
-const TODAY = new Date().toISOString().slice(0, 10);
+// Tanggal kalender LOKAL (bukan UTC) dari sebuah Date. WAJIB dipakai untuk
+// apa pun yang berarti "hari ini" menurut jam pengguna -- new Date().toISOString()
+// selalu memakai UTC, jadi untuk pengguna di WIB (UTC+7) tanggalnya baru
+// berganti jam 7 pagi, bukan tengah malam (chat/entri jadi tidak reset tepat
+// waktu kalau dihitung lewat toISOString()).
+function toLocalISODate(d) {
+  const year = d.getFullYear();
+  const month = String(d.getMonth() + 1).padStart(2, "0");
+  const day = String(d.getDate()).padStart(2, "0");
+  return `${year}-${month}-${day}`;
+}
+
+const TODAY = toLocalISODate(new Date());
 
 // TODAY di atas cuma dihitung sekali saat modul di-load -- kalau tab
 // dibiarkan terbuka melewati tengah malam, TODAY tetap tanggal lama
@@ -55,13 +67,13 @@ const TODAY = new Date().toISOString().slice(0, 10);
 // di tengah sesi (bukan cuma nilai awal/default), pakai fungsi ini,
 // bukan konstanta TODAY.
 function getTodayISO() {
-  return new Date().toISOString().slice(0, 10);
+  return toLocalISODate(new Date());
 }
 
 function daysAgoISO(days) {
-  const d = new Date(TODAY);
+  const d = new Date();
   d.setDate(d.getDate() - days);
-  return d.toISOString().slice(0, 10);
+  return toLocalISODate(d);
 }
 
 function buildWelcomeMessage() {
@@ -292,7 +304,7 @@ function extractDate(text) {
   if (/\bkemarin\b/.test(normalizeText(source))) {
     const d = new Date();
     d.setDate(d.getDate() - 1);
-    return d.toISOString().slice(0, 10);
+    return toLocalISODate(d);
   }
 
   return TODAY;
@@ -2644,6 +2656,30 @@ export default function App() {
     }));
   }
 
+  // Baris review yang tebakan namanya PERSIS sama (mis. "Bunga Pepaya
+  // Seadanya" yang muncul di banyak tanggal) dikelompokkan supaya cukup
+  // ditinjau/diperbaiki sekali -- perbaikan nama/jumlah/satuan otomatis
+  // berlaku ke semua baris dalam grup itu. Tanggal & outlet tetap per
+  // baris (memang beda-beda), bisa dibuka & diedit satu-satu kalau perlu.
+  function groupWaReviewItems(reviewItems) {
+    const map = new Map();
+    reviewItems.forEach((item, index) => {
+      const key = String(item.itemName || "").trim().toLowerCase();
+      if (!map.has(key)) {
+        map.set(key, { key, itemName: item.itemName, quantity: item.quantity, unit: item.unit, indices: [] });
+      }
+      map.get(key).indices.push(index);
+    });
+    return [...map.values()];
+  }
+
+  function updateWaReviewGroupField(indices, field, value) {
+    setWaResult((prev) => ({
+      ...prev,
+      reviewItems: prev.reviewItems.map((item, i) => (indices.includes(i) ? { ...item, [field]: value } : item))
+    }));
+  }
+
   function chooseWaSimilarity(index, choice) {
     setWaResult((prev) => ({
       ...prev,
@@ -3706,56 +3742,106 @@ export default function App() {
               style={{ maxWidth: 900, width: "100%", maxHeight: "85vh", overflowY: "auto" }}
               onClick={(e) => e.stopPropagation()}
             >
-              <div className="card-title">Tinjau &amp; Perbaiki {waResult.reviewItems.length} Baris</div>
-              <p style={{ fontSize: 13, color: "var(--ink-soft)", margin: "0 0 12px" }}>
-                Baris asli dari chat ditampilkan sebagai referensi. Ubah field di sebelah kanan kalau tebakannya
-                salah, atau biarkan saja untuk memakai tebakan apa adanya.
-              </p>
-              <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
-                {waResult.reviewItems.map((item, i) => (
-                  <div key={i} style={{ border: "1px solid var(--border)", borderRadius: 8, padding: 10 }}>
-                    <div style={{ fontSize: 12, color: "var(--ink-soft)", marginBottom: 6 }}>
-                      Baris asli: "{item.rawLine}" — {item.reason}
+              {(() => {
+                const groups = groupWaReviewItems(waResult.reviewItems);
+                const groupCount = groups.length;
+                return (
+                  <>
+                    <div className="card-title">
+                      Tinjau &amp; Perbaiki {waResult.reviewItems.length} Baris
+                      {groupCount < waResult.reviewItems.length && ` (${groupCount} nama unik)`}
                     </div>
-                    <div style={{ display: "flex", gap: 6, flexWrap: "wrap", alignItems: "center" }}>
-                      <input
-                        type="date"
-                        value={item.date}
-                        onChange={(e) => updateWaReviewItem(i, "date", e.target.value)}
-                        style={{ padding: "6px 8px", borderRadius: 6, border: "1px solid var(--border)" }}
-                      />
-                      <select
-                        value={item.outlet}
-                        onChange={(e) => updateWaReviewItem(i, "outlet", e.target.value)}
-                        style={{ padding: "6px 8px", borderRadius: 6, border: "1px solid var(--border)" }}
-                      >
-                        <option value="">(default DS)</option>
-                        {OUTLETS.filter((o) => o.id !== "ALL").map((o) => (
-                          <option key={o.id} value={o.id}>{o.id}</option>
-                        ))}
-                      </select>
-                      <input
-                        type="text"
-                        value={item.itemName}
-                        onChange={(e) => updateWaReviewItem(i, "itemName", e.target.value)}
-                        style={{ padding: "6px 8px", borderRadius: 6, border: "1px solid var(--border)", flex: "1 1 160px" }}
-                      />
-                      <input
-                        type="number"
-                        value={item.quantity}
-                        onChange={(e) => updateWaReviewItem(i, "quantity", e.target.value)}
-                        style={{ padding: "6px 8px", borderRadius: 6, border: "1px solid var(--border)", width: 80 }}
-                      />
-                      <input
-                        type="text"
-                        value={item.unit}
-                        onChange={(e) => updateWaReviewItem(i, "unit", e.target.value)}
-                        style={{ padding: "6px 8px", borderRadius: 6, border: "1px solid var(--border)", width: 70 }}
-                      />
+                    <p style={{ fontSize: 13, color: "var(--ink-soft)", margin: "0 0 12px" }}>
+                      Baris dengan tebakan nama yang sama (mis. muncul di banyak tanggal) dikelompokkan jadi satu --
+                      perbaiki nama/jumlah/satuan sekali, otomatis berlaku untuk semua baris dalam grup itu. Buka
+                      "Lihat semua tanggal" untuk mengedit tanggal/outlet per baris kalau perlu.
+                    </p>
+                    <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+                      {groups.map((group) => (
+                        <div key={group.key} style={{ border: "1px solid var(--border)", borderRadius: 8, padding: 10 }}>
+                          <div style={{ fontSize: 12, color: "var(--ink-soft)", marginBottom: 6 }}>
+                            {group.indices.length > 1
+                              ? `${group.indices.length} baris pakai nama ini`
+                              : `Baris asli: "${waResult.reviewItems[group.indices[0]].rawLine}" — ${waResult.reviewItems[group.indices[0]].reason}`}
+                          </div>
+                          <div style={{ display: "flex", gap: 6, flexWrap: "wrap", alignItems: "center" }}>
+                            {group.indices.length === 1 && (
+                              <>
+                                <input
+                                  type="date"
+                                  value={waResult.reviewItems[group.indices[0]].date}
+                                  onChange={(e) => updateWaReviewItem(group.indices[0], "date", e.target.value)}
+                                  style={{ padding: "6px 8px", borderRadius: 6, border: "1px solid var(--border)" }}
+                                />
+                                <select
+                                  value={waResult.reviewItems[group.indices[0]].outlet}
+                                  onChange={(e) => updateWaReviewItem(group.indices[0], "outlet", e.target.value)}
+                                  style={{ padding: "6px 8px", borderRadius: 6, border: "1px solid var(--border)" }}
+                                >
+                                  <option value="">(default DS)</option>
+                                  {OUTLETS.filter((o) => o.id !== "ALL").map((o) => (
+                                    <option key={o.id} value={o.id}>{o.id}</option>
+                                  ))}
+                                </select>
+                              </>
+                            )}
+                            <input
+                              type="text"
+                              value={group.itemName}
+                              onChange={(e) => updateWaReviewGroupField(group.indices, "itemName", e.target.value)}
+                              style={{ padding: "6px 8px", borderRadius: 6, border: "1px solid var(--border)", flex: "1 1 160px" }}
+                            />
+                            <input
+                              type="number"
+                              value={group.quantity}
+                              onChange={(e) => updateWaReviewGroupField(group.indices, "quantity", e.target.value)}
+                              style={{ padding: "6px 8px", borderRadius: 6, border: "1px solid var(--border)", width: 80 }}
+                            />
+                            <input
+                              type="text"
+                              value={group.unit}
+                              onChange={(e) => updateWaReviewGroupField(group.indices, "unit", e.target.value)}
+                              style={{ padding: "6px 8px", borderRadius: 6, border: "1px solid var(--border)", width: 70 }}
+                            />
+                          </div>
+                          {group.indices.length > 1 && (
+                            <details style={{ marginTop: 8 }}>
+                              <summary style={{ fontSize: 12, color: "var(--ink-soft)", cursor: "pointer" }}>
+                                Lihat semua tanggal ({group.indices.length})
+                              </summary>
+                              <div style={{ display: "flex", flexDirection: "column", gap: 6, marginTop: 8 }}>
+                                {group.indices.map((i) => (
+                                  <div key={i} style={{ display: "flex", gap: 6, flexWrap: "wrap", alignItems: "center" }}>
+                                    <input
+                                      type="date"
+                                      value={waResult.reviewItems[i].date}
+                                      onChange={(e) => updateWaReviewItem(i, "date", e.target.value)}
+                                      style={{ padding: "6px 8px", borderRadius: 6, border: "1px solid var(--border)" }}
+                                    />
+                                    <select
+                                      value={waResult.reviewItems[i].outlet}
+                                      onChange={(e) => updateWaReviewItem(i, "outlet", e.target.value)}
+                                      style={{ padding: "6px 8px", borderRadius: 6, border: "1px solid var(--border)" }}
+                                    >
+                                      <option value="">(default DS)</option>
+                                      {OUTLETS.filter((o) => o.id !== "ALL").map((o) => (
+                                        <option key={o.id} value={o.id}>{o.id}</option>
+                                      ))}
+                                    </select>
+                                    <span style={{ fontSize: 11, color: "var(--ink-faint)" }}>
+                                      "{waResult.reviewItems[i].rawLine}"
+                                    </span>
+                                  </div>
+                                ))}
+                              </div>
+                            </details>
+                          )}
+                        </div>
+                      ))}
                     </div>
-                  </div>
-                ))}
-              </div>
+                  </>
+                );
+              })()}
               <div className="form-footer">
                 <button className="secondary-button" onClick={() => setWaShowReview(false)}>Tutup</button>
                 <button className="primary-button" onClick={handleWaSave} disabled={waSaveBusy}>
