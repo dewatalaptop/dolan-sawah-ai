@@ -10,6 +10,7 @@ import {
 } from "firebase/firestore";
 
 import { db } from "./firebase";
+import { toLocalISODate } from "./dateUtils";
 
 const PRICE_HISTORY =
   "price_history";
@@ -74,9 +75,7 @@ export async function savePrice(
 
     effectiveDate:
       data.effectiveDate ||
-      new Date()
-        .toISOString()
-        .slice(0, 10),
+      toLocalISODate(),
 
     source:
       data.source || "AI",
@@ -111,9 +110,7 @@ export function getCurrentPrice(
 ) {
   const targetDate =
     date ||
-    new Date()
-      .toISOString()
-      .slice(0, 10);
+    toLocalISODate();
 
   const normalized =
     String(

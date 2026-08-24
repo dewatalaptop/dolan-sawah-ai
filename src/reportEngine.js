@@ -157,10 +157,11 @@ export function buildReportWorkbook({
 
   if (criticalItems.length) {
     summaryRows.push(["TOP VARIANCE KRITIS (STOK KURANG TERBESAR)"]);
-    summaryRows.push(["Bahan", "Unit", "Saldo Teoritis", "Stok Aktual", "Selisih"]);
+    summaryRows.push(["Bahan", "Outlet", "Unit", "Saldo Teoritis", "Stok Aktual", "Selisih"]);
     criticalItems.slice(0, 15).forEach((item) => {
       summaryRows.push([
         item.itemName,
+        item.outlet,
         item.unit,
         round2(item.theoretical),
         round2(item.actual),
@@ -188,6 +189,7 @@ export function buildReportWorkbook({
     .sort((a, b) => (a.variance ?? 0) - (b.variance ?? 0))
     .map((item) => ({
       Bahan: item.itemName,
+      Outlet: item.outlet,
       Unit: item.unit,
       "Stok Awal/Baseline": round2(item.opening),
       "Pembelian/Barang Datang": round2(item.receiving),
@@ -429,6 +431,48 @@ export function buildReportWorkbook({
       Alasan: r.reason
     }));
   XLSX.utils.book_append_sheet(workbook, sheetFromRows(wasteRows.length ? wasteRows : [{ Tanggal: "-", Outlet: "", Bahan: "Tidak ada data di periode ini", Qty: "", Unit: "", Alasan: "" }]), "Waste");
+
+  return workbook;
+}
+
+// ============================================================
+// BACKUP DATA LENGKAP -- satu sheet per koleksi, apa adanya (tidak
+// difilter tanggal/outlet, tidak diringkas), buat jaring pengaman
+// sebelum operasi massal (hapus banyak data, dsb) atau sekadar arsip.
+// ============================================================
+
+function backupSheet(workbook, name, rows) {
+  const safeRows = rows && rows.length ? rows : [{ info: "Tidak ada data" }];
+  XLSX.utils.book_append_sheet(workbook, sheetFromRows(safeRows), name.slice(0, 31));
+}
+
+export function buildFullBackupWorkbook({ rawData, priceHistory, categories, activityLog, generatedAt }) {
+  const workbook = XLSX.utils.book_new();
+
+  const infoSheet = XLSX.utils.aoa_to_sheet([
+    ["BACKUP DATA LENGKAP -- DOLAN SAWAH AI"],
+    ["Dibuat pada", generatedAt],
+    ["Isi setiap sheet apa adanya (tidak difilter tanggal/outlet) -- untuk arsip atau jaring pengaman sebelum operasi massal."]
+  ]);
+  XLSX.utils.book_append_sheet(workbook, infoSheet, "Info");
+
+  backupSheet(workbook, "Stok Awal", rawData.openingStock);
+  backupSheet(workbook, "Pembelian", rawData.purchases);
+  backupSheet(workbook, "Barang Datang", rawData.receiving);
+  backupSheet(workbook, "Penjualan", rawData.sales);
+  backupSheet(workbook, "Stock Opname", rawData.stockOpname);
+  backupSheet(workbook, "Waste", rawData.waste);
+  backupSheet(workbook, "Penyesuaian Stok", rawData.adjustments);
+  // "ingredients" adalah array bersarang -- diserialisasi ke teks JSON
+  // supaya tetap terbaca di Excel (bukan "[object Object]").
+  backupSheet(
+    workbook,
+    "Resep",
+    (rawData.recipes || []).map((r) => ({ ...r, ingredients: JSON.stringify(r.ingredients || []) }))
+  );
+  backupSheet(workbook, "Riwayat Harga", priceHistory);
+  backupSheet(workbook, "Kategori Pembelian", categories);
+  backupSheet(workbook, "Riwayat Aktivitas", activityLog);
 
   return workbook;
 }

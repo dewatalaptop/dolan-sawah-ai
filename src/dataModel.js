@@ -113,7 +113,7 @@ export function createOpeningStock(data = {}) {
       Number(data.value || 0),
 
     outlet:
-      data.outlet || "Dolan Sawah",
+      data.outlet || "DS",
 
     source:
       data.source || "AI",
@@ -156,7 +156,7 @@ export function createPurchase(data = {}) {
       data.category || "",
 
     outlet:
-      data.outlet || "Dolan Sawah",
+      data.outlet || "DS",
 
     createdAt:
       new Date().toISOString()
@@ -185,6 +185,14 @@ export function createActivityLog(data = {}) {
     collectionName: data.collectionName || "",
     documentIds: Array.isArray(data.documentIds) ? data.documentIds : [],
     summary: data.summary || "",
+
+    // "create" (default, dokumen baru -- undo = hapus), "edit" (undo =
+    // kembalikan nilai field lama), "delete" (undo = buat ulang dokumen
+    // yang sama). `previousData` cuma dipakai untuk "edit"/"delete": objek
+    // { [documentId]: dataLamaDokumenItu }.
+    undoType: data.undoType || "create",
+    previousData: data.previousData || null,
+
     undone: false,
     undoneAt: null
   };
@@ -228,7 +236,7 @@ export function createReceiving(data = {}) {
       ),
 
     outlet:
-      data.outlet || "Dolan Sawah",
+      data.outlet || "DS",
 
     createdAt:
       new Date().toISOString()
@@ -253,7 +261,7 @@ export function createSale(data = {}) {
       Number(data.quantity || 0),
 
     outlet:
-      data.outlet || "Dolan Sawah",
+      data.outlet || "DS",
 
     source:
       data.source || "AI",
@@ -284,7 +292,7 @@ export function createStockOpname(data = {}) {
       data.unit || "",
 
     outlet:
-      data.outlet || "Dolan Sawah",
+      data.outlet || "DS",
 
     createdAt:
       new Date().toISOString()
@@ -315,7 +323,7 @@ export function createWaste(data = {}) {
       data.reason || "",
 
     outlet:
-      data.outlet || "Dolan Sawah",
+      data.outlet || "DS",
 
     createdAt:
       new Date().toISOString()
@@ -346,7 +354,7 @@ export function createAdjustment(data = {}) {
       data.reason || "",
 
     outlet:
-      data.outlet || "Dolan Sawah",
+      data.outlet || "DS",
 
     createdAt:
       new Date().toISOString()

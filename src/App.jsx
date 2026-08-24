@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { collection, addDoc, getDocs, query, limit, where, doc, writeBatch, updateDoc, deleteDoc } from "firebase/firestore";
+import { collection, addDoc, getDocs, query, limit, where, doc, writeBatch, updateDoc, deleteDoc, setDoc } from "firebase/firestore";
 import {
   onAuthStateChanged,
   signInWithEmailAndPassword,
@@ -39,25 +39,15 @@ import { parseWhatsAppExport } from "./whatsappImportEngine";
 
 import { findSimilarName, findPrefixCandidate } from "./similarityEngine";
 
-import { buildReportWorkbook, downloadReportWorkbook } from "./reportEngine";
+import { buildReportWorkbook, downloadReportWorkbook, buildFullBackupWorkbook } from "./reportEngine";
 
 import { askAI, buildReportPrompt, analyzeIngredientPairs } from "./aiEngine";
+
+import { toLocalISODate } from "./dateUtils";
 
 /* =========================================================
    KONSTANTA
    ========================================================= */
-
-// Tanggal kalender LOKAL (bukan UTC) dari sebuah Date. WAJIB dipakai untuk
-// apa pun yang berarti "hari ini" menurut jam pengguna -- new Date().toISOString()
-// selalu memakai UTC, jadi untuk pengguna di WIB (UTC+7) tanggalnya baru
-// berganti jam 7 pagi, bukan tengah malam (chat/entri jadi tidak reset tepat
-// waktu kalau dihitung lewat toISOString()).
-function toLocalISODate(d) {
-  const year = d.getFullYear();
-  const month = String(d.getMonth() + 1).padStart(2, "0");
-  const day = String(d.getDate()).padStart(2, "0");
-  return `${year}-${month}-${day}`;
-}
 
 const TODAY = toLocalISODate(new Date());
 
@@ -106,6 +96,7 @@ const MENU = [
   { id: "barang-datang", label: "Barang Datang", icon: "truck" },
   { id: "penjualan", label: "Penjualan", icon: "coin" },
   { id: "stok", label: "Stock Opname", icon: "box" },
+  { id: "penyesuaian", label: "Penyesuaian Stok", icon: "box" },
   { section: "ANALISIS" },
   { id: "kebutuhan", label: "Kebutuhan Bahan", icon: "leaf" },
   { id: "variance", label: "Variance & Waste", icon: "trend" },
@@ -443,6 +434,38 @@ function looksLikeWhatsAppExport(text) {
    opname, waste, adjustment.
    ========================================================= */
 
+// Baris header/meta (tanggal, nama jenis data, outlet sendirian, label
+// "supplier:" dst.) -- dipakai supaya baris yang GAGAL diurai tapi
+// sebenarnya memang bukan baris barang tidak ikut dilaporkan sebagai
+// "baris hilang" ke pengguna. Daftar kata kunci sengaja mengikuti
+// keyword yang sama dipakai detectDataType, supaya konsisten.
+function looksLikeHeaderOrMetaLine(line) {
+  const t = normalizeText(line);
+  if (/\d{1,2}[/-]\d{1,2}[/-]\d{2,4}/.test(t)) return true;
+  if (/\d{1,2}\s+(januari|februari|maret|april|mei|juni|juli|agustus|september|oktober|november|desember)/.test(t)) return true;
+  if (/\b(hari ini|kemarin)\b/.test(t)) return true;
+  if (/^(ds|ss|sp)$/.test(t)) return true;
+  if (/^(supplier|vendor|alasan|keterangan|catatan)\s*:/i.test(t)) return true;
+  if (
+    t.includes("stock opname") || t.includes("stok opname") || t.includes("opname") ||
+    t.includes("barang datang") || t.includes("barang yang datang") || t.includes("barang diterima") ||
+    t.includes("diterima") || t.includes("terima barang") ||
+    t.includes("stok awal") || t.includes("stock awal") || t.includes("saldo awal") ||
+    t.includes("waste") || t.includes("rusak") || t.includes("terbuang") || t.includes("busuk") ||
+    t.includes("kadaluarsa") || t.includes("basi") ||
+    t.includes("penyesuaian") || t.includes("koreksi stok") || t.includes("adjustment") ||
+    t.includes("pembelian") || t.includes("pembelanjaan") || t.includes("belanja") ||
+    t.includes("pesan barang") || t.includes("po ke") || t.includes("order barang") || /\bbeli\b/.test(t) ||
+    t.includes("penjualan") || t.includes("terjual") || t.includes("laku")
+  ) return true;
+  return false;
+}
+
+// Mengembalikan { items, unparsedLines }. `unparsedLines` berisi baris
+// yang KELIHATANNYA dimaksudkan sebagai baris barang (ada angka, bukan
+// header/meta) tapi gagal diurai (mis. tidak ada satuan yang dikenali,
+// format aneh) -- supaya baris ini bisa dilaporkan ke pengguna, bukan
+// diam-diam hilang seolah semua baris berhasil tersimpan.
 function parseItemLines(text) {
   const lines = String(text)
     .split(/\n|;/)
@@ -450,6 +473,7 @@ function parseItemLines(text) {
     .filter(Boolean);
 
   const result = [];
+  const unparsedLines = [];
 
   for (const line of lines) {
     // Satuan wajib match di sini (bukan opsional). Baris header/tanggal
@@ -462,7 +486,10 @@ function parseItemLines(text) {
       /([\d.,]+)\s*(kg|kilogram|gram|gr|g|liter|ltr|l|ml|porsi|pcs|buah|butir|ekor|pack|bungkus|kemasan|ikat|dus|krat|bal|sak|kotak|kranjang|keranjang|botol|karton)\b/i
     );
 
-    if (!match || !match[1]) continue;
+    if (!match || !match[1]) {
+      if (/\d/.test(line) && !looksLikeHeaderOrMetaLine(line)) unparsedLines.push(line);
+      continue;
+    }
 
     let clean = line
       .replace(match[0], "")
@@ -481,7 +508,18 @@ function parseItemLines(text) {
     });
   }
 
-  return result;
+  return { items: result, unparsedLines };
+}
+
+// Ditambahkan ke akhir teks balasan sukses supaya baris yang gagal
+// diurai (bukan diam-diam hilang) tetap terlihat oleh pengguna.
+function unparsedWarningText(unparsedLines) {
+  if (!unparsedLines || !unparsedLines.length) return "";
+  return (
+    `\n\n⚠️ ${unparsedLines.length} baris TIDAK ikut tersimpan karena tidak terbaca:\n` +
+    unparsedLines.map((l) => `- "${l}"`).join("\n") +
+    `\nPeriksa lagi baris ini -- mungkin satuannya belum dikenali atau ada salah ketik.`
+  );
 }
 
 function extractLabeledValue(text, labels) {
@@ -507,22 +545,29 @@ function parseSalesLines(text) {
     .filter(Boolean);
 
   const result = [];
+  const unparsedLines = [];
 
   for (const line of lines) {
     // Satuan wajib ada (bukan opsional) supaya baris header/tanggal tanpa
     // outlet (mis. "Penjualan 21 Agustus 2026") tidak salah terbaca jadi
     // penjualan dengan menuName ngawur dan quantity = tahunnya.
     const match = line.match(/^[-•*]?\s*(.+?)\s+([\d.,]+)\s*(porsi|pcs|buah|unit)$/i);
-    if (!match) continue;
+    if (!match) {
+      if (/\d/.test(line) && !looksLikeHeaderOrMetaLine(line)) unparsedLines.push(line);
+      continue;
+    }
 
     const name = match[1].replace(/^penjualan\s*/i, "").trim();
     const quantity = toNumber(match[2]);
-    if (!name || !quantity) continue;
+    if (!name || !quantity) {
+      unparsedLines.push(line);
+      continue;
+    }
 
     result.push({ menuName: titleCase(name), quantity });
   }
 
-  return result;
+  return { items: result, unparsedLines };
 }
 
 /* =========================================================
@@ -963,6 +1008,19 @@ function computeVarianceValue(item, priceHistory) {
   return unitPriceBase * item.variance;
 }
 
+// Nilai Rupiah dari sejumlah bahan (mis. satu baris waste), berdasarkan
+// harga bahan terkini -- null kalau harganya belum pernah dicatat, atau
+// satuannya tidak sepadan (mis. harga per liter tapi baris ini per kg).
+function computeItemValue(itemName, quantity, unit, priceHistory) {
+  const priceEntry = getCurrentPrice(itemName, priceHistory);
+  if (!priceEntry) return null;
+  const priceConverted = convertToBase(1, priceEntry.unit);
+  const qtyConverted = convertToBase(quantity, unit);
+  if (priceConverted.base !== qtyConverted.base) return null;
+  const unitPriceBase = Number(priceEntry.price || 0) / priceConverted.value;
+  return unitPriceBase * qtyConverted.value;
+}
+
 // Bahan yang muncul di data pembelian tapi tidak pernah dipakai di
 // resep mana pun -- kemungkinan besar bahan itu dipakai oleh menu
 // yang resepnya belum lengkap. Perkiraan KASAR: total bahan yang
@@ -1129,22 +1187,33 @@ function computeDailySalesStats(sales, recipes) {
 }
 
 function buildPurchaseSuggestions(ingredientForecast, theoreticalStock) {
+  // theoreticalStock punya SATU baris per (outlet, bahan) -- digabung dulu
+  // per nama bahan di sini supaya kebutuhan pembelian dibandingkan dengan
+  // TOTAL stok di SEMUA outlet, bukan cuma outlet yang kebetulan terakhir
+  // diproses (dulu di sini `stockMap[key] = item` menimpa baris outlet
+  // lain untuk bahan yang sama -- bug, bukan disengaja).
   const stockMap = {};
   theoreticalStock.forEach((item) => {
-    stockMap[normalizeText(item.itemName)] = item;
+    const key = normalizeText(item.itemName);
+    if (!stockMap[key]) {
+      stockMap[key] = { theoretical: 0, available: 0, hasOpname: false, unit: item.unit };
+    }
+    const agg = stockMap[key];
+    agg.theoretical += Number(item.theoretical || 0);
+    // Per outlet: pakai hasil opname (actual) kalau sudah pernah di-opname
+    // -- lebih bisa dipercaya daripada saldo teoritis murni akumulasi
+    // historis -- fallback ke saldo teoritis outlet itu kalau belum.
+    const hasOpnameHere = item.actual !== null && item.actual !== undefined;
+    agg.available += Number(hasOpnameHere ? item.actual : item.theoretical || 0);
+    if (hasOpnameHere) agg.hasOpname = true;
   });
 
   return ingredientForecast
     .map((need) => {
       const stockItem = stockMap[normalizeText(need.itemName)];
       const saldoTeoritis = stockItem ? stockItem.theoretical : 0;
-      const sourceIsOpname = !!stockItem && stockItem.actual !== null && stockItem.actual !== undefined;
-
-      // STOK TERSEDIA: pakai hasil stock opname (actual) kalau bahan ini
-      // sudah pernah di-opname -- itu lebih bisa dipercaya daripada saldo
-      // teoritis yang murni akumulasi historis dan tidak pernah dikoreksi
-      // fisik. Kalau belum pernah opname, fallback ke saldo teoritis.
-      const stokTersedia = sourceIsOpname ? stockItem.actual : saldoTeoritis;
+      const sourceIsOpname = !!stockItem && stockItem.hasOpname;
+      const stokTersedia = stockItem ? stockItem.available : 0;
 
       const base = need.unit || (stockItem ? stockItem.unit : "unit");
       const suggested = Math.max(0, need.quantity - stokTersedia);
@@ -1281,6 +1350,73 @@ function analyzeDataQuality(rawData) {
 }
 
 /* =========================================================
+   PERINGATAN OPERASIONAL (stok menipis, lonjakan harga)
+   Beda dari data quality di atas -- ini bukan masalah DATA,
+   tapi hal operasional yang layak diketahui pemilik usaha.
+   ========================================================= */
+
+// Bahan yang stoknya (saldo teoritis/opname) diperkirakan habis dalam
+// waktu KURANG dari 1 hari, berdasar rata-rata kebutuhan harian 7 hari
+// terakhir -- sinyal "beli sekarang", bukan cuma daftar saran biasa.
+function checkLowStock(purchaseSuggestions) {
+  return purchaseSuggestions
+    .filter((x) => x.dailyNeed > 0 && x.currentStock < x.dailyNeed)
+    .map((x) => ({
+      type: "low-stock",
+      message:
+        `Stok "${x.itemName}" tinggal ${displayQuantity(x.currentStock, x.base)}, sementara kebutuhan rata-rata ` +
+        `${displayQuantity(x.dailyNeed, x.base)}/hari -- kemungkinan habis kurang dari sehari.`
+    }));
+}
+
+// Harga bahan yang naik signifikan dibanding catatan SEBELUMNYA (bukan
+// dibanding harga pertama kali dicatat -- supaya tidak "alarm palsu"
+// untuk kenaikan bertahap yang wajar dari waktu ke waktu).
+function checkPriceSpikes(priceHistory, thresholdPercent = 20) {
+  const byItem = {};
+  priceHistory.forEach((p) => {
+    const key = normalizeText(p.itemName);
+    if (!byItem[key]) byItem[key] = [];
+    byItem[key].push(p);
+  });
+
+  const issues = [];
+  Object.values(byItem).forEach((records) => {
+    if (records.length < 2) return;
+    // effectiveDate saja bisa seri (dua harga disimpan di tanggal yang
+    // sama) -- createdAt sebagai kunci urutan kedua supaya "sebelum"/
+    // "sesudah" tetap benar walau effectiveDate-nya sama persis.
+    const sorted = [...records].sort((a, b) => {
+      const dateCompare = String(a.effectiveDate || "").localeCompare(String(b.effectiveDate || ""));
+      if (dateCompare !== 0) return dateCompare;
+      return String(a.createdAt || "").localeCompare(String(b.createdAt || ""));
+    });
+    const previous = sorted[sorted.length - 2];
+    const latest = sorted[sorted.length - 1];
+    const oldPrice = Number(previous.price || 0);
+    const newPrice = Number(latest.price || 0);
+    if (oldPrice <= 0) return;
+    const changePercent = ((newPrice - oldPrice) / oldPrice) * 100;
+    if (changePercent >= thresholdPercent) {
+      issues.push({
+        type: "price-spike",
+        message:
+          `Harga "${latest.itemName}" naik ${formatNumber(changePercent, 0)}% (Rp ${formatNumber(oldPrice)} → ` +
+          `Rp ${formatNumber(newPrice)}) sejak ${formatDateID(previous.effectiveDate)}.`
+      });
+    }
+  });
+  return issues;
+}
+
+function analyzeOpsAlerts(purchaseSuggestions, priceHistory) {
+  return [
+    ...checkLowStock(purchaseSuggestions),
+    ...checkPriceSpikes(priceHistory)
+  ];
+}
+
+/* =========================================================
    LAPORAN LOKAL (fallback jika AI belum tersambung)
    ========================================================= */
 
@@ -1318,7 +1454,7 @@ function buildLocalReport(question, ctx) {
       items
         .map(
           (x) =>
-            `- ${x.itemName}: teoritis ${displayQuantity(x.theoretical, x.unit)}, ` +
+            `- ${x.itemName} (${x.outlet}): teoritis ${displayQuantity(x.theoretical, x.unit)}, ` +
             `aktual ${displayQuantity(x.actual, x.unit)}, ` +
             `selisih ${displayQuantity(x.variance, x.unit)} ` +
             `${x.variance < 0 ? "(kemungkinan waste/kurang tercatat)" : "(surplus, periksa pencatatan)"}`
@@ -1699,9 +1835,24 @@ export default function App() {
     setUndoBusyId(logEntry.id);
     setSaveProgress({ done: 0, total: logEntry.documentIds.length });
     try {
-      await deleteDocsBatched(logEntry.collectionName, logEntry.documentIds, (done, total) =>
-        setSaveProgress({ done, total })
-      );
+      if (logEntry.undoType === "edit") {
+        // Kembalikan nilai field ke sebelum diedit.
+        for (const id of logEntry.documentIds) {
+          const previous = logEntry.previousData?.[id];
+          if (previous) await updateDoc(doc(db, logEntry.collectionName, id), previous);
+        }
+      } else if (logEntry.undoType === "delete") {
+        // Buat ulang dokumen yang dihapus, di ID yang sama.
+        for (const id of logEntry.documentIds) {
+          const previous = logEntry.previousData?.[id];
+          if (previous) await setDoc(doc(db, logEntry.collectionName, id), previous);
+        }
+      } else {
+        // "create" (default) -- dokumen yang baru disimpan dihapus lagi.
+        await deleteDocsBatched(logEntry.collectionName, logEntry.documentIds, (done, total) =>
+          setSaveProgress({ done, total })
+        );
+      }
       await updateDoc(doc(db, COLLECTIONS.ACTIVITY_LOG, logEntry.id), {
         undone: true,
         undoneAt: new Date().toISOString()
@@ -1737,7 +1888,7 @@ export default function App() {
       fields[key] = row[key] ?? "";
     });
     setRowDeleteConfirmId(null);
-    setEditingRow({ collectionName, id: row.id, fields });
+    setEditingRow({ collectionName, id: row.id, fields, originalFields: { ...fields } });
   }
 
   function updateRowEditField(key, value) {
@@ -1757,6 +1908,21 @@ export default function App() {
         changes[key] = Number(changes[key]) || 0;
       });
       await updateDoc(doc(db, editingRow.collectionName, editingRow.id), changes);
+
+      // Dicatat ke Riwayat Aktivitas supaya bisa di-undo -- ini jalur
+      // koreksi data yang paling sering dipakai, jadi harus tercakup sama
+      // seperti penyimpanan lewat chat/import.
+      const logEntry = createActivityLog({
+        actionType: "Edit baris",
+        collectionName: editingRow.collectionName,
+        documentIds: [editingRow.id],
+        summary: `1 baris diedit di ${editingRow.collectionName}`,
+        undoType: "edit",
+        previousData: { [editingRow.id]: editingRow.originalFields }
+      });
+      const ref = await addDoc(collection(db, COLLECTIONS.ACTIVITY_LOG), logEntry);
+      setActivityLog((prev) => [{ id: ref.id, ...logEntry }, ...prev]);
+
       await refreshData();
       showToast("Perubahan tersimpan.", "success");
       setEditingRow(null);
@@ -1768,10 +1934,26 @@ export default function App() {
     }
   }
 
-  async function deleteRow(collectionName, id) {
+  async function deleteRow(collectionName, row) {
     setRowDeleteBusy(true);
     try {
+      const { id, ...fullData } = row;
       await deleteDoc(doc(db, collectionName, id));
+
+      // Dicatat ke Riwayat Aktivitas dengan SELURUH isi dokumen (bukan
+      // cuma field yang tampil di tabel) supaya undo bisa mengembalikan
+      // datanya persis seperti semula.
+      const logEntry = createActivityLog({
+        actionType: "Hapus baris",
+        collectionName,
+        documentIds: [id],
+        summary: `1 baris dihapus di ${collectionName}`,
+        undoType: "delete",
+        previousData: { [id]: fullData }
+      });
+      const ref = await addDoc(collection(db, COLLECTIONS.ACTIVITY_LOG), logEntry);
+      setActivityLog((prev) => [{ id: ref.id, ...logEntry }, ...prev]);
+
       await refreshData();
       showToast("Data berhasil dihapus.", "success");
       setRowDeleteConfirmId(null);
@@ -1818,7 +2000,7 @@ export default function App() {
     if (rowDeleteConfirmId === row.id) {
       return (
         <div style={{ display: "flex", gap: 4 }}>
-          <button className="primary-button" style={{ background: "#c0392b", borderColor: "#c0392b" }} onClick={() => deleteRow(collectionName, row.id)} disabled={rowDeleteBusy}>
+          <button className="primary-button" style={{ background: "#c0392b", borderColor: "#c0392b" }} onClick={() => deleteRow(collectionName, row)} disabled={rowDeleteBusy}>
             {rowDeleteBusy ? "..." : "Yakin?"}
           </button>
           <button className="secondary-button" onClick={() => setRowDeleteConfirmId(null)} disabled={rowDeleteBusy}>Batal</button>
@@ -1906,6 +2088,7 @@ export default function App() {
   const [reportEnd, setReportEnd] = useState(TODAY);
   const [reportOutlet, setReportOutlet] = useState("ALL");
   const [reportBusy, setReportBusy] = useState(false);
+  const [backupBusy, setBackupBusy] = useState(false);
 
   const [salesFilterStart, setSalesFilterStart] = useState(daysAgoISO(29));
   const [salesFilterEnd, setSalesFilterEnd] = useState(TODAY);
@@ -1930,6 +2113,10 @@ export default function App() {
   const [openingSearch, setOpeningSearch] = useState("");
   const [openingFilterStart, setOpeningFilterStart] = useState("");
   const [openingFilterEnd, setOpeningFilterEnd] = useState("");
+
+  const [adjustmentSearch, setAdjustmentSearch] = useState("");
+  const [adjustmentFilterStart, setAdjustmentFilterStart] = useState("");
+  const [adjustmentFilterEnd, setAdjustmentFilterEnd] = useState("");
 
   const [priceSearch, setPriceSearch] = useState("");
   const [priceFilterStart, setPriceFilterStart] = useState("");
@@ -2137,6 +2324,12 @@ export default function App() {
     [ingredientForecast, theoreticalStock]
   );
 
+  const opsAlerts = useMemo(
+    () => analyzeOpsAlerts(purchaseSuggestions, priceHistory),
+    [purchaseSuggestions, priceHistory]
+  );
+  const [opsAlertBannerExpanded, setOpsAlertBannerExpanded] = useState(false);
+
   const receivingIssues = useMemo(
     () => filteredData.receiving.filter((r) => Math.abs(Number(r.difference || 0)) > 0.0001),
     [filteredData.receiving]
@@ -2166,12 +2359,13 @@ export default function App() {
     const outlet = detectOutlet(text, chatOutlet);
 
     if (dataType === "opening_stock") {
-      const items = parseItemLines(text);
+      const { items, unparsedLines } = parseItemLines(text);
       if (!items.length) {
         return {
           text:
             "Saya kenali ini sebagai STOK AWAL, tapi belum menemukan pasangan barang + jumlah.\n\n" +
-            "Contoh:\nStok awal 21 Agustus 2026 DS\nAyam 35 kg\nDaging sapi 18 kg",
+            "Contoh:\nStok awal 21 Agustus 2026 DS\nAyam 35 kg\nDaging sapi 18 kg" +
+            unparsedWarningText(unparsedLines),
           tags: ["STOK AWAL"]
         };
       }
@@ -2187,19 +2381,21 @@ export default function App() {
       return {
         text:
           `STOK AWAL (${outlet}) tersimpan.\n\nTanggal: ${formatDateID(date)}\n\n` +
-          items.map((x) => `- ${x.itemName}: ${formatNumber(x.quantity)} ${x.unit}`).join("\n"),
-        tags: ["STOK AWAL", "TERSIMPAN"]
+          items.map((x) => `- ${x.itemName}: ${formatNumber(x.quantity)} ${x.unit}`).join("\n") +
+          unparsedWarningText(unparsedLines),
+        tags: unparsedLines.length ? ["STOK AWAL", "TERSIMPAN", "PERLU DICEK"] : ["STOK AWAL", "TERSIMPAN"]
       };
     }
 
     if (dataType === "purchase") {
-      const items = parseItemLines(text);
+      const { items, unparsedLines } = parseItemLines(text);
       const supplier = extractLabeledValue(text, ["supplier", "vendor", "pemasok"]);
       if (!items.length) {
         return {
           text:
             "Saya kenali ini sebagai PEMBELIAN, tapi jumlah barang belum terbaca.\n\n" +
-            "Contoh:\nPembelian 21 Agustus 2026 DS\nSupplier: PT Ternak Jaya\nAyam 20 kg\nBeras 25 kg",
+            "Contoh:\nPembelian 21 Agustus 2026 DS\nSupplier: PT Ternak Jaya\nAyam 20 kg\nBeras 25 kg" +
+            unparsedWarningText(unparsedLines),
           tags: ["PEMBELIAN"]
         };
       }
@@ -2217,18 +2413,20 @@ export default function App() {
           `PEMBELIAN (${outlet}) tersimpan — jumlah ini otomatis dianggap sudah diterima sesuai pesanan ` +
           `dan langsung masuk stok. Kirim "barang datang" HANYA kalau jumlah yang diterima berbeda dari pesanan.` +
           `\n\nTanggal: ${formatDateID(date)}${supplier ? `\nSupplier: ${supplier}` : ""}\n\n` +
-          items.map((x) => `- ${x.itemName}: ${formatNumber(x.quantity)} ${x.unit}`).join("\n"),
-        tags: ["PEMBELIAN", "TERSIMPAN"]
+          items.map((x) => `- ${x.itemName}: ${formatNumber(x.quantity)} ${x.unit}`).join("\n") +
+          unparsedWarningText(unparsedLines),
+        tags: unparsedLines.length ? ["PEMBELIAN", "TERSIMPAN", "PERLU DICEK"] : ["PEMBELIAN", "TERSIMPAN"]
       };
     }
 
     if (dataType === "receiving") {
-      const items = parseItemLines(text);
+      const { items, unparsedLines } = parseItemLines(text);
       if (!items.length) {
         return {
           text:
             "Saya kenali ini sebagai BARANG DATANG, tapi jumlah belum terbaca.\n\n" +
-            "Contoh:\nBarang datang 22 Agustus 2026 DS\nAyam 20 kg\nBeras 25 kg",
+            "Contoh:\nBarang datang 22 Agustus 2026 DS\nAyam 20 kg\nBeras 25 kg" +
+            unparsedWarningText(unparsedLines),
           tags: ["BARANG DATANG"]
         };
       }
@@ -2286,18 +2484,20 @@ export default function App() {
       return {
         text:
           `BARANG DATANG (${outlet}) tersimpan.\n\nTanggal: ${formatDateID(date)}\n\n` +
-          noteLines.join("\n"),
-        tags: ["BARANG DATANG", "TERSIMPAN"]
+          noteLines.join("\n") +
+          unparsedWarningText(unparsedLines),
+        tags: unparsedLines.length ? ["BARANG DATANG", "TERSIMPAN", "PERLU DICEK"] : ["BARANG DATANG", "TERSIMPAN"]
       };
     }
 
     if (dataType === "sales") {
-      const items = parseSalesLines(text);
+      const { items, unparsedLines } = parseSalesLines(text);
       if (!items.length) {
         return {
           text:
             "Saya kenali ini sebagai PENJUALAN, tapi menu + jumlah porsi belum terbaca.\n\n" +
-            "Contoh:\nPenjualan 21 Agustus 2026 DS\nAyam Bakar 45 porsi\nAyam Geprek 32 porsi",
+            "Contoh:\nPenjualan 21 Agustus 2026 DS\nAyam Bakar 45 porsi\nAyam Geprek 32 porsi" +
+            unparsedWarningText(unparsedLines),
           tags: ["PENJUALAN"]
         };
       }
@@ -2310,18 +2510,20 @@ export default function App() {
           `PENJUALAN (${outlet}) tersimpan.\n\nTanggal: ${formatDateID(date)}\n\n` +
           items.map((x) => `- ${x.menuName}: ${formatNumber(x.quantity)} porsi`).join("\n") +
           `\n\nTotal porsi: ${formatNumber(total)}. Data ini otomatis dipakai untuk menghitung ` +
-          `kebutuhan bahan besok berdasarkan resep.`,
-        tags: ["PENJUALAN", "TERSIMPAN"]
+          `kebutuhan bahan besok berdasarkan resep.` +
+          unparsedWarningText(unparsedLines),
+        tags: unparsedLines.length ? ["PENJUALAN", "TERSIMPAN", "PERLU DICEK"] : ["PENJUALAN", "TERSIMPAN"]
       };
     }
 
     if (dataType === "stock_opname") {
-      const items = parseItemLines(text);
+      const { items, unparsedLines } = parseItemLines(text);
       if (!items.length) {
         return {
           text:
             "Saya kenali ini sebagai STOCK OPNAME, tapi jumlah fisik belum terbaca.\n\n" +
-            "Contoh:\nStock opname 21 Agustus 2026 DS\nAyam 28 kg\nBeras 42 kg",
+            "Contoh:\nStock opname 21 Agustus 2026 DS\nAyam 28 kg\nBeras 42 kg" +
+            unparsedWarningText(unparsedLines),
           tags: ["STOCK OPNAME"]
         };
       }
@@ -2346,19 +2548,21 @@ export default function App() {
         text:
           `STOCK OPNAME (${outlet}) tersimpan.\n\nTanggal: ${formatDateID(date)}\n\n` +
           items.map((x) => `- ${x.itemName}: ${formatNumber(x.quantity)} ${x.unit}`).join("\n") +
-          `\n\nBuka menu Variance & Waste untuk melihat selisih dengan stok teoritis.`,
-        tags: ["STOCK OPNAME", "TERSIMPAN"]
+          `\n\nBuka menu Variance & Waste untuk melihat selisih dengan stok teoritis.` +
+          unparsedWarningText(unparsedLines),
+        tags: unparsedLines.length ? ["STOCK OPNAME", "TERSIMPAN", "PERLU DICEK"] : ["STOCK OPNAME", "TERSIMPAN"]
       };
     }
 
     if (dataType === "waste") {
-      const items = parseItemLines(text);
+      const { items, unparsedLines } = parseItemLines(text);
       const reason = extractLabeledValue(text, ["alasan", "keterangan", "sebab"]);
       if (!items.length) {
         return {
           text:
             "Saya kenali ini sebagai WASTE, tapi jumlah belum terbaca.\n\n" +
-            "Contoh:\nWaste 21 Agustus 2026 DS\nAlasan: basi\nAyam 2 kg",
+            "Contoh:\nWaste 21 Agustus 2026 DS\nAlasan: basi\nAyam 2 kg" +
+            unparsedWarningText(unparsedLines),
           tags: ["WASTE"]
         };
       }
@@ -2374,17 +2578,18 @@ export default function App() {
       return {
         text:
           `WASTE (${outlet}) tersimpan.\n\nTanggal: ${formatDateID(date)}${reason ? `\nAlasan: ${reason}` : ""}\n\n` +
-          items.map((x) => `- ${x.itemName}: ${formatNumber(x.quantity)} ${x.unit}`).join("\n"),
-        tags: ["WASTE", "TERSIMPAN"]
+          items.map((x) => `- ${x.itemName}: ${formatNumber(x.quantity)} ${x.unit}`).join("\n") +
+          unparsedWarningText(unparsedLines),
+        tags: unparsedLines.length ? ["WASTE", "TERSIMPAN", "PERLU DICEK"] : ["WASTE", "TERSIMPAN"]
       };
     }
 
     if (dataType === "adjustment") {
-      const items = parseItemLines(text);
+      const { items, unparsedLines } = parseItemLines(text);
       const reason = extractLabeledValue(text, ["alasan", "keterangan"]);
       if (!items.length) {
         return {
-          text: "Saya kenali ini sebagai PENYESUAIAN STOK, tapi jumlah belum terbaca.",
+          text: "Saya kenali ini sebagai PENYESUAIAN STOK, tapi jumlah belum terbaca." + unparsedWarningText(unparsedLines),
           tags: ["PENYESUAIAN"]
         };
       }
@@ -2398,8 +2603,8 @@ export default function App() {
       }
       await refreshData();
       return {
-        text: `PENYESUAIAN STOK (${outlet}) tersimpan.`,
-        tags: ["PENYESUAIAN", "TERSIMPAN"]
+        text: `PENYESUAIAN STOK (${outlet}) tersimpan.` + unparsedWarningText(unparsedLines),
+        tags: unparsedLines.length ? ["PENYESUAIAN", "TERSIMPAN", "PERLU DICEK"] : ["PENYESUAIAN", "TERSIMPAN"]
       };
     }
 
@@ -2534,6 +2739,7 @@ export default function App() {
           .slice(0, 10)
           .map((x) => ({
             item: x.itemName,
+            outlet: x.outlet,
             teoritis: Math.round(x.theoretical),
             aktual: Math.round(x.actual),
             selisih: Math.round(x.variance),
@@ -3085,6 +3291,49 @@ export default function App() {
     );
   }
 
+  function renderPenyesuaian() {
+    const adjustmentRows = filteredData.adjustments
+      .filter((x) => !adjustmentSearch.trim() || normalizeText(x.itemName).includes(normalizeText(adjustmentSearch)))
+      .filter((x) => !adjustmentFilterStart || x.date >= adjustmentFilterStart)
+      .filter((x) => !adjustmentFilterEnd || x.date <= adjustmentFilterEnd)
+      .sort((a, b) => (a.date < b.date ? 1 : -1));
+    return (
+      <div className="page">
+        <div className="section-header">
+          <div>
+            <h1>Penyesuaian Stok</h1>
+            <p>Koreksi manual saldo stok (di luar pembelian/waste/opname) -- ikut dihitung ke stok teoritis di Variance & Waste.</p>
+          </div>
+        </div>
+        <FilterBar
+          search={adjustmentSearch}
+          onSearchChange={setAdjustmentSearch}
+          searchPlaceholder="Cari nama bahan..."
+          start={adjustmentFilterStart}
+          onStartChange={setAdjustmentFilterStart}
+          end={adjustmentFilterEnd}
+          onEndChange={setAdjustmentFilterEnd}
+          summary={`${adjustmentRows.length} baris`}
+        />
+        <DataTable
+          columns={["Tanggal", "Outlet", "Bahan", "Jumlah", "Satuan", "Alasan", "Aksi"]}
+          rows={adjustmentRows.map((x) => {
+            const editing = editingRow?.id === x.id;
+            return [
+              editing ? fieldInput("date", "date") : formatDateID(x.date),
+              editing ? fieldInput("outlet", "select", ["DS", "SS", "SP"]) : x.outlet,
+              editing ? fieldInput("itemName", "text") : x.itemName,
+              editing ? fieldInput("quantity", "number") : formatNumber(x.quantity),
+              editing ? fieldInput("unit", "text") : x.unit,
+              editing ? fieldInput("reason", "text") : (x.reason || "-"),
+              actionCell(COLLECTIONS.ADJUSTMENTS, x, ["date", "outlet", "itemName", "quantity", "unit", "reason"], ["quantity"])
+            ];
+          })}
+        />
+      </div>
+    );
+  }
+
   function renderPembelian() {
     return (
       <div className="page">
@@ -3348,18 +3597,41 @@ export default function App() {
       .filter((x) => !wasteFilterStart || x.date >= wasteFilterStart)
       .filter((x) => !wasteFilterEnd || x.date <= wasteFilterEnd)
       .sort((a, b) => (a.date < b.date ? 1 : -1));
+
+    // Ringkasan biaya waste -- pakai baris yang SUDAH difilter (search +
+    // rentang tanggal) supaya ringkasannya selalu sesuai apa yang sedang
+    // dilihat pengguna di tabel di bawahnya.
+    let wasteTotalValue = 0;
+    let wasteUnpricedCount = 0;
+    const wasteByOutlet = {};
+    const wasteByItem = {};
+    wasteRows.forEach((x) => {
+      const value = computeItemValue(x.itemName, x.quantity, x.unit, priceHistory);
+      if (value === null) {
+        wasteUnpricedCount += 1;
+        return;
+      }
+      wasteTotalValue += value;
+      wasteByOutlet[x.outlet] = (wasteByOutlet[x.outlet] || 0) + value;
+      wasteByItem[x.itemName] = (wasteByItem[x.itemName] || 0) + value;
+    });
+    const wasteTopItems = Object.entries(wasteByItem)
+      .sort((a, b) => b[1] - a[1])
+      .slice(0, 5);
+
     return (
       <div className="page">
         <div className="section-header">
           <div><h1>Variance & Waste</h1><p>Stok teoritis (stok awal + pembelian/barang datang − pemakaian resep − waste + penyesuaian) dibanding stock opname aktual.</p></div>
         </div>
         <DataTable
-          columns={["Bahan", "Teoritis", "Aktual", "Selisih", "Nilai Selisih", "Status"]}
+          columns={["Bahan", "Outlet", "Teoritis", "Aktual", "Selisih", "Nilai Selisih", "Status"]}
           rows={items.map((x) => {
             const ratio = x.theoretical > 0 ? x.actual / x.theoretical : x.actual >= 0 ? 1 : 0;
             const value = computeVarianceValue(x, priceHistory);
             return [
               x.itemName,
+              x.outlet,
               displayQuantity(x.theoretical, x.unit),
               displayQuantity(x.actual, x.unit),
               displayQuantity(x.variance, x.unit),
@@ -3370,6 +3642,39 @@ export default function App() {
             ];
           })}
         />
+
+        <div className="card" style={{ marginTop: 16 }}>
+          <div className="card-title">Ringkasan Biaya Waste</div>
+          <p style={{ fontSize: 13, color: "var(--ink-soft)", margin: "0 0 12px" }}>
+            Dihitung dari baris waste yang sedang ditampilkan di bawah (ikut berubah kalau Anda cari/filter tanggal).
+          </p>
+          <div style={{ display: "flex", gap: 24, flexWrap: "wrap", marginBottom: wasteTopItems.length ? 16 : 0 }}>
+            <div>
+              <div style={{ fontSize: 12, color: "var(--ink-faint)" }}>Total nilai waste</div>
+              <div style={{ fontSize: 22, fontWeight: 700, color: "#c6392e" }}>Rp {formatNumber(wasteTotalValue)}</div>
+              {wasteUnpricedCount > 0 && (
+                <div style={{ fontSize: 11, color: "var(--ink-faint)" }}>
+                  + {wasteUnpricedCount} baris belum punya harga bahan (tidak ikut dihitung)
+                </div>
+              )}
+            </div>
+            {Object.entries(wasteByOutlet).map(([outlet, value]) => (
+              <div key={outlet}>
+                <div style={{ fontSize: 12, color: "var(--ink-faint)" }}>Outlet {outlet}</div>
+                <div style={{ fontSize: 18, fontWeight: 600 }}>Rp {formatNumber(value)}</div>
+              </div>
+            ))}
+          </div>
+          {wasteTopItems.length > 0 && (
+            <div>
+              <div style={{ fontSize: 12, color: "var(--ink-faint)", marginBottom: 6 }}>Bahan penyumbang waste terbesar</div>
+              <DataTable
+                columns={["Bahan", "Nilai Waste"]}
+                rows={wasteTopItems.map(([itemName, value]) => [itemName, `Rp ${formatNumber(value)}`])}
+              />
+            </div>
+          )}
+        </div>
 
         <div className="card" style={{ marginTop: 16 }}>
           <div className="card-title">Catatan Waste</div>
@@ -3384,15 +3689,17 @@ export default function App() {
             summary={`${wasteRows.length} baris`}
           />
           <DataTable
-            columns={["Tanggal", "Outlet", "Bahan", "Jumlah", "Satuan", "Alasan", "Aksi"]}
+            columns={["Tanggal", "Outlet", "Bahan", "Jumlah", "Satuan", "Nilai", "Alasan", "Aksi"]}
             rows={wasteRows.map((x) => {
               const editing = editingRow?.id === x.id;
+              const value = computeItemValue(x.itemName, x.quantity, x.unit, priceHistory);
               return [
                 editing ? fieldInput("date", "date") : formatDateID(x.date),
                 editing ? fieldInput("outlet", "select", ["DS", "SS", "SP"]) : x.outlet,
                 editing ? fieldInput("itemName", "text") : x.itemName,
                 editing ? fieldInput("quantity", "number") : formatNumber(x.quantity),
                 editing ? fieldInput("unit", "text") : x.unit,
+                value !== null ? `Rp ${formatNumber(value)}` : <span style={{ color: "#999" }}>-</span>,
                 editing ? fieldInput("reason", "text") : (x.reason || "-"),
                 actionCell(COLLECTIONS.WASTE, x, ["date", "outlet", "itemName", "quantity", "unit", "reason"], ["quantity"])
               ];
@@ -3949,10 +4256,11 @@ export default function App() {
           <div>
             <h1>Riwayat Aktivitas</h1>
             <p>
-              Setiap kali data disimpan lewat chat, Import Excel, atau Import Chat WA, aksinya tercatat di sini
-              dan bisa di-undo. Undo menghapus baris yang tersimpan pada aksi itu saja, tidak menyentuh data
-              lain. Data yang sudah ada di database sebelum fitur ini aktif tidak tercatat di sini — perbaiki
-              lewat halaman masing-masing (Pembelian, Penjualan, dst).
+              Setiap kali data disimpan lewat chat, Import Excel, Import Chat WA, atau diedit/dihapus lewat
+              tombol Edit/Hapus di halaman data, aksinya tercatat di sini dan bisa di-undo. Undo hanya
+              membatalkan aksi itu saja (mengembalikan baris yang dihapus, mengembalikan nilai sebelum diedit,
+              atau menghapus baris yang baru disimpan), tidak menyentuh data lain. Data yang sudah ada di
+              database sebelum fitur ini aktif tidak tercatat di sini.
             </p>
           </div>
         </div>
@@ -4019,6 +4327,27 @@ export default function App() {
       showToast(`Gagal membuat laporan Excel: ${error.message}`);
     } finally {
       setReportBusy(false);
+    }
+  }
+
+  async function handleDownloadBackup() {
+    setBackupBusy(true);
+    try {
+      const workbook = buildFullBackupWorkbook({
+        rawData,
+        priceHistory,
+        categories,
+        activityLog,
+        generatedAt: new Date().toLocaleString("id-ID")
+      });
+      const filename = `Backup_DolanSawahAI_${getTodayISO()}.xlsx`;
+      downloadReportWorkbook(workbook, filename);
+      showToast("Backup data lengkap berhasil diunduh.", "success");
+    } catch (error) {
+      console.error("Gagal membuat backup:", error);
+      showToast(`Gagal membuat backup: ${error.message}`);
+    } finally {
+      setBackupBusy(false);
     }
   }
 
@@ -4107,6 +4436,31 @@ export default function App() {
         </div>
 
         <div className="card">
+          <div className="card-title">Backup Data Lengkap</div>
+          <p style={{ fontSize: 13, color: "var(--ink-soft)", margin: "0 0 14px" }}>
+            Unduh SELURUH data (semua tanggal, semua outlet, tanpa difilter/diringkas) sebagai satu file Excel --
+            satu sheet per jenis data. Berguna sebagai jaring pengaman sebelum menghapus banyak data sekaligus,
+            atau sekadar arsip.
+          </p>
+          <button
+            onClick={handleDownloadBackup}
+            disabled={backupBusy}
+            style={{
+              padding: "10px 20px",
+              borderRadius: 10,
+              border: "1px solid var(--border)",
+              background: "var(--surface)",
+              color: "var(--ink)",
+              fontWeight: 600,
+              cursor: backupBusy ? "default" : "pointer",
+              opacity: backupBusy ? 0.7 : 1
+            }}
+          >
+            {backupBusy ? "Menyiapkan backup..." : "⬇ Unduh Backup Data Lengkap"}
+          </button>
+        </div>
+
+        <div className="card">
           <div className="card-title">Pertanyaan cepat</div>
           <div className="prompt-list">
             {prompts.map((p) => (
@@ -4128,6 +4482,7 @@ export default function App() {
       case "barang-datang": return renderBarangDatang();
       case "penjualan": return renderPenjualan();
       case "stok": return renderStok();
+      case "penyesuaian": return renderPenyesuaian();
       case "kebutuhan": return renderKebutuhan();
       case "variance": return renderVariance();
       case "harga": return renderHarga();
@@ -4349,6 +4704,30 @@ export default function App() {
             {qualityBannerExpanded && (
               <ul className="data-quality-banner-list">
                 {dataQualityIssues.map((issue, i) => (
+                  <li key={i}>{issue.message}</li>
+                ))}
+              </ul>
+            )}
+          </div>
+        )}
+
+        {opsAlerts.length > 0 && (
+          <div className="ops-alert-banner">
+            <div
+              className="ops-alert-banner-header"
+              onClick={() => setOpsAlertBannerExpanded((v) => !v)}
+            >
+              <span className="ops-alert-banner-icon">🔔</span>
+              <span className="ops-alert-banner-title">
+                {opsAlerts.length} peringatan operasional (stok menipis / harga naik)
+              </span>
+              <span className="ops-alert-banner-toggle">
+                {opsAlertBannerExpanded ? "Sembunyikan ▲" : "Lihat detail ▼"}
+              </span>
+            </div>
+            {opsAlertBannerExpanded && (
+              <ul className="ops-alert-banner-list">
+                {opsAlerts.map((issue, i) => (
                   <li key={i}>{issue.message}</li>
                 ))}
               </ul>

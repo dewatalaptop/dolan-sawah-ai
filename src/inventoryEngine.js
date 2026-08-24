@@ -73,10 +73,21 @@ export async function loadInventoryData() {
 // CALCULATE THEORETICAL STOCK
 // ============================================================
 
+// PENTING: dikelompokkan per OUTLET + bahan, bukan cuma per bahan. Kalau
+// dipanggil dengan data gabungan 3 outlet (mis. tab "Semua"), stok tiap
+// outlet tetap dihitung terpisah -- stock opname di satu outlet TIDAK
+// ikut mereset baseline outlet lain, dan pembelian/waste/pemakaian tidak
+// tercampur antar outlet. Baris hasil punya field `outlet` supaya
+// pemanggil yang perlu (tampilan gabungan, laporan) bisa menjumlahkan
+// atau menampilkan per outlet sesuai kebutuhan.
 export function calculateTheoreticalStock(
   data
 ) {
   const result = {};
+
+  function keyOf(row) {
+    return `${row.outlet || "DS"}|${row.itemId || row.itemName}`;
+  }
 
   function ensure(key, seed) {
     if (!result[key]) {
@@ -84,6 +95,7 @@ export function calculateTheoreticalStock(
         itemId: seed.itemId || "",
         itemName: seed.itemName || "",
         unit: seed.unit || "",
+        outlet: seed.outlet || "DS",
         opening: 0,
         receiving: 0,
         usage: 0,
@@ -107,7 +119,7 @@ export function calculateTheoreticalStock(
 
   const opnameByItem = {};
   for (const opname of data.stockOpname) {
-    const key = opname.itemId || opname.itemName;
+    const key = keyOf(opname);
     if (!opnameByItem[key]) opnameByItem[key] = [];
     opnameByItem[key].push(opname);
   }
@@ -150,7 +162,7 @@ export function calculateTheoreticalStock(
   // ----------------------------------------------------------
 
   for (const item of data.openingStock) {
-    const key = item.itemId || item.itemName;
+    const key = keyOf(item);
     ensure(key, item);
     const info = baselineInfo[key];
     if (!info || info.baselineValue === null) {
@@ -163,7 +175,7 @@ export function calculateTheoreticalStock(
   // ----------------------------------------------------------
 
   for (const item of data.receiving) {
-    const key = item.itemId || item.itemName;
+    const key = keyOf(item);
     ensure(key, item);
     if (withinPeriod(key, item.date)) {
       result[key].receiving += Number(item.receivedQuantity || 0);
@@ -187,7 +199,7 @@ export function calculateTheoreticalStock(
 
   for (const purchase of data.purchases) {
     if (resolvedPurchaseIds.has(purchase.id)) continue;
-    const key = purchase.itemId || purchase.itemName;
+    const key = keyOf(purchase);
     ensure(key, purchase);
     if (withinPeriod(key, purchase.date)) {
       result[key].receiving += Number(purchase.quantity || 0);
@@ -199,7 +211,7 @@ export function calculateTheoreticalStock(
   // ----------------------------------------------------------
 
   for (const item of data.waste) {
-    const key = item.itemId || item.itemName;
+    const key = keyOf(item);
     ensure(key, item);
     if (withinPeriod(key, item.date)) {
       result[key].waste += Number(item.quantity || 0);
@@ -211,7 +223,7 @@ export function calculateTheoreticalStock(
   // ----------------------------------------------------------
 
   for (const item of data.adjustments) {
-    const key = item.itemId || item.itemName;
+    const key = keyOf(item);
     ensure(key, item);
     if (withinPeriod(key, item.date)) {
       result[key].adjustment += Number(item.quantity || 0);
@@ -231,9 +243,12 @@ export function calculateTheoreticalStock(
       continue;
     }
 
+    // Resep sendiri tidak punya outlet (sama untuk semua outlet) --
+    // pemakaian bahannya dihitung ke outlet TEMPAT PENJUALAN terjadi
+    // (sale.outlet), bukan default "DS".
     for (const ingredient of recipe.ingredients) {
-      const key = ingredient.itemId || ingredient.itemName;
-      ensure(key, ingredient);
+      const key = `${sale.outlet || "DS"}|${ingredient.itemId || ingredient.itemName}`;
+      ensure(key, { ...ingredient, outlet: sale.outlet });
 
       if (withinPeriod(key, sale.date)) {
         const amount =
@@ -250,7 +265,7 @@ export function calculateTheoreticalStock(
   // ----------------------------------------------------------
 
   Object.values(result).forEach((item) => {
-    const key = item.itemId || item.itemName;
+    const key = keyOf(item);
     const info = baselineInfo[key];
     const baseline =
       info && info.baselineValue !== null

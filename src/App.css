@@ -981,6 +981,64 @@ tbody tr:hover { background: var(--green-050); }
   }
 }
 
+/* Operational alerts banner (stok menipis, lonjakan harga) -- struktur
+   sama seperti data-quality-banner, warna biru supaya beda kategori:
+   ini bukan masalah DATA, tapi hal operasional yang layak diketahui. */
+.ops-alert-banner {
+  background: #e8f1fd;
+  border-bottom: 1px solid #a9cef4;
+  padding: 10px 28px;
+}
+
+.ops-alert-banner-header {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  cursor: pointer;
+  user-select: none;
+}
+
+.ops-alert-banner-icon {
+  font-size: 16px;
+  line-height: 1;
+}
+
+.ops-alert-banner-title {
+  font-weight: 600;
+  color: #14538a;
+  font-size: 14px;
+}
+
+.ops-alert-banner-toggle {
+  margin-left: auto;
+  font-size: 13px;
+  color: #14538a;
+  white-space: nowrap;
+}
+
+.ops-alert-banner-list {
+  margin: 10px 0 2px;
+  padding-left: 20px;
+  color: #123f66;
+  font-size: 13px;
+  line-height: 1.6;
+}
+
+.ops-alert-banner-list li {
+  margin-bottom: 4px;
+}
+
+@media (max-width: 720px) {
+  .ops-alert-banner {
+    padding: 10px 16px;
+  }
+
+  .ops-alert-banner-toggle {
+    margin-left: 0;
+    flex-basis: 100%;
+  }
+}
+
 /* =========================================================
    TOAST NOTIFICATION
    ========================================================= */
