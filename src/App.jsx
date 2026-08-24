@@ -422,6 +422,21 @@ function detectDataType(text) {
   return "unknown";
 }
 
+// Ekspor WhatsApp asli (header "===== DD/MM/YY =====", header pesan
+// "[DD/MM/YY, HH.MM.SS] Pengirim:", atau banyak baris outlet berdiri
+// sendiri) mengandung BANYAK tanggal/outlet sekaligus dalam satu teks --
+// beda dari asumsi chat biasa di sini (satu pesan = satu tanggal + satu
+// outlet). Kalau dipaksa diproses lewat parser satu-tanggal biasa, semua
+// baris dari berbagai tanggal/outlet akan tergabung salah jadi SATU
+// tanggal/outlet -- makanya perlu dideteksi lebih dulu dan diarahkan ke
+// menu "Import Chat WA" yang memang dibuat khusus untuk format ini.
+function looksLikeWhatsAppExport(text) {
+  const dateHeaders = (text.match(/^=+\s*\d{1,2}\/\d{1,2}\/\d{2,4}\s*=+$/gm) || []).length;
+  const msgHeaders = (text.match(/^\[?\d{1,2}\/\d{1,2}\/\d{2,4},\s*[\d.:]+\]/gm) || []).length;
+  const outletLines = (text.match(/^(DS|SS|SP)$/gim) || []).length;
+  return dateHeaders >= 2 || msgHeaders >= 2 || outletLines >= 2;
+}
+
 /* =========================================================
    PARSER BARIS "BARANG + JUMLAH + SATUAN"
    Dipakai untuk stok awal, pembelian, barang datang, stock
@@ -816,16 +831,30 @@ function getKnownIngredientNames(rawData) {
 // Menghitung daftar "kandidat mirip" untuk sekumpulan nama bahan baru,
 // dibanding `pool` (nama-nama yang sudah dikenal -- akan bertambah terus
 // selagi diproses, supaya nama yang mirip ANTAR baris dalam batch yang
-// sama juga tertangkap). Dua tahap: (1) kemiripan tulisan (typo/ejaan) --
-// cepat, tanpa AI; (2) kandidat "kata tambahan di belakang" yang tidak
-// bisa diputuskan cuma dari tulisan (mis. "Kelapa Parut" vs "Kelapa Parut
-// 30rb") -- dikirim ke AI untuk dinilai, dan HANYA yang dinilai AI sebagai
-// "kemungkinan sama" yang lanjut ditanyakan ke pengguna. Kalau AI gagal
-// dipanggil, tahap kedua ini dilewati saja (tidak mengganggu penyimpanan).
-async function computeSimilarityChecks(names, pool) {
+// sama juga tertangkap). Dua cara mendeteksi KANDIDAT: (1) kemiripan
+// tulisan (typo/ejaan, mis. "Bawang Puith" vs "Bawang Putih"), dan (2)
+// "kata tambahan di belakang" (mis. "Kelapa Parut" vs "Kelapa Parut
+// 30rb"). SEMUA kandidat -- termasuk yang dari kemiripan tulisan --
+// diverifikasi AI sebelum ditanyakan ke pengguna: skor tulisan tinggi
+// TERNYATA bisa salah untuk nama pendek yang cuma beda satu kata tapi
+// beda produk (mis. "Daging Ayam Giling" vs "Daging Sapi Giling" = 78%
+// mirip padahal jelas dua bahan berbeda) -- AI menyaring kasus begini
+// sebelum sampai ke pengguna. Kalau AI gagal dipanggil: kandidat dari
+// kemiripan tulisan tetap ditanyakan (skor tinggi cukup dipercaya tanpa
+// AI), tapi kandidat "kata tambahan" dilewati saja (terlalu rawan salah
+// tanpa penilaian AI).
+// Jumlah pasangan per panggilan AI. Waktu AI menjawab bertambah seiring
+// jumlah pasangan yang dikirim (respons JSON-nya makin panjang) -- untuk
+// rekap panjang (ratusan bahan baru) satu panggilan berisi SEMUA kandidat
+// pernah butuh 3+ menit. Dipecah jadi beberapa panggilan lebih kecil yang
+// jalan BERSAMAAN (Promise.all) supaya total waktu tunggu jauh lebih
+// pendek (dibatasi oleh chunk paling lambat, bukan jumlah semua chunk).
+const SIMILARITY_AI_CHUNK_SIZE = 10;
+
+async function computeSimilarityChecks(names, pool, onProgress) {
   const seenLower = new Set(pool.map((n) => n.toLowerCase()));
-  const checks = [];
-  const aiCandidates = [];
+  const levenshteinCandidates = [];
+  const prefixCandidates = [];
 
   names.forEach((name) => {
     if (!name) return;
@@ -834,13 +863,13 @@ async function computeSimilarityChecks(names, pool) {
 
     const similar = findSimilarName(name, pool);
     if (similar) {
-      if (!checks.some((c) => c.name.toLowerCase() === key)) {
-        checks.push({ name, matchedName: similar.match, score: similar.score, choice: null, source: "typo" });
+      if (!levenshteinCandidates.some((c) => c.name.toLowerCase() === key)) {
+        levenshteinCandidates.push({ name, matchedName: similar.match, score: similar.score });
       }
     } else {
       const prefixMatch = findPrefixCandidate(name, pool);
-      if (prefixMatch && !aiCandidates.some((c) => c.name.toLowerCase() === key)) {
-        aiCandidates.push({ name, matchedName: prefixMatch });
+      if (prefixMatch && !prefixCandidates.some((c) => c.name.toLowerCase() === key)) {
+        prefixCandidates.push({ name, matchedName: prefixMatch, score: null });
       }
     }
 
@@ -848,27 +877,60 @@ async function computeSimilarityChecks(names, pool) {
     pool.push(name);
   });
 
-  if (aiCandidates.length > 0) {
-    const verdicts = await analyzeIngredientPairs(aiCandidates);
-    if (Array.isArray(verdicts)) {
-      verdicts.forEach((v) => {
-        if (!v || !v.same) return;
-        const key = String(v.name || "").toLowerCase();
-        if (checks.some((c) => c.name.toLowerCase() === key)) return;
-        const original = aiCandidates.find((c) => c.name.toLowerCase() === key);
-        if (!original) return;
-        checks.push({
-          name: original.name,
-          matchedName: v.matchedName || original.matchedName,
-          score: null,
-          choice: null,
-          source: "ai",
-          reason: v.reason || ""
-        });
-      });
-    }
+  const allCandidates = [...levenshteinCandidates, ...prefixCandidates];
+  if (allCandidates.length === 0) return [];
+
+  const chunks = [];
+  for (let i = 0; i < allCandidates.length; i += SIMILARITY_AI_CHUNK_SIZE) {
+    chunks.push(allCandidates.slice(i, i + SIMILARITY_AI_CHUNK_SIZE));
   }
 
+  let doneChunks = 0;
+  if (onProgress) onProgress(0, chunks.length);
+  const chunkResults = await Promise.all(
+    chunks.map((chunk) =>
+      analyzeIngredientPairs(chunk).then((result) => {
+        doneChunks += 1;
+        if (onProgress) onProgress(doneChunks, chunks.length);
+        return result;
+      })
+    )
+  );
+
+  const succeededChunks = chunkResults.filter(Array.isArray);
+  if (succeededChunks.length === 0) {
+    // AI gagal/tidak tersedia sama sekali -- fallback aman: kandidat
+    // kemiripan tulisan tetap ditanyakan (skor tinggi), kandidat "kata
+    // tambahan" dilewati.
+    return levenshteinCandidates.map((c) => ({
+      name: c.name, matchedName: c.matchedName, score: c.score, choice: null, source: "typo"
+    }));
+  }
+  const verdicts = succeededChunks.flat();
+
+  const verdictMap = new Map(verdicts.map((v) => [String(v.name || "").toLowerCase(), v]));
+  const checks = [];
+  allCandidates.forEach((c) => {
+    const key = c.name.toLowerCase();
+    const v = verdictMap.get(key);
+    if (v) {
+      if (!v.same) return; // AI yakin ini bahan berbeda -- tidak perlu ditanyakan
+      checks.push({
+        name: c.name,
+        matchedName: v.matchedName || c.matchedName,
+        score: c.score,
+        choice: null,
+        source: "ai",
+        reason: v.reason || ""
+      });
+    } else if (c.score != null) {
+      // AI tidak sempat menilai pasangan ini (mis. respons terpotong) --
+      // tetap tanyakan berdasar skor kemiripan tulisan yang sudah tinggi.
+      checks.push({ name: c.name, matchedName: c.matchedName, score: c.score, choice: null, source: "typo" });
+    }
+    // kandidat "kata tambahan" tanpa verdict AI: dilewati, terlalu rawan
+    // salah kalau ditanyakan tanpa penilaian AI.
+  });
   return checks;
 }
 
@@ -1910,6 +1972,7 @@ export default function App() {
   const [waResult, setWaResult] = useState(null);
   const [waSaveBusy, setWaSaveBusy] = useState(false);
   const [waAnalyzing, setWaAnalyzing] = useState(false);
+  const [waAnalyzeProgress, setWaAnalyzeProgress] = useState(null); // { done, total }
   const [waShowReview, setWaShowReview] = useState(false);
 
   const [editingRecipeId, setEditingRecipeId] = useState(null);
@@ -2085,6 +2148,20 @@ export default function App() {
 
   async function processMessage(text) {
     const dataType = detectDataType(text);
+
+    const ITEM_BASED_TYPES = ["opening_stock", "purchase", "receiving", "stock_opname", "waste", "adjustment", "sales"];
+    if (ITEM_BASED_TYPES.includes(dataType) && looksLikeWhatsAppExport(text)) {
+      return {
+        text:
+          "Teks ini sepertinya rekap WhatsApp dengan BANYAK tanggal dan/atau outlet sekaligus. Chat AI Assistant " +
+          "di sini menganggap satu pesan = satu tanggal + satu outlet, jadi kalau dipaksa diproses di sini semua " +
+          "barisnya bisa tergabung salah jadi satu tanggal/outlet saja.\n\n" +
+          "Silakan pakai menu \"Import Chat WA\" di sebelah kiri — itu dibuat khusus untuk rekap seperti ini, " +
+          "lengkap dengan deteksi tanggal dan outlet masing-masing baris.",
+        tags: ["PERLU IMPORT WA"]
+      };
+    }
+
     const date = extractDate(text);
     const outlet = detectOutlet(text, chatOutlet);
 
@@ -2640,12 +2717,16 @@ export default function App() {
     result.reviewItems.forEach((item) => allNames.push(item.itemName));
 
     setWaAnalyzing(true);
+    setWaAnalyzeProgress(null);
     try {
-      const similarityChecks = await computeSimilarityChecks(allNames, pool);
+      const similarityChecks = await computeSimilarityChecks(allNames, pool, (done, total) => {
+        setWaAnalyzeProgress({ done, total });
+      });
       setWaResult({ ...result, similarityChecks });
       setWaShowReview(false);
     } finally {
       setWaAnalyzing(false);
+      setWaAnalyzeProgress(null);
     }
   }
 
@@ -3621,6 +3702,12 @@ export default function App() {
             style={{ width: "100%", padding: 10, borderRadius: 8, border: "1px solid var(--border)", fontFamily: "inherit", fontSize: 13, resize: "vertical" }}
           />
           <div className="form-footer">
+            <span className="message">
+              {waAnalyzing &&
+                (waAnalyzeProgress && waAnalyzeProgress.total > 0
+                  ? `Sedang memeriksa nama bahan dengan AI... (${waAnalyzeProgress.done}/${waAnalyzeProgress.total} batch selesai)`
+                  : "Sedang memeriksa nama bahan dengan AI, mohon tunggu...")}
+            </span>
             <button className="primary-button" onClick={handleWaParse} disabled={!waText.trim() || waAnalyzing}>
               {waAnalyzing ? "Menganalisa..." : "Proses Teks"}
             </button>
