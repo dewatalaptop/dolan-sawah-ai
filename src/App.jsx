@@ -20,7 +20,8 @@ import {
   createWaste,
   createAdjustment,
   createChatMessage,
-  createActivityLog
+  createActivityLog,
+  createDecisionLog
 } from "./dataModel";
 
 import {
@@ -41,7 +42,9 @@ import { findSimilarName, findPrefixCandidate } from "./similarityEngine";
 
 import { buildReportWorkbook, downloadReportWorkbook, buildFullBackupWorkbook } from "./reportEngine";
 
-import { askAI, buildReportPrompt, analyzeIngredientPairs } from "./aiEngine";
+import { askAI, buildReportPrompt, analyzeIngredientPairs, buildAgentInitialMessages, runAgentLoop } from "./aiEngine";
+
+import { AGENT_TOOLS, isWriteTool } from "./agentTools";
 
 import { toLocalISODate } from "./dateUtils";
 
@@ -2125,6 +2128,16 @@ export default function App() {
   const [messages, setMessages] = useState(() => [buildWelcomeMessage()]);
   const [chatDate, setChatDate] = useState(TODAY);
 
+  /* =======================================================
+     AGENT CORE -- agentic loop dengan function-calling. Nonaktif
+     secara default (mode Tanya Cepat lama tetap jalan seperti biasa)
+     supaya fitur yang sudah teruji tidak berisiko regresi; pengguna
+     aktifkan sendiri lewat sakelar di halaman chat.
+     ======================================================= */
+  const [agentCoreEnabled, setAgentCoreEnabled] = useState(false);
+  const [agentPending, setAgentPending] = useState(null); // { toolCalls, messages, toolLog, userMessage }
+  const [agentApprovalBusy, setAgentApprovalBusy] = useState(false);
+
   const [input, setInput] = useState("");
   const [loading, setLoading] = useState(false);
   const [systemOnline, setSystemOnline] = useState(false);
@@ -2334,6 +2347,341 @@ export default function App() {
     () => filteredData.receiving.filter((r) => Math.abs(Number(r.difference || 0)) > 0.0001),
     [filteredData.receiving]
   );
+
+  /* =======================================================
+     AGENT CORE -- tool executor, logging, dan alur agentic loop.
+     Tool BACA dieksekusi di sini langsung dari rawData/priceHistory
+     yang sudah dimuat (tidak query Firestore ulang, kecuali reservasi
+     yang memang koleksi terpisah). Tool TULIS TIDAK PERNAH benar-benar
+     menulis di sini -- itu baru terjadi di approveAgentAction, setelah
+     pemilik klik "Setujui".
+     ======================================================= */
+
+  // Stok teoritis SEMUA outlet sekaligus (bukan cuma outlet yang lagi
+  // aktif di tab atas) -- tool agent menentukan outlet-nya sendiri per
+  // panggilan, jadi tidak boleh terbatas ke activeOutlet.
+  const allOutletsStock = useMemo(
+    () => calculateTheoreticalStock(toBaseUnitDataset(rawData)),
+    [rawData]
+  );
+
+  async function executeAgentTool(name, args) {
+    const outlet = args.outlet || "ALL";
+
+    switch (name) {
+      case "getVarianceReport": {
+        const scoped = outlet === "ALL" ? allOutletsStock : allOutletsStock.filter((x) => x.outlet === outlet);
+        const report = generateVarianceReport(scoped);
+        return {
+          outlet,
+          total_item_dengan_opname: report.itemsWithOpname,
+          total_item_bervariance: report.varianceItems,
+          items: report.items.slice(0, 15).map((x) => ({
+            bahan: x.itemName,
+            outlet: x.outlet,
+            teoritis: Math.round(x.theoretical * 100) / 100,
+            aktual: x.actual === null ? null : Math.round(x.actual * 100) / 100,
+            selisih: Math.round(x.variance * 100) / 100,
+            satuan: x.unit
+          }))
+        };
+      }
+
+      case "getCurrentStock": {
+        const key = normalizeText(args.bahan);
+        const rows = allOutletsStock.filter(
+          (x) => normalizeText(x.itemName) === key && (outlet === "ALL" || x.outlet === outlet)
+        );
+        if (!rows.length) return { ditemukan: false, bahan: args.bahan };
+        return {
+          ditemukan: true,
+          bahan: args.bahan,
+          per_outlet: rows.map((x) => ({
+            outlet: x.outlet,
+            teoritis: Math.round(x.theoretical * 100) / 100,
+            aktual: x.actual === null ? null : Math.round(x.actual * 100) / 100,
+            satuan: x.unit
+          }))
+        };
+      }
+
+      case "getPriceHistory": {
+        const entry = getCurrentPrice(args.bahan, priceHistory);
+        const historyRows = priceHistory
+          .filter((p) => normalizeText(p.itemName) === normalizeText(args.bahan))
+          .sort((a, b) => (a.effectiveDate < b.effectiveDate ? 1 : -1))
+          .slice(0, 5);
+        return {
+          bahan: args.bahan,
+          harga_terkini: entry ? { harga: entry.price, satuan: entry.unit, berlaku_sejak: entry.effectiveDate } : null,
+          riwayat_terakhir: historyRows.map((p) => ({ harga: p.price, satuan: p.unit, berlaku_sejak: p.effectiveDate }))
+        };
+      }
+
+      case "getRecipeCost": {
+        const recipe = findRecipeByMenu(args.menu, rawData.recipes);
+        if (!recipe) return { ditemukan: false, menu: args.menu };
+        const cost = computeRecipeCost(recipe, priceHistory);
+        return {
+          ditemukan: true,
+          menu: recipe.menuName,
+          harga_jual: recipe.sellPrice,
+          estimasi_hpp: cost.complete ? Math.round(cost.totalCost * 100) / 100 : null,
+          lengkap: cost.complete,
+          rincian_bahan: cost.lines.map((l) => ({
+            bahan: l.itemName,
+            jumlah: l.quantity,
+            satuan: l.unit,
+            harga_satuan: l.unitPrice,
+            biaya: l.cost === null ? null : Math.round(l.cost * 100) / 100
+          }))
+        };
+      }
+
+      case "getSalesSummary": {
+        const days = Number(args.hariTerakhir) || 7;
+        const scopedSales = outlet === "ALL" ? rawData.sales : rawData.sales.filter((s) => (s.outlet || "DS") === outlet);
+        const avg = computeAvgDailySales(scopedSales, days);
+        const totalPorsi = Object.values(avg).reduce((a, b) => a + b, 0);
+        const stats = computeDailySalesStats(scopedSales, rawData.recipes);
+        return {
+          outlet,
+          hari_terakhir: days,
+          total_porsi_per_hari_gabungan: Math.round(totalPorsi * 100) / 100,
+          rata_rata_per_menu: avg,
+          rata_rata_harian_seluruh_periode: {
+            dari: stats.dariTanggal,
+            sampai: stats.sampaiTanggal,
+            porsi_per_hari: stats.rataRataPorsiPerHari,
+            omzet_per_hari: stats.rataRataOmzetPerHari
+          }
+        };
+      }
+
+      case "getReservationForecast": {
+        const from = args.dariTanggal || getTodayISO();
+        const to =
+          args.sampaiTanggal ||
+          (() => {
+            const d = new Date();
+            d.setDate(d.getDate() + 14);
+            return toLocalISODate(d);
+          })();
+        const snap = await getDocs(collection(db, "reservations_mirror"));
+        const rows = snap.docs
+          .map((d) => d.data())
+          .filter((r) => r.date >= from && r.date <= to && (outlet === "ALL" || r.outlet === outlet));
+        return {
+          outlet,
+          dari: from,
+          sampai: to,
+          jumlah_reservasi: rows.length,
+          total_tamu: rows.reduce((s, r) => s + Number(r.jumlah || 0), 0),
+          // nomorHp SENGAJA tidak disertakan -- tool ini untuk perkiraan beban
+          // dapur, tidak perlu data kontak pelanggan.
+          daftar: rows.slice(0, 20).map((r) => ({
+            nama: r.nama,
+            tanggal: r.date,
+            jam: r.jam,
+            jumlah_tamu: r.jumlah,
+            outlet: r.outlet,
+            status: r.status
+          }))
+        };
+      }
+
+      case "flagFollowUp":
+        // Ditangani di runAgentTurn/resumeAgentTurn lewat toolLog -- di
+        // sini cukup konfirmasi diterima.
+        return { dicatat: true, catatan: args.catatan, tanggal: args.tanggal };
+
+      case "proposeStockAdjustment":
+      case "proposePurchaseSuggestion":
+        // Seharusnya tidak pernah sampai sini -- loop berhenti duluan
+        // untuk tool tulis. Jaga-jaga saja.
+        return { error: "Tool tulis harus lewat alur persetujuan, bukan dieksekusi langsung." };
+
+      default:
+        return { error: `Tool tidak dikenal: ${name}` };
+    }
+  }
+
+  async function logAgentDecision(fields) {
+    const followUp = (fields.toolLog || []).find((t) => t.name === "flagFollowUp" && t.type === "read");
+    const logEntry = createDecisionLog({
+      userMessage: fields.userMessage,
+      plan: fields.plan || "",
+      toolsUsed: (fields.toolLog || []).map((t) => ({ name: t.name, args: t.args, type: t.type, result: t.result })),
+      requiresApproval: !!fields.requiresApproval,
+      approvedBy: fields.approvedBy || null,
+      approvedAt: fields.approvedAt || null,
+      rejected: !!fields.rejected,
+      finalAnswer: fields.finalAnswer || "",
+      followUpNeeded: !!followUp,
+      followUpNote: followUp?.result?.catatan || "",
+      followUpDate: followUp?.result?.tanggal || ""
+    });
+    await addDoc(collection(db, COLLECTIONS.DECISIONS_LOG), logEntry);
+  }
+
+  function formatToolCallDraft(toolCall) {
+    let args;
+    try {
+      args = JSON.parse(toolCall.function.arguments || "{}");
+    } catch {
+      args = {};
+    }
+    if (toolCall.function.name === "proposeStockAdjustment") {
+      return (
+        `🤖 Agent Core mengusulkan PENYESUAIAN STOK:\n\n` +
+        `- Bahan: ${args.bahan}\n- Outlet: ${args.outlet}\n- Jumlah: ${args.jumlah} ${args.satuan}\n` +
+        `- Alasan: ${args.alasan}\n\nBelum tersimpan -- perlu persetujuan Anda di bawah.`
+      );
+    }
+    if (toolCall.function.name === "proposePurchaseSuggestion") {
+      const list = (args.daftarBahan || [])
+        .map((x) => `- ${x.bahan}: ${x.jumlah} ${x.satuan}${x.alasan ? ` (${x.alasan})` : ""}`)
+        .join("\n");
+      return `🤖 Agent Core mengusulkan SARAN BELANJA:\n\n${list}\n\nIni baru rekomendasi -- perlu persetujuan Anda di bawah.`;
+    }
+    return `🤖 Agent Core mengusulkan aksi "${toolCall.function.name}" dengan parameter: ${JSON.stringify(args)}`;
+  }
+
+  async function runAgentTurn(userMessage) {
+    const messages = buildAgentInitialMessages(userMessage);
+    const result = await runAgentLoop({ messages, tools: AGENT_TOOLS, executeTool: executeAgentTool, isWriteTool });
+
+    if (result.status === "pending_approval") {
+      setAgentPending({ toolCalls: result.toolCalls, messages: result.messages, toolLog: result.toolLog, userMessage });
+      const draftCall = result.toolCalls.find((tc) => isWriteTool(tc.function.name));
+      return { text: formatToolCallDraft(draftCall), tags: ["AGENT CORE", "PERLU PERSETUJUAN"] };
+    }
+
+    await logAgentDecision({
+      userMessage,
+      toolLog: result.toolLog,
+      finalAnswer: result.finalAnswer,
+      requiresApproval: false
+    });
+
+    return {
+      text: result.finalAnswer,
+      tags: result.status === "max_iterations" ? ["AGENT CORE", "TERLALU BANYAK LANGKAH"] : ["AGENT CORE"]
+    };
+  }
+
+  async function resumeAgentTurn(approved) {
+    if (!agentPending) return null;
+    setAgentApprovalBusy(true);
+    try {
+      const { toolCalls, messages, toolLog, userMessage } = agentPending;
+      const writeCall = toolCalls.find((tc) => isWriteTool(tc.function.name));
+      let writeArgs;
+      try {
+        writeArgs = JSON.parse(writeCall.function.arguments || "{}");
+      } catch {
+        writeArgs = {};
+      }
+
+      const nextMessages = [...messages];
+      const nextToolLog = [...toolLog];
+
+      for (const toolCall of toolCalls) {
+        let result;
+        if (toolCall.id === writeCall.id) {
+          if (approved) {
+            result = await executeApprovedWrite(writeCall.function.name, writeArgs);
+          } else {
+            result = { disetujui: false, alasan: "Ditolak oleh pemilik." };
+          }
+          nextToolLog.push({ name: toolCall.function.name, args: writeArgs, type: "write", result });
+        } else {
+          // tool baca lain dalam batch yang sama -- baru dieksekusi sekarang.
+          let readArgs;
+          try {
+            readArgs = JSON.parse(toolCall.function.arguments || "{}");
+          } catch {
+            readArgs = {};
+          }
+          result = await executeAgentTool(toolCall.function.name, readArgs);
+          nextToolLog.push({ name: toolCall.function.name, args: readArgs, type: "read", result });
+        }
+        nextMessages.push({ role: "tool", tool_call_id: toolCall.id, content: JSON.stringify(result ?? null) });
+      }
+
+      setAgentPending(null);
+
+      const next = await runAgentLoop({
+        messages: nextMessages,
+        tools: AGENT_TOOLS,
+        executeTool: executeAgentTool,
+        isWriteTool
+      });
+
+      if (next.status === "pending_approval") {
+        setAgentPending({ toolCalls: next.toolCalls, messages: next.messages, toolLog: [...nextToolLog, ...next.toolLog], userMessage });
+        const draftCall = next.toolCalls.find((tc) => isWriteTool(tc.function.name));
+        const draftText = formatToolCallDraft(draftCall);
+        setMessages((prev) => [...prev, { id: `assistant-${Date.now()}`, role: "assistant", text: draftText, tags: ["AGENT CORE", "PERLU PERSETUJUAN"] }]);
+        persistChatMessage(chatDate, "assistant", draftText, ["AGENT CORE", "PERLU PERSETUJUAN"]);
+        return null;
+      }
+
+      await logAgentDecision({
+        userMessage,
+        toolLog: [...nextToolLog, ...next.toolLog],
+        finalAnswer: next.finalAnswer,
+        requiresApproval: true,
+        approvedBy: approved ? "pemilik" : null,
+        approvedAt: approved ? new Date().toISOString() : null,
+        rejected: !approved
+      });
+
+      const finalTags = approved ? ["AGENT CORE", "DISETUJUI"] : ["AGENT CORE", "DITOLAK"];
+      setMessages((prev) => [...prev, { id: `assistant-${Date.now()}`, role: "assistant", text: next.finalAnswer, tags: finalTags }]);
+      persistChatMessage(chatDate, "assistant", next.finalAnswer, finalTags);
+      return next.finalAnswer;
+    } catch (error) {
+      console.error(error);
+      showToast("Gagal melanjutkan Agent Core: " + (error?.message || "unknown error"));
+      return null;
+    } finally {
+      setAgentApprovalBusy(false);
+    }
+  }
+
+  // Eksekusi NYATA hanya terjadi di sini, hanya setelah pemilik klik
+  // "Setujui" -- ini satu-satunya tempat tool tulis benar-benar mengubah
+  // data.
+  async function executeApprovedWrite(name, args) {
+    if (name === "proposeStockAdjustment") {
+      const row = createAdjustment({
+        date: getTodayISO(),
+        outlet: args.outlet,
+        itemName: args.bahan,
+        quantity: Number(args.jumlah) || 0,
+        unit: args.satuan,
+        reason: `[Agent Core] ${args.alasan}`
+      });
+      const ids = await saveRowsTracked(
+        COLLECTIONS.ADJUSTMENTS,
+        [row],
+        "Penyesuaian Stok (Agent Core)",
+        `1 bahan, ${args.outlet}, diusulkan Agent Core`
+      );
+      await refreshData();
+      return { disetujui: true, tersimpan: true, documentIds: ids };
+    }
+
+    if (name === "proposePurchaseSuggestion") {
+      // Draft rekomendasi -- disetujui = pemilik menerima usulannya, tidak
+      // ada transaksi pembelian otomatis (itu tetap lewat alur pembelian
+      // manual/chat biasa seperti sekarang).
+      return { disetujui: true, catatan: "Rekomendasi diterima pemilik. Input pembelian aktual tetap lewat menu Pembelian." };
+    }
+
+    return { disetujui: false, alasan: "Tool tulis tidak dikenal." };
+  }
 
   /* =======================================================
      PROSES PESAN CHAT
@@ -2655,6 +3003,10 @@ export default function App() {
           items.map((x) => `- ${x.itemName}: Rp ${formatNumber(x.price)} / ${x.unit}`).join("\n"),
         tags: ["HARGA", "TERSIMPAN"]
       };
+    }
+
+    if (dataType === "report" && agentCoreEnabled) {
+      return await runAgentTurn(text);
     }
 
     if (dataType === "report") {
@@ -4751,9 +5103,20 @@ export default function App() {
                 ))}
               </div>
               <span className="chat-context-hint">Anda tetap bisa menyebut outlet lain langsung di dalam pesan.</span>
+              <label
+                title="Kalau aktif, pertanyaan/laporan dijawab lewat Agent Core (AI memilih sendiri data yang perlu diambil, lewat beberapa tool, dan mengusulkan aksi yang perlu Anda setujui) -- bukan lagi jawaban satu-kali seperti biasa."
+                style={{ marginLeft: "auto", display: "flex", alignItems: "center", gap: 6, fontSize: 13, cursor: "pointer" }}
+              >
+                <input
+                  type="checkbox"
+                  checked={agentCoreEnabled}
+                  onChange={(e) => setAgentCoreEnabled(e.target.checked)}
+                />
+                🤖 Agent Core
+              </label>
               <button
                 onClick={() => setHistoryOpen((v) => !v)}
-                style={{ marginLeft: "auto", padding: "6px 12px", borderRadius: 8, border: "1px solid #ddd", background: historyOpen ? "#2e7d32" : "transparent", color: historyOpen ? "#fff" : "#333", cursor: "pointer", fontSize: 13 }}
+                style={{ padding: "6px 12px", borderRadius: 8, border: "1px solid #ddd", background: historyOpen ? "#2e7d32" : "transparent", color: historyOpen ? "#fff" : "#333", cursor: "pointer", fontSize: 13 }}
               >
                 Riwayat Chat
               </button>
@@ -4866,6 +5229,31 @@ export default function App() {
                     disabled={pendingSimilarity.checks.some((c) => !c.choice)}
                   >
                     Lanjutkan & Simpan
+                  </button>
+                </div>
+              </div>
+            )}
+
+            {agentPending && (
+              <div className="agent-approval-card">
+                <div className="agent-approval-title">🤖 Agent Core mengusulkan aksi tulis -- perlu persetujuan Anda</div>
+                <p className="agent-approval-desc">
+                  {formatToolCallDraft(agentPending.toolCalls.find((tc) => isWriteTool(tc.function.name)))}
+                </p>
+                <div className="agent-approval-footer">
+                  <button
+                    className="secondary-button agent-approval-reject"
+                    onClick={() => resumeAgentTurn(false)}
+                    disabled={agentApprovalBusy}
+                  >
+                    {agentApprovalBusy ? "..." : "Tolak"}
+                  </button>
+                  <button
+                    className="primary-button agent-approval-approve"
+                    onClick={() => resumeAgentTurn(true)}
+                    disabled={agentApprovalBusy}
+                  >
+                    {agentApprovalBusy ? "Memproses..." : "Setujui"}
                   </button>
                 </div>
               </div>

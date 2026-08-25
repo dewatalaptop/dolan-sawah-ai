@@ -576,6 +576,50 @@ tbody tr:hover { background: var(--green-050); }
   margin-top: 14px;
 }
 
+/* Agent Core -- kartu persetujuan aksi tulis. Warna ungu, sengaja beda
+   dari kartu kemiripan bahan (oranye) supaya jelas ini kategori
+   keputusan yang lebih berisiko (menulis ke data operasional). */
+.agent-approval-card {
+  border: 1px solid #c9b8f0;
+  border-radius: var(--radius-lg);
+  background: linear-gradient(135deg, #f3effc, var(--surface));
+  padding: 16px 18px;
+  margin: 0 0 14px;
+}
+
+.agent-approval-title {
+  font-size: 13.5px;
+  font-weight: 750;
+  color: #5b3ea6;
+}
+
+.agent-approval-desc {
+  margin: 6px 0 14px;
+  font-size: 12px;
+  line-height: 1.6;
+  color: var(--ink-soft);
+  white-space: pre-wrap;
+}
+
+.agent-approval-footer {
+  display: flex;
+  justify-content: flex-end;
+  gap: 10px;
+  margin-top: 4px;
+}
+
+.agent-approval-reject {
+  background: var(--surface);
+  border: 1px solid #c0392b;
+  color: #c0392b;
+}
+
+.agent-approval-approve {
+  background: linear-gradient(135deg, #6d4fc7, #8a6fe0);
+  border: none;
+  color: #fff;
+}
+
 /* =========================================================
    BUTTONS
    ========================================================= */

@@ -23,7 +23,9 @@ export const COLLECTIONS = {
 
   PURCHASE_CATEGORIES: "purchase_categories",
 
-  ACTIVITY_LOG: "activity_log"
+  ACTIVITY_LOG: "activity_log",
+
+  DECISIONS_LOG: "decisions_log"
 };
 
 // ============================================================
@@ -195,6 +197,32 @@ export function createActivityLog(data = {}) {
 
     undone: false,
     undoneAt: null
+  };
+}
+
+// ============================================================
+// DECISIONS LOG (Agent Core -- satu entri per siklus agentic loop,
+// baik yang butuh approval maupun tidak)
+// ============================================================
+
+export function createDecisionLog(data = {}) {
+  return {
+    timestamp: new Date().toISOString(),
+    userMessage: data.userMessage || "",
+    plan: data.plan || "",
+    toolsUsed: Array.isArray(data.toolsUsed) ? data.toolsUsed : [],
+
+    requiresApproval: !!data.requiresApproval,
+    approvedBy: data.approvedBy || null,
+    approvedAt: data.approvedAt || null,
+    rejected: !!data.rejected,
+
+    finalAnswer: data.finalAnswer || "",
+
+    followUpNeeded: !!data.followUpNeeded,
+    followUpNote: data.followUpNote || "",
+    followUpDate: data.followUpDate || "",
+    followUpNotified: false
   };
 }
 
