@@ -1,0 +1,14 @@
+{
+  "indexes": [
+    {
+      "collectionGroup": "decisions_log",
+      "queryScope": "COLLECTION",
+      "fields": [
+        { "fieldPath": "followUpNeeded", "order": "ASCENDING" },
+        { "fieldPath": "followUpNotified", "order": "ASCENDING" },
+        { "fieldPath": "followUpDate", "order": "ASCENDING" }
+      ]
+    }
+  ],
+  "fieldOverrides": []
+}

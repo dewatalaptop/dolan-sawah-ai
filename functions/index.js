@@ -143,6 +143,57 @@ async function cleanupStaleMirrors(sourceCollectionName, liveSourceIds) {
   return commitInChunks(ownDb, operations);
 }
 
+// ============================================================
+// sendFollowUpReminders: tiap pagi, cek decisions_log untuk follow-up
+// yang jatuh tempo (followUpNeeded=true, followUpDate<=hari ini,
+// belum dinotifikasi), kirim satu email ringkasan lewat extension
+// "Trigger Email from Firestore" (nulis ke collection `mail`), lalu
+// tandai followUpNotified=true supaya tidak dikirim ulang besok.
+// ============================================================
+
+const FOLLOW_UP_RECIPIENT = "dewatalaptop@gmail.com";
+
+exports.sendFollowUpReminders = onSchedule(
+  {
+    schedule: "0 7 * * *",
+    timeZone: "Asia/Jakarta",
+    region: "asia-southeast2"
+  },
+  async () => {
+    const today = new Date().toISOString().slice(0, 10);
+
+    const snapshot = await ownDb
+      .collection("decisions_log")
+      .where("followUpNeeded", "==", true)
+      .where("followUpNotified", "==", false)
+      .where("followUpDate", "<=", today)
+      .get();
+
+    if (snapshot.empty) {
+      logger.info("sendFollowUpReminders: tidak ada follow-up jatuh tempo hari ini.");
+      return;
+    }
+
+    const batch = ownDb.batch();
+    const lines = snapshot.docs.map((doc) => {
+      const data = doc.data();
+      batch.update(doc.ref, { followUpNotified: true });
+      return `- [${data.followUpDate}] ${data.followUpNote || "(tanpa catatan)"}\n  Konteks: ${data.userMessage || "-"}`;
+    });
+    await batch.commit();
+
+    await ownDb.collection("mail").add({
+      to: [FOLLOW_UP_RECIPIENT],
+      message: {
+        subject: `Dolan Sawah AI -- ${snapshot.size} follow-up jatuh tempo hari ini`,
+        text: `Follow-up yang perlu ditindaklanjuti hari ini (${today}):\n\n${lines.join("\n\n")}`
+      }
+    });
+
+    logger.info(`sendFollowUpReminders selesai: ${snapshot.size} follow-up dikirim & ditandai notified.`);
+  }
+);
+
 exports.syncReservations = onSchedule(
   {
     schedule: "0 * * * *",
