@@ -295,7 +295,18 @@ function extractDate(text) {
     return `${match[3]}-${bulanMap[match[2]]}-${String(match[1]).padStart(2, "0")}`;
   }
 
-  if (/\bkemarin\b/.test(normalizeText(source))) {
+  // Baris berlabel (mis. "Alasan: koreksi input kemarin") dikeluarkan dulu
+  // dari pengecekan kata "kemarin" -- alasan/catatan wajar menyebut
+  // kejadian masa lalu meski transaksinya sendiri untuk HARI INI, dan
+  // sebelumnya kata "kemarin" di baris alasan salah menggeser tanggal
+  // transaksi mundur satu hari padahal user sudah eksplisit bilang
+  // "hari ini" di baris lain.
+  const withoutLabeledLines = source
+    .split(/\n/)
+    .filter((line) => !/^(alasan|keterangan|catatan|supplier|vendor|pemasok)\s*:/i.test(line.trim()))
+    .join("\n");
+
+  if (/\bkemarin\b/.test(normalizeText(withoutLabeledLines))) {
     const d = new Date();
     d.setDate(d.getDate() - 1);
     return toLocalISODate(d);
@@ -470,8 +481,13 @@ function looksLikeHeaderOrMetaLine(line) {
 // format aneh) -- supaya baris ini bisa dilaporkan ke pengguna, bukan
 // diam-diam hilang seolah semua baris berhasil tersimpan.
 function parseItemLines(text) {
+  // Selain baris baru/titik koma, pisahkan juga di koma+spasi (dgn syarat
+  // karakter setelahnya bukan digit, supaya "1, 500" -- kalau memang ada
+  // yang menulis ribuan dengan spasi -- tidak ikut terpotong) -- pola nyata
+  // yang sering dipakai staf: "ayam 12 kg, bawang putih 5 kg" dalam satu
+  // baris, bukan satu barang per baris.
   const lines = String(text)
-    .split(/\n|;/)
+    .split(/\n|;|,\s+(?!\d)/)
     .map((x) => x.trim())
     .filter(Boolean);
 
@@ -485,8 +501,12 @@ function parseItemLines(text) {
     // tidak pernah diikuti langsung oleh kata satuan — jadi mewajibkan
     // satuan di sini otomatis mencegah angka tanggal/metadata terbaca
     // sebagai quantity barang, tanpa perlu parser tanggal terpisah.
+    // Angka boleh diawali "-" (penyesuaian stok sering butuh pengurangan,
+    // mis. "Ayam -1 kg") -- sebelumnya tanda minus tidak ikut tertangkap,
+    // jadinya nyangkut di nama barang ("Ayam -") dan quantity-nya jadi
+    // positif, kebalikan dari yang dimaksud.
     const match = line.match(
-      /([\d.,]+)\s*(kg|kilogram|gram|gr|g|liter|ltr|l|ml|porsi|pcs|buah|butir|ekor|pack|bungkus|kemasan|ikat|dus|krat|bal|sak|kotak|kranjang|keranjang|botol|karton)\b/i
+      /(-?[\d.,]+)\s*(kg|kilogram|gram|gr|g|liter|ltr|l|ml|porsi|pcs|buah|butir|ekor|pack|bungkus|kemasan|ikat|dus|krat|bal|sak|kotak|kranjang|keranjang|botol|karton)\b/i
     );
 
     if (!match || !match[1]) {
@@ -499,10 +519,30 @@ function parseItemLines(text) {
       .replace(/^[-•*:\s]+/, "")
       .trim();
 
+    // Angka tersisa di ujung nama (mis. harga yang ikut disebut setelah
+    // qty+satuan: "Ayam 10 kg 25000") bukan bagian dari nama barang --
+    // format chat ini tidak menangkap harga (dicatat terpisah lewat
+    // "Harga Bahan"), jadi buang saja daripada ikut menempel jadi nama
+    // yang salah ("Ayam 25000").
+    clean = clean.replace(/\s+(?:rp\.?\s*)?[\d.,]+\s*(?:rb|ribu|k)?$/i, "").trim();
+
     if (!clean) continue;
 
     // baris "supplier: xxx" / "alasan: xxx" bukan baris barang
     if (/^(supplier|vendor|alasan|keterangan|catatan)\s*:/i.test(clean)) continue;
+
+    // Baris pertama kadang menggabungkan header ("stok awal hari ini:")
+    // dengan nama barang pertama dalam satu kalimat -- kalau ada titik dua
+    // dan bagian sebelum titik dua kelihatan seperti header/meta, buang
+    // bagian itu supaya nama barangnya bersih (bukan ikut jadi bagian nama).
+    const colonIdx = clean.indexOf(":");
+    if (colonIdx > -1) {
+      const prefix = clean.slice(0, colonIdx);
+      const suffix = clean.slice(colonIdx + 1).trim();
+      if (suffix && looksLikeHeaderOrMetaLine(prefix)) {
+        clean = suffix;
+      }
+    }
 
     result.push({
       itemName: normalizeIngredient(clean),
@@ -543,7 +583,7 @@ function extractLabeledValue(text, labels) {
 
 function parseSalesLines(text) {
   const lines = String(text)
-    .split(/\n|;/)
+    .split(/\n|;|,\s+(?!\d)/)
     .map((x) => x.trim())
     .filter(Boolean);
 
@@ -560,7 +600,20 @@ function parseSalesLines(text) {
       continue;
     }
 
-    const name = match[1].replace(/^penjualan\s*/i, "").trim();
+    let name = match[1].replace(/^penjualan\s*/i, "").trim();
+
+    // Sama seperti parseItemLines: baris pertama kadang menggabungkan
+    // header ("penjualan hari ini:") dengan nama menu pertama dalam satu
+    // kalimat -- buang bagian sebelum titik dua kalau kelihatan header.
+    const colonIdx = name.indexOf(":");
+    if (colonIdx > -1) {
+      const prefix = name.slice(0, colonIdx);
+      const suffix = name.slice(colonIdx + 1).trim();
+      if (suffix && looksLikeHeaderOrMetaLine(prefix)) {
+        name = suffix;
+      }
+    }
+
     const quantity = toNumber(match[2]);
     if (!name || !quantity) {
       unparsedLines.push(line);
@@ -646,7 +699,18 @@ function parseRecipeGroups(text) {
       continue;
     }
 
-    if (!/resep/i.test(clean)) {
+    // Baris "Resep Nasi Goreng" (label+nama digabung satu baris, pola yang
+    // umum dipakai) sebelumnya ditolak total karena mengandung kata
+    // "resep" -- akibatnya currentMenu tidak pernah terisi dan tiap baris
+    // bahan berikutnya salah dianggap resep satu-baris tersendiri. Sekarang
+    // kalau ada teks lain setelah kata "resep"/"resep update", teks itu
+    // yang dipakai sebagai nama menu; kalau baris CUMA "Resep" (tanpa nama
+    // menu), baris ini murni header dan dilewati seperti sebelumnya --
+    // baris berikutnya yang jadi nama menu.
+    if (/^resep\b/i.test(clean)) {
+      const afterResep = clean.replace(/^resep\s*:?\s*(update)?\s*:?\s*/i, "").trim();
+      if (afterResep) currentMenu = titleCase(afterResep.replace(/:$/, ""));
+    } else {
       currentMenu = titleCase(clean.replace(/:$/, ""));
     }
   }
@@ -663,7 +727,7 @@ function parseRecipeGroups(text) {
 
 function parsePriceLines(text) {
   const lines = String(text)
-    .split(/\n|;/)
+    .split(/\n|;|,\s+(?!\d)/)
     .map((x) => x.trim())
     .filter(Boolean);
 
@@ -684,8 +748,11 @@ function parsePriceLines(text) {
       continue;
     }
 
+    // Satuan boleh dipisah "/" ("Rp 35.000 / kg") atau kata "per"
+    // ("35.000 per kg") -- keduanya sama umum dipakai orang Indonesia,
+    // sebelumnya cuma "/" yang dikenali.
     const match = line.match(
-      /^[-•*]?\s*(.+?)\s*(?:Rp\.?|rp\.?)?\s*([\d.,]+)(?:\s*\/\s*(\w+))?$/i
+      /^[-•*]?\s*(.+?)\s*(?:Rp\.?|rp\.?)?\s*([\d.,]+)(?:\s*(?:\/|per)\s*(\w+))?$/i
     );
 
     if (!match) continue;
