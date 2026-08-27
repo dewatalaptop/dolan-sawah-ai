@@ -194,6 +194,64 @@ exports.checkFollowUpNotifications = onSchedule(
   }
 );
 
+// ============================================================
+// checkTomorrowReservations: tiap pagi (setelah syncReservations jalan
+// jam-jam sebelumnya), cek reservations_mirror untuk tanggal besok,
+// buat satu notifikasi per reservasi supaya muncul di badge lonceng
+// UI -- pengingat proaktif tanpa perlu pengguna tanya duluan.
+//
+// ID dokumen notifikasi dibuat deterministik (bukan .doc() acak) dari
+// id mirror + tanggal, supaya kalau function ini kebetulan jalan dua
+// kali di hari yang sama (retry/redeploy), notifikasi yang sama cuma
+// di-overwrite, bukan digandakan.
+// ============================================================
+
+exports.checkTomorrowReservations = onSchedule(
+  {
+    schedule: "0 8 * * *",
+    timeZone: "Asia/Jakarta",
+    region: "asia-southeast2"
+  },
+  async () => {
+    const tomorrow = new Date();
+    tomorrow.setDate(tomorrow.getDate() + 1);
+    const tomorrowDate = tomorrow.toISOString().slice(0, 10);
+
+    const snapshot = await ownDb
+      .collection(MIRROR_COLLECTION)
+      .where("date", "==", tomorrowDate)
+      .get();
+
+    if (snapshot.empty) {
+      logger.info(`checkTomorrowReservations: tidak ada reservasi untuk ${tomorrowDate}.`);
+      return;
+    }
+
+    const batch = ownDb.batch();
+    snapshot.docs.forEach((doc) => {
+      const data = doc.data();
+      const jamText = data.jam ? ` jam ${data.jam}` : "";
+      const outletText = data.outlet ? ` (${data.outlet})` : "";
+      batch.set(
+        ownDb.collection("notifications").doc(`resv-reminder-${doc.id}-${tomorrowDate}`),
+        {
+          decisionId: "",
+          message:
+            `Reservasi besok: ${data.nama || "(tanpa nama)"}${jamText}, ` +
+            `${data.jumlah || 0} tamu${outletText}` +
+            (data.tambahan ? ` -- ${data.tambahan}` : ""),
+          dueDate: tomorrowDate,
+          createdAt: admin.firestore.FieldValue.serverTimestamp(),
+          read: false
+        }
+      );
+    });
+    await batch.commit();
+
+    logger.info(`checkTomorrowReservations selesai: ${snapshot.size} notifikasi reservasi besok dibuat.`);
+  }
+);
+
 exports.syncReservations = onSchedule(
   {
     schedule: "0 * * * *",

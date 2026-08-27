@@ -419,7 +419,9 @@ function detectDataType(text) {
     t.includes("analisis") ||
     t.includes("kebutuhan") ||
     t.includes("rekomendasi") ||
-    t.includes("saran")
+    t.includes("saran") ||
+    t.includes("reservasi") ||
+    t.includes("booking")
   ) {
     return "report";
   }
@@ -3102,6 +3104,41 @@ export default function App() {
     if (dataType === "report") {
       const dailyStats = computeDailySalesStats(filteredData.sales, rawData.recipes);
 
+      // Data reservasi (disinkronkan tiap jam dari project reservasi
+      // terpisah ke reservations_mirror) -- diambil di sini, bukan lewat
+      // rawData, karena cuma dipakai untuk konteks laporan/tanya-jawab.
+      let reservasiMendatang = [];
+      try {
+        const resFrom = getTodayISO();
+        const resToDate = new Date();
+        resToDate.setDate(resToDate.getDate() + 14);
+        const resTo = toLocalISODate(resToDate);
+        const resSnap = await getDocs(
+          query(
+            collection(db, "reservations_mirror"),
+            where("date", ">=", resFrom),
+            where("date", "<=", resTo)
+          )
+        );
+        reservasiMendatang = resSnap.docs
+          .map((d) => d.data())
+          .filter((r) => activeOutlet === "ALL" || r.outlet === activeOutlet)
+          .sort((a, b) => `${a.date}${a.jam || ""}`.localeCompare(`${b.date}${b.jam || ""}`))
+          .slice(0, 30)
+          .map((r) => ({
+            nama: r.nama,
+            tanggal: r.date,
+            jam: r.jam,
+            jumlah_tamu: r.jumlah,
+            outlet: r.outlet,
+            status: r.status,
+            nomor_hp: r.nomorHp || "",
+            catatan: r.tambahan || ""
+          }));
+      } catch (error) {
+        console.warn("Gagal memuat data reservasi untuk konteks laporan:", error.message);
+      }
+
       const ctx = {
         varianceReport,
         purchaseSuggestions,
@@ -3159,7 +3196,9 @@ export default function App() {
           "JAWAB LANGSUNG memakai field rata_rata_harian_seluruh_periode (total gabungan semua menu) " +
           "-- JANGAN menjumlahkan sendiri angka per-menu. Field rata_rata_penjualan_harian_per_menu " +
           "hanya dipakai kalau pengguna tanya spesifik per-menu. Selalu sebutkan periode/tanggal data " +
-          "yang dipakai (field dari/sampai) agar jelas rentang waktunya.",
+          "yang dipakai (field dari/sampai) agar jelas rentang waktunya. Field reservasi_mendatang " +
+          "berisi data reservasi 14 hari ke depan (nama, tanggal, jam, jumlah_tamu, outlet, status, " +
+          "nomor_hp, catatan) -- pakai ini untuk menjawab pertanyaan soal reservasi.",
         rata_rata_harian_seluruh_periode: {
           dari: dailyStats.dariTanggal,
           sampai: dailyStats.sampaiTanggal,
@@ -3198,7 +3237,8 @@ export default function App() {
         omzet_rata_rata_harian_per_menu: omzetRataRataPerMenu,
         total_omzet_tercatat: Math.round(computeRevenue(filteredData.sales, rawData.recipes)),
         margin_per_menu: marginPerMenu,
-        selisih_barang_datang: receivingIssues.slice(0, 10)
+        selisih_barang_datang: receivingIssues.slice(0, 10),
+        reservasi_mendatang: reservasiMendatang
       });
 
       let answerText;
