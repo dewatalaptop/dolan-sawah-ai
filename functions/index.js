@@ -144,16 +144,18 @@ async function cleanupStaleMirrors(sourceCollectionName, liveSourceIds) {
 }
 
 // ============================================================
-// sendFollowUpReminders: tiap pagi, cek decisions_log untuk follow-up
-// yang jatuh tempo (followUpNeeded=true, followUpDate<=hari ini,
-// belum dinotifikasi), kirim satu email ringkasan lewat extension
-// "Trigger Email from Firestore" (nulis ke collection `mail`), lalu
-// tandai followUpNotified=true supaya tidak dikirim ulang besok.
+// checkFollowUpNotifications: tiap pagi, cek decisions_log untuk
+// follow-up yang jatuh tempo (followUpNeeded=true, followUpDate<=hari
+// ini, belum dimunculkan sebagai notifikasi), buat satu dokumen di
+// collection `notifications` per follow-up (dibaca UI lewat badge
+// lonceng), lalu tandai followUpNotified=true supaya tidak dibuat
+// ulang besok. Satu batch atomic -- tidak ada risiko "sudah ditandai
+// tapi belum benar-benar muncul" seperti versi email sebelumnya,
+// karena semuanya cuma tulis ke Firestore sendiri (tidak bergantung
+// pada layanan pengiriman eksternal).
 // ============================================================
 
-const FOLLOW_UP_RECIPIENT = "dewatalaptop@gmail.com";
-
-exports.sendFollowUpReminders = onSchedule(
+exports.checkFollowUpNotifications = onSchedule(
   {
     schedule: "0 7 * * *",
     timeZone: "Asia/Jakarta",
@@ -170,27 +172,25 @@ exports.sendFollowUpReminders = onSchedule(
       .get();
 
     if (snapshot.empty) {
-      logger.info("sendFollowUpReminders: tidak ada follow-up jatuh tempo hari ini.");
+      logger.info("checkFollowUpNotifications: tidak ada follow-up jatuh tempo hari ini.");
       return;
     }
 
     const batch = ownDb.batch();
-    const lines = snapshot.docs.map((doc) => {
+    snapshot.docs.forEach((doc) => {
       const data = doc.data();
       batch.update(doc.ref, { followUpNotified: true });
-      return `- [${data.followUpDate}] ${data.followUpNote || "(tanpa catatan)"}\n  Konteks: ${data.userMessage || "-"}`;
+      batch.set(ownDb.collection("notifications").doc(), {
+        decisionId: doc.id,
+        message: data.followUpNote || data.userMessage || "Follow-up perlu ditindaklanjuti",
+        dueDate: data.followUpDate,
+        createdAt: admin.firestore.FieldValue.serverTimestamp(),
+        read: false
+      });
     });
     await batch.commit();
 
-    await ownDb.collection("mail").add({
-      to: [FOLLOW_UP_RECIPIENT],
-      message: {
-        subject: `Dolan Sawah AI -- ${snapshot.size} follow-up jatuh tempo hari ini`,
-        text: `Follow-up yang perlu ditindaklanjuti hari ini (${today}):\n\n${lines.join("\n\n")}`
-      }
-    });
-
-    logger.info(`sendFollowUpReminders selesai: ${snapshot.size} follow-up dikirim & ditandai notified.`);
+    logger.info(`checkFollowUpNotifications selesai: ${snapshot.size} notifikasi dibuat.`);
   }
 );
 

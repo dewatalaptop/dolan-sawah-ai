@@ -25,7 +25,9 @@ export const COLLECTIONS = {
 
   ACTIVITY_LOG: "activity_log",
 
-  DECISIONS_LOG: "decisions_log"
+  DECISIONS_LOG: "decisions_log",
+
+  NOTIFICATIONS: "notifications"
 };
 
 // ============================================================
@@ -223,6 +225,22 @@ export function createDecisionLog(data = {}) {
     followUpNote: data.followUpNote || "",
     followUpDate: data.followUpDate || "",
     followUpNotified: false
+  };
+}
+
+// ============================================================
+// NOTIFICATION (Agent Core -- follow-up yang jatuh tempo, dibuat
+// oleh Cloud Function terjadwal `checkFollowUpNotifications` dari
+// decisions_log, ditampilkan sebagai badge lonceng di UI)
+// ============================================================
+
+export function createNotification(data = {}) {
+  return {
+    decisionId: data.decisionId || "",
+    message: data.message || "",
+    dueDate: data.dueDate || "",
+    createdAt: new Date().toISOString(),
+    read: false
   };
 }
 

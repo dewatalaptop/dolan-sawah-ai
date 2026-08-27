@@ -1816,6 +1816,29 @@ export default function App() {
     setActivityLog(list);
   }
 
+  /* =======================================================
+     NOTIFIKASI FOLLOW-UP (dibuat oleh Cloud Function
+     checkFollowUpNotifications dari decisions_log)
+     ======================================================= */
+
+  const [notifications, setNotifications] = useState([]);
+  const [notifBannerExpanded, setNotifBannerExpanded] = useState(false);
+
+  async function loadNotifications() {
+    const snapshot = await getDocs(
+      query(collection(db, COLLECTIONS.NOTIFICATIONS), where("read", "==", false))
+    );
+    const list = snapshot.docs
+      .map((d) => ({ id: d.id, ...d.data() }))
+      .sort((a, b) => (a.dueDate < b.dueDate ? 1 : -1));
+    setNotifications(list);
+  }
+
+  async function dismissNotification(id) {
+    await updateDoc(doc(db, COLLECTIONS.NOTIFICATIONS, id), { read: true });
+    setNotifications((prev) => prev.filter((n) => n.id !== id));
+  }
+
   // Bungkus saveRows: mengurus progress (%) dan mencatat aksi ke riwayat
   // aktivitas supaya bisa di-undo nanti. Dipakai di semua titik simpan data
   // (chat, import Excel, import WhatsApp) -- satu tempat, konsisten.
@@ -2243,7 +2266,7 @@ export default function App() {
     queueMicrotask(() => {
       setDataLoading(true);
       setDataLoadError("");
-      Promise.all([checkConnection(), refreshData(), loadCategories(), loadActivityLog()])
+      Promise.all([checkConnection(), refreshData(), loadCategories(), loadActivityLog(), loadNotifications()])
         .catch((error) => {
           console.error("Gagal memuat data awal:", error);
           setDataLoadError(error?.message || "Gagal memuat data dari Firestore.");
@@ -5081,6 +5104,40 @@ export default function App() {
               <ul className="ops-alert-banner-list">
                 {opsAlerts.map((issue, i) => (
                   <li key={i}>{issue.message}</li>
+                ))}
+              </ul>
+            )}
+          </div>
+        )}
+
+        {notifications.length > 0 && (
+          <div className="followup-notif-banner">
+            <div
+              className="followup-notif-banner-header"
+              onClick={() => setNotifBannerExpanded((v) => !v)}
+            >
+              <span className="followup-notif-banner-icon">🔔</span>
+              <span className="followup-notif-banner-title">
+                {notifications.length} follow-up perlu ditindaklanjuti
+              </span>
+              <span className="followup-notif-banner-toggle">
+                {notifBannerExpanded ? "Sembunyikan ▲" : "Lihat detail ▼"}
+              </span>
+            </div>
+            {notifBannerExpanded && (
+              <ul className="followup-notif-banner-list">
+                {notifications.map((n) => (
+                  <li key={n.id}>
+                    <span>
+                      [{n.dueDate}] {n.message}
+                    </span>
+                    <button
+                      className="followup-notif-dismiss"
+                      onClick={() => dismissNotification(n.id)}
+                    >
+                      ✓ Selesai
+                    </button>
+                  </li>
                 ))}
               </ul>
             )}
