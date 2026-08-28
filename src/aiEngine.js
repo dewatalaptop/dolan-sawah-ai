@@ -7,10 +7,12 @@ import OpenAI from "openai";
 import { toLocalISODate } from "./dateUtils";
 
 const API_KEY = import.meta.env.VITE_ZAI_API_KEY;
-// glm-4.7-flash: generasi lebih baru dari glm-4.5-flash, tetap gratis
-// (dicek di docs.z.ai/guides/overview/pricing, 2026-08-28) -- upgrade
-// tanpa biaya tambahan, bukan pindah ke tier berbayar.
-const MODEL_NAME = import.meta.env.VITE_ZAI_MODEL || "glm-4.7-flash";
+// Sempat coba glm-4.7-flash (sama-sama gratis, generasi lebih baru)
+// tapi tier gratisnya jauh lebih padat -- diukur langsung via network
+// log dalam 2 hari pemakaian, ~70-80% percobaan gagal 429/503 vs
+// glm-4.5-flash yang jauh lebih stabil. Balik ke glm-4.5-flash atas
+// pilihan pemilik sampai kepadatan 4.7-flash reda (kalau reda).
+const MODEL_NAME = import.meta.env.VITE_ZAI_MODEL || "glm-4.5-flash";
 const BASE_URL = "https://api.z.ai/api/paas/v4/";
 
 const client = API_KEY
