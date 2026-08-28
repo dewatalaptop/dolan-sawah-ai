@@ -17,6 +17,8 @@ export const READ_TOOL_NAMES = [
   "getTodoList",
   "getReservationPatterns",
   "getVarianceTrend",
+  "getKpiStatus",
+  "getRecentPriceChanges",
   "flagFollowUp",
   "logRecommendations"
 ];
@@ -150,6 +152,42 @@ export const AGENT_TOOLS = [
             enum: ["harian", "mingguan", "bulanan", "semua"],
             description: "Filter periode tugas. Default semua kalau tidak disebutkan."
           }
+        },
+        required: []
+      }
+    }
+  },
+  {
+    type: "function",
+    function: {
+      name: "getKpiStatus",
+      description:
+        "Bandingkan kondisi bisnis SAAT INI (omzet bulan berjalan, rata-rata variance %, tingkat penyelesaian " +
+        "tugas) dengan TARGET yang sudah ditetapkan pemilik di halaman Pengaturan. Kalau target belum diset " +
+        "untuk suatu ukuran, statusnya \"target_belum_diset\" -- jangan berlagak ada target kalau memang belum " +
+        "ada. Pakai ini untuk pertanyaan \"apakah saya sudah capai target\" atau sebagai bagian analisa MODE " +
+        "BUSINESS COACH.",
+      parameters: {
+        type: "object",
+        properties: {
+          outlet: { type: "string", enum: OUTLET_ENUM, description: "Kode outlet, atau ALL untuk gabungan semua outlet." }
+        },
+        required: []
+      }
+    }
+  },
+  {
+    type: "function",
+    function: {
+      name: "getRecentPriceChanges",
+      description:
+        "Ambil daftar bahan yang harganya berubah dalam beberapa hari terakhir (naik/turun), diurutkan dari " +
+        "perubahan persentase terbesar. Pakai untuk pertanyaan soal kenaikan/penurunan harga bahan belakangan " +
+        "ini, atau sebagai bagian ringkasan harian.",
+      parameters: {
+        type: "object",
+        properties: {
+          hariTerakhir: { type: "number", description: "Jumlah hari terakhir yang dicek. Default 14 kalau tidak disebutkan." }
         },
         required: []
       }

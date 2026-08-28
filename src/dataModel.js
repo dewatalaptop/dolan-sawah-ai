@@ -31,8 +31,15 @@ export const COLLECTIONS = {
 
   TODOS: "todos",
 
-  VARIANCE_HISTORY: "variance_history"
+  VARIANCE_HISTORY: "variance_history",
+
+  SETTINGS: "settings"
 };
+
+// Dokumen tunggal (fixed ID) di collection settings -- bukan banyak
+// dokumen kayak koleksi lain, cuma satu konfigurasi bisnis yang
+// di-overwrite (setDoc) tiap disimpan lewat halaman Pengaturan.
+export const BUSINESS_SETTINGS_DOC_ID = "business";
 
 // ============================================================
 // CHAT MESSAGE (riwayat chat, dikelompokkan per tanggal)
@@ -298,6 +305,23 @@ export function createVarianceSnapshot(data = {}) {
     variance: data.variance === null || data.variance === undefined ? null : Number(data.variance),
     unit: data.unit || "",
     createdAt: new Date().toISOString()
+  };
+}
+
+// ============================================================
+// BUSINESS SETTINGS (konteks bisnis bebas teks + target KPI --
+// diisi pemilik lewat halaman Pengaturan, dipakai Agent Core supaya
+// saran/analisa tidak generik dan bisa membandingkan kondisi nyata
+// vs target yang pemilik tetapkan sendiri.)
+// ============================================================
+
+export function createBusinessSettings(data = {}) {
+  return {
+    businessContext: data.businessContext || "",
+    targetOmzetBulanan: data.targetOmzetBulanan ?? null,
+    targetVarianceMaxPercent: data.targetVarianceMaxPercent ?? null,
+    targetTodoCompletionRate: data.targetTodoCompletionRate ?? null,
+    updatedAt: new Date().toISOString()
   };
 }
 

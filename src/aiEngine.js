@@ -7,7 +7,10 @@ import OpenAI from "openai";
 import { toLocalISODate } from "./dateUtils";
 
 const API_KEY = import.meta.env.VITE_ZAI_API_KEY;
-const MODEL_NAME = import.meta.env.VITE_ZAI_MODEL || "glm-4.5-flash";
+// glm-4.7-flash: generasi lebih baru dari glm-4.5-flash, tetap gratis
+// (dicek di docs.z.ai/guides/overview/pricing, 2026-08-28) -- upgrade
+// tanpa biaya tambahan, bukan pindah ke tier berbayar.
+const MODEL_NAME = import.meta.env.VITE_ZAI_MODEL || "glm-4.7-flash";
 const BASE_URL = "https://api.z.ai/api/paas/v4/";
 
 const client = API_KEY
@@ -146,7 +149,9 @@ const AGENT_SYSTEM_PROMPT =
   "1. getTodoList (status semua) DULUAN -- cek apakah ada rekomendasi dari analisa SEBELUMNYA (tugas dengan " +
   "sumber saran_ai_sebelumnya) yang masih belum selesai. Kalau ada, itu WAJIB disebutkan di jawaban -- jangan " +
   "kasih saran baru yang isinya mengulang saran lama yang belum sempat dikerjakan; tegaskan progresnya dulu.\n" +
-  "2. getSalesSummary, getVarianceReport, getReservationForecast -- kondisi operasional terkini.\n" +
+  "2. getSalesSummary, getVarianceReport, getReservationForecast, getKpiStatus -- kondisi operasional terkini " +
+  "dan posisinya terhadap target yang pemilik tetapkan (kalau ada -- getKpiStatus akan bilang " +
+  "\"target_belum_diset\" kalau belum, jangan berlagak ada target yang tidak ada).\n" +
   "3. getReservationPatterns dan getVarianceTrend -- pola historis (hari ramai/sepi, item yang berulang kali " +
   "bermasalah). Kalau datanya masih tipis (jumlah_hari_data atau jumlah_data kecil), katakan itu terus terang " +
   "sebagai keterbatasan data, jangan berlagak yakin dari sampel kecil.\n" +
@@ -160,7 +165,13 @@ const AGENT_SYSTEM_PROMPT =
   "(d) Follow-up -- kalau ada hal yang perlu dicek ulang nanti, tawarkan untuk dicatat lewat tool flagFollowUp. " +
   "SETELAH menulis (c), WAJIB panggil tool logRecommendations dengan daftar rekomendasi yang baru saja " +
   "ditulis di (c), supaya bisa dipantau progresnya di analisa berikutnya (lihat langkah 1) -- ini yang membuat " +
-  "coaching-nya makin tajam tiap kali dipakai, bukan mengulang dari nol setiap saat.";
+  "coaching-nya makin tajam tiap kali dipakai, bukan mengulang dari nol setiap saat.\n\n" +
+  "MODE RINGKASAN HARIAN: kalau pengguna cuma minta ringkasan/briefing harian yang CEPAT (mis. \"ringkasan hari " +
+  "ini\", bukan minta analisa/saran pengembangan), JANGAN ikuti daftar tool wajib MODE BUSINESS COACH di atas -- " +
+  "itu untuk analisa mendalam dan sengaja berat/lama. Cukup panggil 2-3 tool yang relevan saja (biasanya " +
+  "getReservationForecast untuk hari ini, getTodoList status belum_selesai, getRecentPriceChanges), lalu jawab " +
+  "singkat dalam beberapa poin, TANPA logRecommendations dan TANPA struktur (a)-(d) di atas -- ini mode cepat, " +
+  "bukan laporan lengkap.";
 
 const HARI_ID = ["Minggu", "Senin", "Selasa", "Rabu", "Kamis", "Jumat", "Sabtu"];
 
@@ -185,15 +196,26 @@ function buildDateContextMessage() {
   };
 }
 
-export function buildAgentInitialMessages(userMessage) {
+export function buildAgentInitialMessages(userMessage, businessContext) {
   // Konteks tanggal TIDAK disimpan di sini -- runAgentLoop() menambahkan
   // pesan tanggal segar ke tiap panggilan API (lihat komentar di sana),
   // jadi cukup ditambahkan sekali per panggilan, bukan disimpan permanen
   // dan ikut menumpuk di riwayat percakapan yang panjang.
-  return [
-    { role: "system", content: AGENT_SYSTEM_PROMPT },
-    { role: "user", content: userMessage }
-  ];
+  const messages = [{ role: "system", content: AGENT_SYSTEM_PROMPT }];
+
+  // Konteks bisnis (target margin, karakter tiap outlet, pola musiman,
+  // dst.) diisi pemilik sendiri lewat halaman Pengaturan -- beda dari
+  // konteks tanggal, ini tidak berubah dalam satu sesi jadi cukup
+  // sekali di awal, tidak perlu di-refresh tiap putaran.
+  if (businessContext && businessContext.trim()) {
+    messages.push({
+      role: "system",
+      content: `KONTEKS BISNIS DARI PEMILIK (jadikan dasar analisa/saran, jangan diabaikan):\n${businessContext.trim()}`
+    });
+  }
+
+  messages.push({ role: "user", content: userMessage });
+  return messages;
 }
 
 // executeTool(name, args) -> Promise<any> (hasil JSON-serializable, dipakai

@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { collection, addDoc, getDocs, query, limit, where, doc, writeBatch, updateDoc, deleteDoc, setDoc } from "firebase/firestore";
+import { collection, addDoc, getDocs, getDoc, query, limit, where, doc, writeBatch, updateDoc, deleteDoc, setDoc } from "firebase/firestore";
 import {
   onAuthStateChanged,
   signInWithEmailAndPassword,
@@ -23,7 +23,9 @@ import {
   createActivityLog,
   createDecisionLog,
   createTodo,
-  createVarianceSnapshot
+  createVarianceSnapshot,
+  createBusinessSettings,
+  BUSINESS_SETTINGS_DOC_ID
 } from "./dataModel";
 
 import {
@@ -34,7 +36,7 @@ import {
 
 import { saveRecipe, updateRecipe, deleteRecipe, calculateUsageFromSales } from "./recipeEngine";
 
-import { getPriceHistory, savePrice, getCurrentPrice } from "./priceEngine";
+import { getPriceHistory, savePrice, getCurrentPrice, comparePrices } from "./priceEngine";
 
 import { processExcelFile } from "./excelEngine";
 
@@ -111,7 +113,8 @@ const MENU = [
   { id: "import", label: "Import Excel", icon: "upload" },
   { id: "import-wa", label: "Import Chat WA", icon: "chat" },
   { id: "riwayat", label: "Riwayat Aktivitas", icon: "trend" },
-  { id: "laporan", label: "Laporan AI", icon: "doc" }
+  { id: "laporan", label: "Laporan AI", icon: "doc" },
+  { id: "pengaturan", label: "Pengaturan", icon: "tag" }
 ];
 
 const MOBILE_NAV = ["chat", "dashboard", "kebutuhan", "variance"];
@@ -2102,6 +2105,50 @@ export default function App() {
     setUpcomingReservations(snapshot.docs.map((d) => d.data()));
   }
 
+  /* =======================================================
+     PENGATURAN BISNIS (konteks bebas teks + target KPI) --
+     dokumen tunggal, dipakai Agent Core untuk konteks & tool
+     getKpiStatus.
+     ======================================================= */
+
+  const [businessSettings, setBusinessSettings] = useState(createBusinessSettings());
+  const [settingsFormBusy, setSettingsFormBusy] = useState(false);
+  const [settingsForm, setSettingsForm] = useState({
+    businessContext: "",
+    targetOmzetBulanan: "",
+    targetVarianceMaxPercent: "",
+    targetTodoCompletionRate: ""
+  });
+
+  useEffect(() => {
+    setSettingsForm({
+      businessContext: businessSettings.businessContext || "",
+      targetOmzetBulanan: businessSettings.targetOmzetBulanan ?? "",
+      targetVarianceMaxPercent: businessSettings.targetVarianceMaxPercent ?? "",
+      targetTodoCompletionRate: businessSettings.targetTodoCompletionRate ?? ""
+    });
+  }, [businessSettings]);
+
+  async function loadBusinessSettings() {
+    const snap = await getDoc(doc(db, COLLECTIONS.SETTINGS, BUSINESS_SETTINGS_DOC_ID));
+    if (snap.exists()) setBusinessSettings({ ...createBusinessSettings(), ...snap.data() });
+  }
+
+  async function saveBusinessSettings(next) {
+    setSettingsFormBusy(true);
+    try {
+      const data = createBusinessSettings(next);
+      await setDoc(doc(db, COLLECTIONS.SETTINGS, BUSINESS_SETTINGS_DOC_ID), data);
+      setBusinessSettings(data);
+      showToast("Pengaturan bisnis tersimpan.", "success");
+    } catch (error) {
+      console.error(error);
+      showToast("Gagal menyimpan pengaturan: " + (error?.message || "unknown error"));
+    } finally {
+      setSettingsFormBusy(false);
+    }
+  }
+
   async function loadTodos() {
     const snapshot = await getDocs(collection(db, COLLECTIONS.TODOS));
     const list = snapshot.docs
@@ -2623,7 +2670,8 @@ export default function App() {
         loadActivityLog(),
         loadNotifications(),
         loadTodos(),
-        loadUpcomingReservations()
+        loadUpcomingReservations(),
+        loadBusinessSettings()
       ])
         .catch((error) => {
           console.error("Gagal memuat data awal:", error);
@@ -2894,6 +2942,97 @@ export default function App() {
         };
       }
 
+      case "getKpiStatus": {
+        const targets = businessSettings || {};
+        const now = new Date();
+        const monthPrefix = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}`;
+        const salesThisMonth = rawData.sales.filter(
+          (s) => String(s.date || "").startsWith(monthPrefix) && (outlet === "ALL" || (s.outlet || "DS") === outlet)
+        );
+        const omzetBulanIni = Math.round(computeRevenue(salesThisMonth, rawData.recipes));
+
+        const varianceItemsForKpi = varianceReport.items.filter((x) => outlet === "ALL" || x.outlet === outlet);
+        const avgVariancePercent = varianceItemsForKpi.length
+          ? Math.round(
+              (varianceItemsForKpi.reduce((s, x) => s + Math.abs(x.variance / (x.theoretical || 1)) * 100, 0) /
+                varianceItemsForKpi.length) *
+                10
+            ) / 10
+          : null;
+
+        const dueTodos = todos.filter((t) => t.dueDate <= getTodayISO());
+        const todoCompletionPercent = dueTodos.length
+          ? Math.round((dueTodos.filter((t) => t.done).length / dueTodos.length) * 1000) / 10
+          : null;
+
+        const statusOf = (target, actual, higherIsBetter) => {
+          if (target === null || target === undefined || actual === null) return "target_belum_diset";
+          return higherIsBetter ? (actual >= target ? "tercapai" : "belum_tercapai") : (actual <= target ? "tercapai" : "melebihi_target");
+        };
+
+        return {
+          outlet,
+          omzet: {
+            target_bulanan: targets.targetOmzetBulanan ?? null,
+            aktual_bulan_ini: omzetBulanIni,
+            status: statusOf(targets.targetOmzetBulanan, omzetBulanIni, true)
+          },
+          variance: {
+            target_maksimal_persen: targets.targetVarianceMaxPercent ?? null,
+            rata_rata_aktual_persen: avgVariancePercent,
+            status: statusOf(targets.targetVarianceMaxPercent, avgVariancePercent, false)
+          },
+          penyelesaian_tugas: {
+            target_persen: targets.targetTodoCompletionRate ?? null,
+            aktual_persen: todoCompletionPercent,
+            status: statusOf(targets.targetTodoCompletionRate, todoCompletionPercent, true)
+          },
+          catatan: !targets.targetOmzetBulanan && !targets.targetVarianceMaxPercent && !targets.targetTodoCompletionRate
+            ? "Belum ada target KPI yang diset pemilik di halaman Pengaturan -- tawarkan untuk membantu menetapkan target kalau relevan."
+            : ""
+        };
+      }
+
+      case "getRecentPriceChanges": {
+        const days = Number(args.hariTerakhir) || 14;
+        const cutoff = new Date();
+        cutoff.setDate(cutoff.getDate() - days);
+        const cutoffISO = toLocalISODate(cutoff);
+
+        const byItem = new Map();
+        priceHistory.forEach((p) => {
+          if (!byItem.has(p.itemName)) byItem.set(p.itemName, []);
+          byItem.get(p.itemName).push(p);
+        });
+
+        const changes = [];
+        byItem.forEach((entries, itemName) => {
+          const sorted = entries.slice().sort((a, b) => (a.effectiveDate < b.effectiveDate ? -1 : 1));
+          const firstRecentIdx = sorted.findIndex((e) => e.effectiveDate >= cutoffISO);
+          if (firstRecentIdx <= 0) return;
+          const previous = sorted[firstRecentIdx - 1];
+          const latest = sorted[sorted.length - 1];
+          const cmp = comparePrices(previous, latest);
+          if (cmp && cmp.percentage !== null && Math.abs(cmp.percentage) > 0.01) {
+            changes.push({
+              bahan: itemName,
+              harga_lama: cmp.oldPrice,
+              harga_baru: cmp.newPrice,
+              perubahan_persen: Math.round(cmp.percentage * 10) / 10,
+              tanggal_berlaku: latest.effectiveDate,
+              satuan: latest.unit
+            });
+          }
+        });
+        changes.sort((a, b) => Math.abs(b.perubahan_persen) - Math.abs(a.perubahan_persen));
+
+        return {
+          hari_terakhir: days,
+          jumlah_perubahan: changes.length,
+          daftar: changes.slice(0, 10)
+        };
+      }
+
       case "getReservationPatterns": {
         const snap = await getDocs(collection(db, "reservations_mirror"));
         const rows = snap.docs
@@ -3069,7 +3208,7 @@ export default function App() {
   }
 
   async function runAgentTurn(userMessage) {
-    const messages = buildAgentInitialMessages(userMessage);
+    const messages = buildAgentInitialMessages(userMessage, businessSettings?.businessContext);
     const result = await runAgentLoop({ messages, tools: AGENT_TOOLS, executeTool: executeAgentTool, isWriteTool });
 
     if (result.status === "pending_approval") {
@@ -5249,6 +5388,90 @@ export default function App() {
     );
   }
 
+  function renderPengaturan() {
+    return (
+      <div className="page">
+        <div className="section-header">
+          <div>
+            <h1>Pengaturan</h1>
+            <p>
+              Konteks bisnis dan target KPI di sini dipakai Agent Core supaya analisa/saran (mis. tombol "Saran
+              Pengembangan") tidak generik -- disesuaikan dengan bisnis Anda yang sebenarnya, dan bisa
+              membandingkan kondisi nyata dengan target yang Anda tetapkan sendiri.
+            </p>
+          </div>
+        </div>
+
+        <div className="card">
+          <div className="card-title">Konteks Bisnis</div>
+          <div className="card-description">
+            Tulis bebas apa saja yang menurut Anda penting supaya AI paham bisnis ini -- mis. target margin,
+            karakter tiap outlet (DS/SS/SP), pola musiman, menu andalan, atau apa pun. Tidak wajib diisi.
+          </div>
+          <textarea
+            value={settingsForm.businessContext}
+            onChange={(e) => setSettingsForm((prev) => ({ ...prev, businessContext: e.target.value }))}
+            placeholder='Contoh: "SS ramai anak muda malam hari, DS keluarga siang hari. Target margin minimal 35%. Musim liburan sekolah omzet biasanya naik 20%."'
+            rows={6}
+            style={{ width: "100%", padding: "10px 12px", borderRadius: 8, border: "1px solid #ddd", fontFamily: "inherit", fontSize: 13.5, resize: "vertical", marginTop: 10 }}
+          />
+        </div>
+
+        <div className="card">
+          <div className="card-title">Target KPI</div>
+          <div className="card-description">Kosongkan kalau belum mau menetapkan target untuk ukuran tertentu.</div>
+          <div style={{ display: "flex", flexDirection: "column", gap: 14, marginTop: 10 }}>
+            <label style={{ display: "flex", flexDirection: "column", gap: 4, fontSize: 13 }}>
+              Target Omzet Bulanan (Rp)
+              <input
+                type="number"
+                value={settingsForm.targetOmzetBulanan}
+                onChange={(e) => setSettingsForm((prev) => ({ ...prev, targetOmzetBulanan: e.target.value }))}
+                placeholder="mis. 50000000"
+                style={{ padding: "8px 10px", borderRadius: 8, border: "1px solid #ddd", maxWidth: 280 }}
+              />
+            </label>
+            <label style={{ display: "flex", flexDirection: "column", gap: 4, fontSize: 13 }}>
+              Target Variance Maksimal (%)
+              <input
+                type="number"
+                value={settingsForm.targetVarianceMaxPercent}
+                onChange={(e) => setSettingsForm((prev) => ({ ...prev, targetVarianceMaxPercent: e.target.value }))}
+                placeholder="mis. 5"
+                style={{ padding: "8px 10px", borderRadius: 8, border: "1px solid #ddd", maxWidth: 280 }}
+              />
+            </label>
+            <label style={{ display: "flex", flexDirection: "column", gap: 4, fontSize: 13 }}>
+              Target Tingkat Penyelesaian Tugas (%)
+              <input
+                type="number"
+                value={settingsForm.targetTodoCompletionRate}
+                onChange={(e) => setSettingsForm((prev) => ({ ...prev, targetTodoCompletionRate: e.target.value }))}
+                placeholder="mis. 80"
+                style={{ padding: "8px 10px", borderRadius: 8, border: "1px solid #ddd", maxWidth: 280 }}
+              />
+            </label>
+          </div>
+        </div>
+
+        <button
+          className="primary-button"
+          disabled={settingsFormBusy}
+          onClick={() =>
+            saveBusinessSettings({
+              businessContext: settingsForm.businessContext,
+              targetOmzetBulanan: settingsForm.targetOmzetBulanan === "" ? null : Number(settingsForm.targetOmzetBulanan),
+              targetVarianceMaxPercent: settingsForm.targetVarianceMaxPercent === "" ? null : Number(settingsForm.targetVarianceMaxPercent),
+              targetTodoCompletionRate: settingsForm.targetTodoCompletionRate === "" ? null : Number(settingsForm.targetTodoCompletionRate)
+            })
+          }
+        >
+          {settingsFormBusy ? "Menyimpan..." : "Simpan Pengaturan"}
+        </button>
+      </div>
+    );
+  }
+
   function renderRiwayat() {
     return (
       <div className="page">
@@ -5492,6 +5715,7 @@ export default function App() {
       case "riwayat": return renderRiwayat();
       case "todo": return renderTodo();
       case "laporan": return renderLaporan();
+      case "pengaturan": return renderPengaturan();
       default: return null;
     }
   }
@@ -5957,6 +6181,15 @@ export default function App() {
               <button onClick={() => quickAction(`Penjualan hari ini ${chatOutlet}\nAyam Bakar 45 porsi\nAyam Geprek 32 porsi`)}>Penjualan</button>
               <button onClick={() => quickAction(`Stock opname hari ini ${chatOutlet}\nAyam 28 kg`)}>Stock Opname</button>
               <button onClick={() => quickAction("Apa saja yang perlu dibeli besok?")}>Kebutuhan Besok</button>
+              <button
+                onClick={() =>
+                  quickAction(
+                    "Beri saya ringkasan hari ini: reservasi hari ini, tugas yang mendesak/terlambat, dan perubahan harga bahan belakangan ini. Ringkas saja, tidak perlu analisa panjang."
+                  )
+                }
+              >
+                Ringkasan Hari Ini
+              </button>
               <button
                 onClick={() =>
                   quickAction(
