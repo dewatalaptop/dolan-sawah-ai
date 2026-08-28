@@ -8,6 +8,14 @@
         { "fieldPath": "followUpNotified", "order": "ASCENDING" },
         { "fieldPath": "followUpDate", "order": "ASCENDING" }
       ]
+    },
+    {
+      "collectionGroup": "todos",
+      "queryScope": "COLLECTION",
+      "fields": [
+        { "fieldPath": "done", "order": "ASCENDING" },
+        { "fieldPath": "dueDate", "order": "ASCENDING" }
+      ]
     }
   ],
   "fieldOverrides": []

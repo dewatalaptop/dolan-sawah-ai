@@ -27,7 +27,9 @@ export const COLLECTIONS = {
 
   DECISIONS_LOG: "decisions_log",
 
-  NOTIFICATIONS: "notifications"
+  NOTIFICATIONS: "notifications",
+
+  TODOS: "todos"
 };
 
 // ============================================================
@@ -241,6 +243,26 @@ export function createNotification(data = {}) {
     dueDate: data.dueDate || "",
     createdAt: new Date().toISOString(),
     read: false
+  };
+}
+
+// ============================================================
+// TODO (tugas harian/mingguan/bulanan pemilik -- sekali selesai per
+// periode, bukan berulang otomatis. dueDate dipakai seragam untuk
+// harian/mingguan/bulanan supaya pengingat terlambat bisa query satu
+// field saja, period cuma label tampilan/pengelompokan.)
+// ============================================================
+
+export function createTodo(data = {}) {
+  return {
+    title: data.title || "",
+    notes: data.notes || "",
+    period: data.period || "harian", // "harian" | "mingguan" | "bulanan"
+    dueDate: data.dueDate || "",
+    outlet: data.outlet || "ALL",
+    done: !!data.done,
+    doneAt: data.doneAt || null,
+    createdAt: new Date().toISOString()
   };
 }
 

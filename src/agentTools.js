@@ -14,6 +14,7 @@ export const READ_TOOL_NAMES = [
   "getRecipeCost",
   "getSalesSummary",
   "getReservationForecast",
+  "getTodoList",
   "flagFollowUp"
 ];
 
@@ -111,14 +112,41 @@ export const AGENT_TOOLS = [
     function: {
       name: "getReservationForecast",
       description:
-        "Ambil daftar reservasi (confirmed & pending) untuk outlet dan rentang tanggal tertentu, dari data " +
-        "sinkronisasi reservasi -- pakai ini untuk memperkirakan beban dapur mendatang.",
+        "Ambil daftar reservasi (confirmed & pending, termasuk nama, jam, jumlah tamu, dan nomor HP) untuk " +
+        "outlet dan rentang tanggal tertentu, dari data sinkronisasi reservasi -- pakai ini untuk menjawab " +
+        "pertanyaan soal reservasi (mis. \"reservasi besok apa saja\") maupun untuk memperkirakan beban dapur.",
       parameters: {
         type: "object",
         properties: {
           outlet: { type: "string", enum: OUTLET_ENUM, description: "Kode outlet, atau ALL untuk gabungan semua outlet." },
           dariTanggal: { type: "string", description: "Tanggal mulai, format YYYY-MM-DD. Default hari ini." },
           sampaiTanggal: { type: "string", description: "Tanggal akhir, format YYYY-MM-DD. Default 14 hari dari sekarang." }
+        },
+        required: []
+      }
+    }
+  },
+  {
+    type: "function",
+    function: {
+      name: "getTodoList",
+      description:
+        "Ambil daftar tugas (to-do) pemilik -- harian/mingguan/bulanan, sekali selesai per periode (bukan " +
+        "berulang otomatis). Pakai ini untuk pertanyaan soal tugas apa yang sudah/belum dikerjakan, mis. " +
+        "\"tugas minggu ini apa aja yang belum selesai?\".",
+      parameters: {
+        type: "object",
+        properties: {
+          status: {
+            type: "string",
+            enum: ["belum_selesai", "selesai", "semua"],
+            description: "Filter status tugas. Default belum_selesai kalau tidak disebutkan."
+          },
+          period: {
+            type: "string",
+            enum: ["harian", "mingguan", "bulanan", "semua"],
+            description: "Filter periode tugas. Default semua kalau tidak disebutkan."
+          }
         },
         required: []
       }

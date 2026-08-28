@@ -21,7 +21,8 @@ import {
   createAdjustment,
   createChatMessage,
   createActivityLog,
-  createDecisionLog
+  createDecisionLog,
+  createTodo
 } from "./dataModel";
 
 import {
@@ -42,7 +43,7 @@ import { findSimilarName, findPrefixCandidate } from "./similarityEngine";
 
 import { buildReportWorkbook, downloadReportWorkbook, buildFullBackupWorkbook } from "./reportEngine";
 
-import { askAI, buildReportPrompt, analyzeIngredientPairs, buildAgentInitialMessages, runAgentLoop } from "./aiEngine";
+import { analyzeIngredientPairs, buildAgentInitialMessages, runAgentLoop } from "./aiEngine";
 
 import { AGENT_TOOLS, isWriteTool } from "./agentTools";
 
@@ -92,6 +93,7 @@ const OUTLETS = [
 
 const MENU = [
   { id: "chat", label: "AI Assistant", icon: "chat" },
+  { id: "todo", label: "To-Do List", icon: "check" },
   { section: "OPERASIONAL" },
   { id: "dashboard", label: "Dashboard", icon: "grid" },
   { id: "stok-awal", label: "Stok Awal", icon: "box" },
@@ -409,6 +411,10 @@ function detectDataType(text) {
 
   if (t.includes("harga") || t.includes("update harga") || t.includes("price")) {
     return "price";
+  }
+
+  if (t.includes("tugas") || t.includes("to do") || t.includes("todo") || t.includes("agenda")) {
+    return "todo";
   }
 
   if (
@@ -771,6 +777,67 @@ function parsePriceLines(text) {
   }
 
   return result;
+}
+
+/* =========================================================
+   PARSER TO-DO (tugas harian/mingguan/bulanan)
+   dueDate dipakai seragam untuk semua period supaya pengingat
+   keterlambatan bisa query satu field saja -- harian = tanggal yang
+   disebut/hari ini, mingguan = akhir pekan berjalan (Minggu),
+   bulanan = akhir bulan berjalan.
+   ========================================================= */
+
+function endOfWeekISO(base = new Date()) {
+  const d = new Date(base);
+  const day = d.getDay(); // 0=Minggu..6=Sabtu
+  d.setDate(d.getDate() + (day === 0 ? 0 : 7 - day));
+  return toLocalISODate(d);
+}
+
+function endOfMonthISO(base = new Date()) {
+  const d = new Date(base.getFullYear(), base.getMonth() + 1, 0);
+  return toLocalISODate(d);
+}
+
+function detectTodoPeriod(t) {
+  if (t.includes("bulan ini") || t.includes("bulanan")) return "bulanan";
+  if (t.includes("minggu ini") || t.includes("mingguan")) return "mingguan";
+  return "harian";
+}
+
+function parseTodoLines(text) {
+  const lower = normalizeText(text);
+  const period = detectTodoPeriod(lower);
+
+  const hasExplicitDate =
+    /\d{1,2}[/-]\d{1,2}[/-]\d{4}/.test(text) ||
+    /\d{4}[/-]\d{1,2}[/-]\d{1,2}/.test(text) ||
+    /\d{1,2}\s+(januari|februari|maret|april|mei|juni|juli|agustus|september|oktober|november|desember)\s+\d{4}/i.test(text);
+
+  let dueDate;
+  if (hasExplicitDate) dueDate = extractDate(text);
+  else if (period === "mingguan") dueDate = endOfWeekISO();
+  else if (period === "bulanan") dueDate = endOfMonthISO();
+  else dueDate = extractDate(text);
+
+  // Buang baris header ("tugas hari ini:", "to do minggu ini", dst.) baik
+  // yang berdiri sendiri di baris pertama maupun yang nempel di depan item
+  // pertama dipisah titik dua -- sisanya dianggap daftar judul tugas bebas
+  // (bukan "barang + jumlah" seperti parser lain, jadi tidak perlu satuan).
+  const withoutHeaderLine = String(text)
+    .split(/\n/)
+    .filter((line) => !/^\s*(tugas|to\s?-?\s?do|agenda)\b[^\n]*$/i.test(line.trim()) || /:/.test(line))
+    .map((line) => line.replace(/^\s*(tugas|to\s?-?\s?do|agenda)\b[^:\n]*:\s*/i, ""))
+    .join("\n");
+
+  const items = withoutHeaderLine
+    .split(/\n|;|,\s+(?!\d)/)
+    .map((s) => s.replace(/^[-*•]\s*/, "").trim())
+    .filter(Boolean)
+    .filter((s) => !looksLikeHeaderOrMetaLine(s))
+    .filter((s) => !/^\s*(tugas|to\s?-?\s?do|agenda)\b\s*$/i.test(s));
+
+  return { period, dueDate, items };
 }
 
 /* =========================================================
@@ -1638,7 +1705,8 @@ const ICONS = {
   tag: "M20 12l-8 8-9-9V4h7l10 8zM7 7h.01",
   upload: "M12 16V4M7 9l5-5 5 5M4 16v3a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-3",
   doc: "M6 3h8l4 4v14H6zM14 3v4h4M9 12h6M9 16h6M9 8h2",
-  book: "M4 5c0-1 1-2 3-2h5v16H7c-2 0-3 1-3 2zM12 3h5c2 0 3 1 3 2v14c0-1-1-2-3-2h-5z"
+  book: "M4 5c0-1 1-2 3-2h5v16H7c-2 0-3 1-3 2zM12 3h5c2 0 3 1 3 2v14c0-1-1-2-3-2h-5z",
+  check: "M4 6h13v13H4zM7.5 12.5l2.5 2.5 5-5M17 6V4h3v3"
 };
 
 function Icon({ name, size = 17 }) {
@@ -1906,6 +1974,73 @@ export default function App() {
   async function dismissNotification(id) {
     await updateDoc(doc(db, COLLECTIONS.NOTIFICATIONS, id), { read: true });
     setNotifications((prev) => prev.filter((n) => n.id !== id));
+  }
+
+  /* =======================================================
+     TO-DO LIST (halaman "To-Do" + input lewat chat) -- tugas
+     sekali-selesai-per-periode (harian/mingguan/bulanan), bukan
+     berulang otomatis. Pengingat tugas terlambat/belum selesai
+     dikirim lewat notifications (Cloud Function checkOverdueTodos),
+     dibaca UI lewat bell yang sama dengan follow-up & reservasi.
+     ======================================================= */
+
+  const [todos, setTodos] = useState([]);
+  const [todoFormTitle, setTodoFormTitle] = useState("");
+  const [todoFormPeriod, setTodoFormPeriod] = useState("harian");
+  const [todoFormBusy, setTodoFormBusy] = useState(false);
+  const [todoDeleteConfirmId, setTodoDeleteConfirmId] = useState(null);
+  const [todoFilterPeriod, setTodoFilterPeriod] = useState("semua");
+  const [todoShowDone, setTodoShowDone] = useState(false);
+
+  async function loadTodos() {
+    const snapshot = await getDocs(collection(db, COLLECTIONS.TODOS));
+    const list = snapshot.docs
+      .map((d) => ({ id: d.id, ...d.data() }))
+      .sort((a, b) => (a.dueDate < b.dueDate ? -1 : 1));
+    setTodos(list);
+  }
+
+  async function toggleTodoDone(id, done) {
+    const prev = todos;
+    setTodos((cur) => cur.map((t) => (t.id === id ? { ...t, done, doneAt: done ? new Date().toISOString() : null } : t)));
+    try {
+      await updateDoc(doc(db, COLLECTIONS.TODOS, id), { done, doneAt: done ? new Date().toISOString() : null });
+    } catch (error) {
+      console.error(error);
+      setTodos(prev);
+      showToast("Gagal menyimpan status tugas: " + (error?.message || "unknown error"));
+    }
+  }
+
+  async function addTodoManual() {
+    const title = todoFormTitle.trim();
+    if (!title || todoFormBusy) return;
+    setTodoFormBusy(true);
+    try {
+      const dueDate =
+        todoFormPeriod === "mingguan" ? endOfWeekISO() : todoFormPeriod === "bulanan" ? endOfMonthISO() : getTodayISO();
+      const row = createTodo({ title, period: todoFormPeriod, dueDate, outlet: chatOutlet });
+      const ref = await addDoc(collection(db, COLLECTIONS.TODOS), row);
+      setTodos((prev) => [...prev, { id: ref.id, ...row }]);
+      setTodoFormTitle("");
+    } catch (error) {
+      console.error(error);
+      showToast("Gagal menambah tugas: " + (error?.message || "unknown error"));
+    } finally {
+      setTodoFormBusy(false);
+    }
+  }
+
+  async function deleteTodo(id) {
+    try {
+      await deleteDoc(doc(db, COLLECTIONS.TODOS, id));
+      setTodos((prev) => prev.filter((t) => t.id !== id));
+    } catch (error) {
+      console.error(error);
+      showToast("Gagal menghapus tugas: " + (error?.message || "unknown error"));
+    } finally {
+      setTodoDeleteConfirmId(null);
+    }
   }
 
   // Bungkus saveRows: mengurus progress (%) dan mencatat aksi ke riwayat
@@ -2221,12 +2356,11 @@ export default function App() {
   const [chatDate, setChatDate] = useState(TODAY);
 
   /* =======================================================
-     AGENT CORE -- agentic loop dengan function-calling. Nonaktif
-     secara default (mode Tanya Cepat lama tetap jalan seperti biasa)
-     supaya fitur yang sudah teruji tidak berisiko regresi; pengguna
-     aktifkan sendiri lewat sakelar di halaman chat.
+     AGENT CORE -- agentic loop dengan function-calling. Jalur utama
+     untuk semua pertanyaan/laporan (lihat processMessage) -- AI
+     sendiri yang memilih tool/data yang relevan lewat beberapa
+     putaran kalau perlu, bukan lagi opt-in.
      ======================================================= */
-  const [agentCoreEnabled, setAgentCoreEnabled] = useState(false);
   const [agentPending, setAgentPending] = useState(null); // { toolCalls, messages, toolLog, userMessage }
   const [agentApprovalBusy, setAgentApprovalBusy] = useState(false);
 
@@ -2335,7 +2469,7 @@ export default function App() {
     queueMicrotask(() => {
       setDataLoading(true);
       setDataLoadError("");
-      Promise.all([checkConnection(), refreshData(), loadCategories(), loadActivityLog(), loadNotifications()])
+      Promise.all([checkConnection(), refreshData(), loadCategories(), loadActivityLog(), loadNotifications(), loadTodos()])
         .catch((error) => {
           console.error("Gagal memuat data awal:", error);
           setDataLoadError(error?.message || "Gagal memuat data dari Firestore.");
@@ -2569,15 +2703,37 @@ export default function App() {
           sampai: to,
           jumlah_reservasi: rows.length,
           total_tamu: rows.reduce((s, r) => s + Number(r.jumlah || 0), 0),
-          // nomorHp SENGAJA tidak disertakan -- tool ini untuk perkiraan beban
-          // dapur, tidak perlu data kontak pelanggan.
           daftar: rows.slice(0, 20).map((r) => ({
             nama: r.nama,
             tanggal: r.date,
             jam: r.jam,
             jumlah_tamu: r.jumlah,
             outlet: r.outlet,
-            status: r.status
+            status: r.status,
+            nomor_hp: r.nomorHp || "",
+            catatan: r.tambahan || ""
+          }))
+        };
+      }
+
+      case "getTodoList": {
+        const statusFilter = args.status || "belum_selesai";
+        const periodFilter = args.period || "semua";
+        const snap = await getDocs(collection(db, COLLECTIONS.TODOS));
+        const rows = snap.docs
+          .map((d) => d.data())
+          .filter((t) => statusFilter === "semua" || (statusFilter === "selesai") === !!t.done)
+          .filter((t) => periodFilter === "semua" || t.period === periodFilter)
+          .sort((a, b) => (a.dueDate < b.dueDate ? -1 : 1));
+        return {
+          status: statusFilter,
+          period: periodFilter,
+          jumlah: rows.length,
+          daftar: rows.slice(0, 30).map((t) => ({
+            judul: t.title,
+            periode: t.period,
+            tenggat: t.dueDate,
+            selesai: !!t.done
           }))
         };
       }
@@ -3097,189 +3253,68 @@ export default function App() {
       };
     }
 
-    if (dataType === "report" && agentCoreEnabled) {
-      return await runAgentTurn(text);
-    }
-
-    if (dataType === "report") {
-      const dailyStats = computeDailySalesStats(filteredData.sales, rawData.recipes);
-
-      // Data reservasi (disinkronkan tiap jam dari project reservasi
-      // terpisah ke reservations_mirror) -- diambil di sini, bukan lewat
-      // rawData, karena cuma dipakai untuk konteks laporan/tanya-jawab.
-      let reservasiMendatang = [];
-      try {
-        const resFrom = getTodayISO();
-        const resToDate = new Date();
-        resToDate.setDate(resToDate.getDate() + 14);
-        const resTo = toLocalISODate(resToDate);
-        const resSnap = await getDocs(
-          query(
-            collection(db, "reservations_mirror"),
-            where("date", ">=", resFrom),
-            where("date", "<=", resTo)
-          )
-        );
-        reservasiMendatang = resSnap.docs
-          .map((d) => d.data())
-          .filter((r) => activeOutlet === "ALL" || r.outlet === activeOutlet)
-          .sort((a, b) => `${a.date}${a.jam || ""}`.localeCompare(`${b.date}${b.jam || ""}`))
-          .slice(0, 30)
-          .map((r) => ({
-            nama: r.nama,
-            tanggal: r.date,
-            jam: r.jam,
-            jumlah_tamu: r.jumlah,
-            outlet: r.outlet,
-            status: r.status,
-            nomor_hp: r.nomorHp || "",
-            catatan: r.tambahan || ""
-          }));
-      } catch (error) {
-        console.warn("Gagal memuat data reservasi untuk konteks laporan:", error.message);
-      }
-
-      const ctx = {
-        varianceReport,
-        purchaseSuggestions,
-        avgDailySales,
-        priceHistory,
-        receivingIssues,
-        dailyStats
-      };
-
-      const omzetRataRataPerMenu = Object.fromEntries(
-        Object.entries(avgDailySales).map(([menu, avgQty]) => {
-          const recipe = findRecipeByMenu(menu, rawData.recipes);
-          const price = recipe ? Number(recipe.sellPrice || 0) : 0;
-          return [menu, Math.round(avgQty * price)];
-        })
-      );
-
-      const marginPerMenu = rawData.recipes
-        .filter((r) => Number(r.sellPrice || 0) > 0)
-        .map((r) => {
-          const cost = computeRecipeCost(r, priceHistory);
-          const sellPrice = Number(r.sellPrice || 0);
-          return {
-            menu: r.menuName,
-            harga_jual: sellPrice,
-            estimasi_hpp: cost.complete ? Math.round(cost.totalCost) : null,
-            margin: cost.complete ? Math.round(sellPrice - cost.totalCost) : null
-          };
-        });
-
-      // Total gabungan (semua menu dijumlahkan) untuk jendela 7 hari terakhir --
-      // dihitung di sini, bukan diserahkan ke AI untuk menjumlahkan sendiri
-      // angka per-menu, karena model kecil sering salah hitung penjumlahan.
-      const totalPorsi7HariTerakhir = Object.values(avgDailySales).reduce((a, b) => a + b, 0);
-      const totalOmzet7HariTerakhir = Object.values(omzetRataRataPerMenu).reduce((a, b) => a + b, 0);
-
-      const outletBreakdown = OUTLETS.filter((o) => o.id !== "ALL").map((o) => {
-        const outletSales = rawData.sales.filter((s) => (s.outlet || "DS") === o.id);
-        const stats = computeDailySalesStats(outletSales, rawData.recipes);
+    if (dataType === "todo") {
+      const { period, dueDate, items } = parseTodoLines(text);
+      if (!items.length) {
         return {
-          outlet: o.id,
-          nama: o.label,
-          total_porsi: outletSales.reduce((sum, s) => sum + Number(s.quantity || 0), 0),
-          total_omzet: Math.round(computeRevenue(outletSales, rawData.recipes)),
-          rata_rata_porsi_per_hari: stats.rataRataPorsiPerHari,
-          rata_rata_omzet_per_hari: stats.rataRataOmzetPerHari
+          text:
+            "Saya kenali ini sebagai TUGAS, tapi judul tugasnya belum terbaca.\n\n" +
+            "Contoh:\nTugas hari ini: telpon supplier ayam, setor uang ke bank\n" +
+            "Tugas minggu ini: evaluasi menu baru\nTugas bulan ini: renovasi dapur SS",
+          tags: ["TUGAS"]
         };
-      });
-
-      const contextText = JSON.stringify({
-        outlet_terpilih: activeOutlet,
-        tanggal_sistem: getTodayISO(),
-        catatan_penting:
-          "Untuk pertanyaan 'rata-rata penjualan per hari' TANPA sebutan menu tertentu, " +
-          "JAWAB LANGSUNG memakai field rata_rata_harian_seluruh_periode (total gabungan semua menu) " +
-          "-- JANGAN menjumlahkan sendiri angka per-menu. Field rata_rata_penjualan_harian_per_menu " +
-          "hanya dipakai kalau pengguna tanya spesifik per-menu. Selalu sebutkan periode/tanggal data " +
-          "yang dipakai (field dari/sampai) agar jelas rentang waktunya. Field reservasi_mendatang " +
-          "berisi data reservasi 14 hari ke depan (nama, tanggal, jam, jumlah_tamu, outlet, status, " +
-          "nomor_hp, catatan) -- pakai ini untuk menjawab pertanyaan soal reservasi.",
-        rata_rata_harian_seluruh_periode: {
-          dari: dailyStats.dariTanggal,
-          sampai: dailyStats.sampaiTanggal,
-          jumlah_hari: dailyStats.jumlahHari,
-          rata_rata_porsi_per_hari: dailyStats.rataRataPorsiPerHari,
-          rata_rata_omzet_per_hari: dailyStats.rataRataOmzetPerHari,
-          rata_rata_hari_kerja: dailyStats.hariKerja,
-          rata_rata_akhir_pekan: dailyStats.akhirPekan
-        },
-        rata_rata_harian_7_hari_terakhir: {
-          total_porsi_per_hari: Math.round(totalPorsi7HariTerakhir),
-          total_omzet_per_hari: Math.round(totalOmzet7HariTerakhir)
-        },
-        omzet_dan_porsi_per_bulan: dailyStats.perBulan,
-        omzet_per_outlet: outletBreakdown,
-        item_variance_terbesar: varianceReport.items
-          .slice()
-          .sort((a, b) => a.variance - b.variance)
-          .slice(0, 10)
-          .map((x) => ({
-            item: x.itemName,
-            outlet: x.outlet,
-            teoritis: Math.round(x.theoretical),
-            aktual: Math.round(x.actual),
-            selisih: Math.round(x.variance),
-            satuan: x.unit
-          })),
-        saran_pembelian: purchaseSuggestions.slice(0, 10).map((x) => ({
-          item: x.itemName,
-          kebutuhan_harian: Math.round(x.dailyNeed),
-          stok_sekarang: Math.round(x.currentStock),
-          saran_beli: Math.round(x.suggestedPurchase),
-          satuan: x.base
-        })),
-        rata_rata_penjualan_harian_per_menu: avgDailySales,
-        omzet_rata_rata_harian_per_menu: omzetRataRataPerMenu,
-        total_omzet_tercatat: Math.round(computeRevenue(filteredData.sales, rawData.recipes)),
-        margin_per_menu: marginPerMenu,
-        selisih_barang_datang: receivingIssues.slice(0, 10),
-        reservasi_mendatang: reservasiMendatang
-      });
-
-      let answerText;
-      let usedFallback = false;
-      try {
-        answerText = await askAI(buildReportPrompt(text, contextText));
-      } catch (error) {
-        console.warn("AI fallback:", error.message);
-        answerText = buildLocalReport(text, ctx);
-        usedFallback = true;
       }
-
-      return {
-        text: answerText,
-        tags: usedFallback ? ["LAPORAN AI", "MODE LOKAL"] : ["LAPORAN AI"]
-      };
-    }
-
-    const lower = normalizeText(text);
-    if (lower.includes("status") || lower.includes("database")) {
+      const rows = items.map((title) => createTodo({ title, period, dueDate, outlet }));
+      const ids = await saveRowsTracked(COLLECTIONS.TODOS, rows, "create", `${rows.length} tugas ${period}, ${formatDateID(dueDate)}`);
+      setTodos((prev) => [...prev, ...rows.map((r, i) => ({ id: ids[i], ...r }))]);
+      const periodLabel = period === "mingguan" ? "minggu ini" : period === "bulanan" ? "bulan ini" : "hari ini";
       return {
         text:
-          `STATUS SISTEM\n\n` +
-          `Firebase: ${systemOnline ? "Terhubung" : "Periksa koneksi"}\n\n` +
-          `Penjualan: ${rawData.sales.length} record\n` +
-          `Pembelian: ${rawData.purchases.length} record\n` +
-          `Barang datang: ${rawData.receiving.length} record\n` +
-          `Stok awal: ${rawData.openingStock.length} record\n` +
-          `Stock opname: ${rawData.stockOpname.length} record\n` +
-          `Resep: ${rawData.recipes.length} menu\n` +
-          `Harga tersimpan: ${priceHistory.length} record`,
-        tags: ["STATUS"]
+          `TUGAS (${periodLabel}, tenggat ${formatDateID(dueDate)}) tersimpan.\n\n` +
+          items.map((t) => `- ${t}`).join("\n") +
+          `\n\nLihat/centang di menu "To-Do" kalau sudah selesai.`,
+        tags: ["TUGAS", "TERSIMPAN"]
       };
+    }
+
+    if (dataType === "report" || dataType === "unknown") {
+      const lower = normalizeText(text);
+      if (lower.includes("status") || lower.includes("database")) {
+        return {
+          text:
+            `STATUS SISTEM\n\n` +
+            `Firebase: ${systemOnline ? "Terhubung" : "Periksa koneksi"}\n\n` +
+            `Penjualan: ${rawData.sales.length} record\n` +
+            `Pembelian: ${rawData.purchases.length} record\n` +
+            `Barang datang: ${rawData.receiving.length} record\n` +
+            `Stok awal: ${rawData.openingStock.length} record\n` +
+            `Stock opname: ${rawData.stockOpname.length} record\n` +
+            `Resep: ${rawData.recipes.length} menu\n` +
+            `Harga tersimpan: ${priceHistory.length} record`,
+          tags: ["STATUS"]
+        };
+      }
+
+      // Agent Core (tool-calling) adalah jalur utama untuk semua
+      // pertanyaan/laporan -- AI sendiri yang memilih tool/data yang
+      // relevan (termasuk reservasi lewat getReservationForecast),
+      // bukan lagi bergantung pada daftar kata kunci yang gampang
+      // ketinggalan (mis. kasus "reservasi" yang sebelumnya tidak
+      // dikenali sama sekali). Kalau Agent Core gagal total (mis. API
+      // key belum diisi / koneksi AI mati), baru turun ke laporan lokal
+      // deterministik di bawah supaya pengguna tetap dapat jawaban dasar.
+      try {
+        return await runAgentTurn(text);
+      } catch (error) {
+        console.warn("Agent Core gagal, pakai laporan lokal sebagai cadangan:", error.message);
+        const dailyStats = computeDailySalesStats(filteredData.sales, rawData.recipes);
+        const ctx = { varianceReport, purchaseSuggestions, avgDailySales, priceHistory, receivingIssues, dailyStats };
+        return { text: buildLocalReport(text, ctx), tags: ["LAPORAN AI", "MODE LOKAL"] };
+      }
     }
 
     return {
-      text:
-        "Saya bisa mengenali: stok awal, pembelian, barang datang, penjualan, stock opname, " +
-        "waste, penyesuaian stok, resep, dan update harga — cukup ketik dalam bahasa biasa.\n\n" +
-        "Untuk laporan, coba tanya misalnya \"apa yang perlu dibeli besok?\" atau " +
-        "\"item mana yang variance-nya paling besar?\".",
+      text: "Maaf, saya tidak yakin cara memproses pesan ini. Coba jelaskan lebih spesifik.",
       tags: ["AI ASSISTANT"]
     };
   }
@@ -4731,6 +4766,115 @@ export default function App() {
     );
   }
 
+  function renderTodo() {
+    const periodLabel = { harian: "Harian", mingguan: "Mingguan", bulanan: "Bulanan" };
+    const todayISO = getTodayISO();
+    const visibleTodos = todos
+      .filter((t) => todoShowDone || !t.done)
+      .filter((t) => todoFilterPeriod === "semua" || t.period === todoFilterPeriod)
+      .sort((a, b) => (a.dueDate < b.dueDate ? -1 : a.dueDate > b.dueDate ? 1 : 0));
+
+    return (
+      <div className="page">
+        <div className="section-header">
+          <div>
+            <h1>To-Do List</h1>
+            <p>
+              Tugas harian, mingguan, atau bulanan -- sekali ditandai selesai ya selesai (bukan berulang otomatis).
+              Bisa ditambah di sini atau lewat chat (mis. "Tugas hari ini: telpon supplier ayam"). Tugas yang
+              lewat tenggat dan belum selesai otomatis diingatkan lewat notifikasi tiap pagi.
+            </p>
+          </div>
+        </div>
+
+        <div className="card">
+          <div style={{ display: "flex", gap: 8, flexWrap: "wrap", alignItems: "center", marginBottom: 14 }}>
+            <input
+              type="text"
+              placeholder="Judul tugas baru..."
+              value={todoFormTitle}
+              onChange={(e) => setTodoFormTitle(e.target.value)}
+              onKeyDown={(e) => e.key === "Enter" && addTodoManual()}
+              style={{ flex: "1 1 240px", padding: "8px 10px", borderRadius: 8, border: "1px solid #ddd" }}
+            />
+            <select
+              value={todoFormPeriod}
+              onChange={(e) => setTodoFormPeriod(e.target.value)}
+              style={{ padding: "8px 10px", borderRadius: 8, border: "1px solid #ddd" }}
+            >
+              <option value="harian">Harian</option>
+              <option value="mingguan">Mingguan</option>
+              <option value="bulanan">Bulanan</option>
+            </select>
+            <button className="primary-button" onClick={addTodoManual} disabled={todoFormBusy || !todoFormTitle.trim()}>
+              {todoFormBusy ? "Menambah..." : "Tambah Tugas"}
+            </button>
+          </div>
+
+          <div style={{ display: "flex", gap: 8, flexWrap: "wrap", alignItems: "center", marginBottom: 14 }}>
+            <div className="outlet-switch small">
+              {["semua", "harian", "mingguan", "bulanan"].map((p) => (
+                <button
+                  key={p}
+                  className={`outlet-chip ${todoFilterPeriod === p ? "active" : ""}`}
+                  onClick={() => setTodoFilterPeriod(p)}
+                >
+                  {p === "semua" ? "Semua" : periodLabel[p]}
+                </button>
+              ))}
+            </div>
+            <label style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 13, cursor: "pointer" }}>
+              <input type="checkbox" checked={todoShowDone} onChange={(e) => setTodoShowDone(e.target.checked)} />
+              Tampilkan yang sudah selesai
+            </label>
+          </div>
+
+          {visibleTodos.length === 0 ? (
+            <div className="empty-state">
+              <div className="empty-icon"><Icon name="check" size={26} /></div>
+              <div className="empty-title">Belum ada tugas{todoFilterPeriod !== "semua" ? ` ${periodLabel[todoFilterPeriod].toLowerCase()}` : ""}.</div>
+            </div>
+          ) : (
+            <DataTable
+              columns={["Selesai", "Tugas", "Periode", "Tenggat", ""]}
+              rows={visibleTodos.map((t) => [
+                <input
+                  key="c"
+                  type="checkbox"
+                  checked={!!t.done}
+                  onChange={(e) => toggleTodoDone(t.id, e.target.checked)}
+                />,
+                <span key="title" style={t.done ? { textDecoration: "line-through", color: "#999" } : undefined}>
+                  {t.title}
+                </span>,
+                periodLabel[t.period] || t.period,
+                <span key="due" style={!t.done && t.dueDate < todayISO ? { color: "#c62828", fontWeight: 600 } : undefined}>
+                  {formatDateID(t.dueDate)}
+                  {!t.done && t.dueDate < todayISO ? " (terlambat)" : ""}
+                </span>,
+                todoDeleteConfirmId === t.id ? (
+                  <span key="del" style={{ display: "flex", gap: 6 }}>
+                    <button
+                      onClick={() => deleteTodo(t.id)}
+                      style={{ padding: "4px 10px", borderRadius: 6, border: "none", background: "#c0392b", color: "#fff", cursor: "pointer" }}
+                    >
+                      Ya, hapus
+                    </button>
+                    <button className="secondary-button" onClick={() => setTodoDeleteConfirmId(null)}>Batal</button>
+                  </span>
+                ) : (
+                  <button key="del" className="secondary-button" onClick={() => setTodoDeleteConfirmId(t.id)}>
+                    Hapus
+                  </button>
+                )
+              ])}
+            />
+          )}
+        </div>
+      </div>
+    );
+  }
+
   function renderRiwayat() {
     return (
       <div className="page">
@@ -4972,6 +5116,7 @@ export default function App() {
       case "import": return renderImport();
       case "import-wa": return renderImportWa();
       case "riwayat": return renderRiwayat();
+      case "todo": return renderTodo();
       case "laporan": return renderLaporan();
       default: return null;
     }
@@ -5267,17 +5412,12 @@ export default function App() {
                 ))}
               </div>
               <span className="chat-context-hint">Anda tetap bisa menyebut outlet lain langsung di dalam pesan.</span>
-              <label
-                title="Kalau aktif, pertanyaan/laporan dijawab lewat Agent Core (AI memilih sendiri data yang perlu diambil, lewat beberapa tool, dan mengusulkan aksi yang perlu Anda setujui) -- bukan lagi jawaban satu-kali seperti biasa."
-                style={{ marginLeft: "auto", display: "flex", alignItems: "center", gap: 6, fontSize: 13, cursor: "pointer" }}
+              <span
+                title="Semua pertanyaan/laporan dijawab lewat Agent Core -- AI memilih sendiri data yang perlu diambil lewat beberapa tool, dan mengusulkan aksi yang perlu Anda setujui sebelum tersimpan."
+                style={{ marginLeft: "auto", display: "flex", alignItems: "center", gap: 6, fontSize: 13, color: "#2e7d32" }}
               >
-                <input
-                  type="checkbox"
-                  checked={agentCoreEnabled}
-                  onChange={(e) => setAgentCoreEnabled(e.target.checked)}
-                />
-                🤖 Agent Core
-              </label>
+                🤖 Agent Core aktif
+              </span>
               <button
                 onClick={() => setHistoryOpen((v) => !v)}
                 style={{ padding: "6px 12px", borderRadius: 8, border: "1px solid #ddd", background: historyOpen ? "#2e7d32" : "transparent", color: historyOpen ? "#fff" : "#333", cursor: "pointer", fontSize: 13 }}

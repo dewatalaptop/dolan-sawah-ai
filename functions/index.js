@@ -252,6 +252,57 @@ exports.checkTomorrowReservations = onSchedule(
   }
 );
 
+// ============================================================
+// checkOverdueTodos: tiap pagi, cek todos yang belum ditandai
+// selesai dan tenggatnya sudah lewat/jatuh hari ini (harian/mingguan/
+// bulanan sama-sama dibandingkan lewat field dueDate), buat satu
+// notifikasi per tugas supaya muncul di badge lonceng -- terus
+// diulang tiap pagi selama tugasnya belum ditandai selesai (dedup
+// per hari lewat ID dokumen deterministik, sama seperti reminder
+// reservasi besok).
+// ============================================================
+
+exports.checkOverdueTodos = onSchedule(
+  {
+    schedule: "0 7 * * *",
+    timeZone: "Asia/Jakarta",
+    region: "asia-southeast2"
+  },
+  async () => {
+    const today = new Date().toISOString().slice(0, 10);
+
+    const snapshot = await ownDb
+      .collection("todos")
+      .where("done", "==", false)
+      .where("dueDate", "<=", today)
+      .get();
+
+    if (snapshot.empty) {
+      logger.info("checkOverdueTodos: tidak ada tugas jatuh tempo/terlambat hari ini.");
+      return;
+    }
+
+    const batch = ownDb.batch();
+    snapshot.docs.forEach((doc) => {
+      const data = doc.data();
+      const label = data.dueDate < today ? "terlambat" : "jatuh tempo hari ini";
+      batch.set(
+        ownDb.collection("notifications").doc(`todo-reminder-${doc.id}-${today}`),
+        {
+          decisionId: "",
+          message: `Tugas ${label}: ${data.title || "(tanpa judul)"} (${data.period || "harian"})`,
+          dueDate: data.dueDate,
+          createdAt: admin.firestore.FieldValue.serverTimestamp(),
+          read: false
+        }
+      );
+    });
+    await batch.commit();
+
+    logger.info(`checkOverdueTodos selesai: ${snapshot.size} notifikasi tugas dibuat.`);
+  }
+);
+
 exports.syncReservations = onSchedule(
   {
     schedule: "0 * * * *",
