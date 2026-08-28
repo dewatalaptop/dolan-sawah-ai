@@ -4,6 +4,7 @@
 // ============================================================
 
 import OpenAI from "openai";
+import { toLocalISODate } from "./dateUtils";
 
 const API_KEY = import.meta.env.VITE_ZAI_API_KEY;
 const MODEL_NAME = import.meta.env.VITE_ZAI_MODEL || "glm-4.5-flash";
@@ -151,9 +152,33 @@ const AGENT_SYSTEM_PROMPT =
   "tanpa detail), sebutkan target/ukuran keberhasilan kalau memungkinkan; " +
   "(d) Follow-up -- kalau ada hal yang perlu dicek ulang nanti, tawarkan untuk dicatat lewat tool flagFollowUp.";
 
+const HARI_ID = ["Minggu", "Senin", "Selasa", "Rabu", "Kamis", "Jumat", "Sabtu"];
+
+// Tanpa ini, model tidak tahu "hari ini" itu tanggal berapa -- rawan
+// mengarang tanggal random (pernah kejadian nyata: flagFollowUp diisi
+// tanggal 2024 padahal sistemnya sudah 2026) atau salah hitung
+// "besok"/"minggu depan". Dikirim sebagai pesan system terpisah di awal
+// percakapan (bukan digabung ke AGENT_SYSTEM_PROMPT yang statis) supaya
+// gampang di-refresh andai nanti perlu; putaran lanjutan (resumeAgentTurn
+// setelah approval) memakai ulang riwayat pesan yang sama, jadi tanggal
+// yang dipakai tetap tanggal saat turn ini dimulai -- cukup akurat
+// karena jeda approval biasanya cuma hitungan detik/menit.
+function buildDateContextMessage() {
+  const now = new Date();
+  const iso = toLocalISODate(now);
+  const hari = HARI_ID[now.getDay()];
+  return {
+    role: "system",
+    content: `KONTEKS WAKTU: Hari ini adalah ${hari}, ${iso} (format YYYY-MM-DD). Pakai tanggal ini sebagai acuan ` +
+      `untuk semua istilah relatif ("hari ini", "besok", "minggu ini", "minggu depan", dst.) dan untuk mengisi ` +
+      `parameter tanggal tool apa pun -- JANGAN pernah menebak atau memakai tanggal dari ingatan/pelatihan.`
+  };
+}
+
 export function buildAgentInitialMessages(userMessage) {
   return [
     { role: "system", content: AGENT_SYSTEM_PROMPT },
+    buildDateContextMessage(),
     { role: "user", content: userMessage }
   ];
 }

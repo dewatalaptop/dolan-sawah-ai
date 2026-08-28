@@ -42,6 +42,9 @@ export function createChatMessage(data = {}) {
     role: data.role || "user",
     text: data.text || "",
     tags: Array.isArray(data.tags) ? data.tags : [],
+    // Grafik ringan (dari data tool Agent Core, bukan dikarang AI) yang
+    // ditampilkan di bawah teks jawaban -- lihat buildChartsFromToolLog.
+    charts: Array.isArray(data.charts) ? data.charts : [],
     createdAt: new Date().toISOString()
   };
 }

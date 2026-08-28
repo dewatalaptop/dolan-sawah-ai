@@ -789,6 +789,27 @@ tbody tr:hover { background: var(--green-050); }
 }
 .chat-bubble-user .chat-tag { background: rgba(255, 255, 255, 0.18); color: #fff; }
 
+.chat-charts { margin-top: 12px; display: flex; flex-direction: column; gap: 10px; }
+.chat-chart { background: rgba(0, 0, 0, 0.03); border-radius: 10px; padding: 10px 12px; }
+.chat-bubble-user .chat-chart { background: rgba(255, 255, 255, 0.14); }
+.chat-chart-title { font-size: 11px; font-weight: 700; margin-bottom: 8px; opacity: 0.85; }
+.chat-chart-bars { display: flex; flex-direction: column; gap: 6px; }
+.chat-chart-row { display: flex; align-items: center; gap: 6px; }
+.chat-chart-label {
+  font-size: 10.5px;
+  width: 34%;
+  min-width: 56px;
+  max-width: 140px;
+  flex-shrink: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.chat-chart-track { flex: 1; min-width: 0; height: 10px; background: rgba(0, 0, 0, 0.07); border-radius: 4px; overflow: hidden; }
+.chat-bubble-user .chat-chart-track { background: rgba(255, 255, 255, 0.22); }
+.chat-chart-fill { height: 100%; border-radius: 4px; }
+.chat-chart-value { font-size: 10px; width: 64px; flex-shrink: 0; text-align: right; opacity: 0.85; }
+
 .chat-typing { display: flex; align-items: center; gap: 10px; padding: 6px 0; }
 .typing { color: var(--ink-faint); font-size: 12px; }
 

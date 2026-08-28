@@ -148,6 +148,98 @@ function formatDateID(date) {
   return `${d}-${m}-${y}`;
 }
 
+/* =========================================================
+   GRAFIK CHAT (dari data tool Agent Core yang sudah nyata
+   diambil, BUKAN diminta AI untuk "menggambar" -- supaya
+   angkanya selalu akurat/konsisten dengan teks jawaban).
+   ========================================================= */
+
+function buildChartsFromToolLog(toolLog) {
+  const charts = [];
+  if (!Array.isArray(toolLog)) return charts;
+
+  for (const entry of toolLog) {
+    if (entry.type !== "read" || !entry.result) continue;
+    const r = entry.result;
+
+    if (entry.name === "getSalesSummary" && r.rata_rata_per_menu && Object.keys(r.rata_rata_per_menu).length) {
+      charts.push({
+        title: `Rata-rata Penjualan per Menu (${r.hari_terakhir} hari terakhir)`,
+        unit: "porsi/hari",
+        items: Object.entries(r.rata_rata_per_menu)
+          .map(([label, value]) => ({ label, value: Math.round(Number(value) * 10) / 10 }))
+          .sort((a, b) => b.value - a.value)
+          .slice(0, 8)
+      });
+    }
+
+    if (entry.name === "getVarianceReport" && Array.isArray(r.items) && r.items.length) {
+      charts.push({
+        title: "Item Variance Terbesar",
+        unit: r.items[0]?.satuan || "",
+        items: r.items
+          .slice()
+          .sort((a, b) => a.selisih - b.selisih)
+          .slice(0, 6)
+          .map((x) => ({ label: `${x.bahan} (${x.outlet})`, value: x.selisih }))
+      });
+    }
+
+    if (entry.name === "getReservationForecast" && Array.isArray(r.daftar) && r.daftar.length) {
+      const byDate = {};
+      r.daftar.forEach((x) => {
+        byDate[x.tanggal] = (byDate[x.tanggal] || 0) + Number(x.jumlah_tamu || 0);
+      });
+      charts.push({
+        title: `Beban Reservasi (${r.dari || ""} s/d ${r.sampai || ""})`,
+        unit: "tamu",
+        items: Object.entries(byDate)
+          .sort(([a], [b]) => (a < b ? -1 : 1))
+          .map(([label, value]) => ({ label: label.slice(5), value }))
+      });
+    }
+  }
+
+  return charts;
+}
+
+function ChatCharts({ charts }) {
+  if (!charts || charts.length === 0) return null;
+  return (
+    <div className="chat-charts">
+      {charts.map((chart, i) => {
+        const maxAbs = Math.max(1, ...chart.items.map((x) => Math.abs(x.value)));
+        return (
+          <div key={i} className="chat-chart">
+            <div className="chat-chart-title">{chart.title}</div>
+            <div className="chat-chart-bars">
+              {chart.items.map((x, j) => {
+                const widthPct = Math.max((Math.abs(x.value) / maxAbs) * 100, 3);
+                const isNegative = x.value < 0;
+                return (
+                  <div key={j} className="chat-chart-row">
+                    <span className="chat-chart-label" title={x.label}>{x.label}</span>
+                    <div className="chat-chart-track">
+                      <div
+                        className="chat-chart-fill"
+                        style={{ width: `${widthPct}%`, background: isNegative ? "#c0392b" : "var(--green-500)" }}
+                      />
+                    </div>
+                    <span className="chat-chart-value">
+                      {formatNumber(x.value)}
+                      {chart.unit ? ` ${chart.unit}` : ""}
+                    </span>
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
 function toNumber(value) {
   if (typeof value === "number") return Number.isFinite(value) ? value : 0;
 
@@ -892,11 +984,11 @@ async function deleteDocsBatched(collectionName, ids, onProgress) {
    tersimpan di Firestore per tanggal, bisa dicari kapan saja).
    ========================================================= */
 
-async function persistChatMessage(date, role, text, tags) {
+async function persistChatMessage(date, role, text, tags, charts) {
   try {
     await addDoc(
       collection(db, COLLECTIONS.CHAT),
-      createChatMessage({ date, role, text, tags })
+      createChatMessage({ date, role, text, tags, charts })
     );
   } catch (error) {
     // Gagal simpan riwayat tidak boleh mengganggu chat yang sedang
@@ -1824,6 +1916,7 @@ function ChatMessage({ message }) {
       {!isUser && <div className="chat-avatar">DS</div>}
       <div className={`chat-bubble ${isUser ? "chat-bubble-user" : "chat-bubble-ai"}`}>
         {message.text}
+        <ChatCharts charts={message.charts} />
         {message.tags?.length > 0 && (
           <div className="chat-tags">
             {message.tags.map((tag, i) => (
@@ -2512,7 +2605,7 @@ export default function App() {
     loadChatByDate(TODAY)
       .then((history) => {
         if (history.length > 0) {
-          setMessages(history.map((m) => ({ id: m.id, role: m.role, text: m.text, tags: m.tags })));
+          setMessages(history.map((m) => ({ id: m.id, role: m.role, text: m.text, tags: m.tags, charts: m.charts })));
         }
       })
       .catch((error) => console.error("Gagal memuat chat hari ini:", error));
@@ -2527,7 +2620,7 @@ export default function App() {
     setChatDate(newDate);
     loadChatByDate(newDate)
       .then((history) => {
-        setMessages(history.length > 0 ? history.map((m) => ({ id: m.id, role: m.role, text: m.text, tags: m.tags })) : [buildWelcomeMessage()]);
+        setMessages(history.length > 0 ? history.map((m) => ({ id: m.id, role: m.role, text: m.text, tags: m.tags, charts: m.charts })) : [buildWelcomeMessage()]);
       })
       .catch((error) => {
         console.error("Gagal memuat chat untuk tanggal baru:", error);
@@ -2838,7 +2931,8 @@ export default function App() {
 
     return {
       text: result.finalAnswer,
-      tags: result.status === "max_iterations" ? ["AGENT CORE", "TERLALU BANYAK LANGKAH"] : ["AGENT CORE"]
+      tags: result.status === "max_iterations" ? ["AGENT CORE", "TERLALU BANYAK LANGKAH"] : ["AGENT CORE"],
+      charts: buildChartsFromToolLog(result.toolLog)
     };
   }
 
@@ -2910,8 +3004,9 @@ export default function App() {
       });
 
       const finalTags = approved ? ["AGENT CORE", "DISETUJUI"] : ["AGENT CORE", "DITOLAK"];
-      setMessages((prev) => [...prev, { id: `assistant-${Date.now()}`, role: "assistant", text: next.finalAnswer, tags: finalTags }]);
-      persistChatMessage(chatDate, "assistant", next.finalAnswer, finalTags);
+      const finalCharts = buildChartsFromToolLog([...nextToolLog, ...next.toolLog]);
+      setMessages((prev) => [...prev, { id: `assistant-${Date.now()}`, role: "assistant", text: next.finalAnswer, tags: finalTags, charts: finalCharts }]);
+      persistChatMessage(chatDate, "assistant", next.finalAnswer, finalTags, finalCharts);
       return next.finalAnswer;
     } catch (error) {
       console.error(error);
@@ -3359,9 +3454,9 @@ export default function App() {
       const response = await processMessage(text);
       setMessages((prev) => [
         ...prev,
-        { id: `assistant-${Date.now()}`, role: "assistant", text: response.text, tags: response.tags }
+        { id: `assistant-${Date.now()}`, role: "assistant", text: response.text, tags: response.tags, charts: response.charts }
       ]);
-      persistChatMessage(sendDate, "assistant", response.text, response.tags || []);
+      persistChatMessage(sendDate, "assistant", response.text, response.tags || [], response.charts || []);
     } catch (error) {
       console.error(error);
       const errorText = `Terjadi kesalahan saat memproses data.\n\nDetail: ${error?.message || "Unknown error"}`;
