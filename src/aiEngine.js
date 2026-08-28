@@ -1,23 +1,22 @@
 // ============================================================
 // DOLAN SAWAH AI
-// AI ENGINE (GLM via Z.AI -- OpenAI-compatible endpoint, free tier)
+// AI ENGINE (Gemini, via Cloud Function proxy `chatCompletions` --
+// endpoint OpenAI-compatible Gemini ada di sisi server, jadi API key
+// Gemini yang sesungguhnya tidak pernah ikut ke bundle browser yang
+// publik. Client cuma bawa apiKey dummy "proxy", diabaikan servernya.
+// Pindah dari z.ai (GLM) karena lambat/sering 429 di free tier, dan
+// karena z.ai mengharuskan key asli ditaruh client-side.
 // ============================================================
 
 import OpenAI from "openai";
 import { toLocalISODate } from "./dateUtils";
 
-const API_KEY = import.meta.env.VITE_ZAI_API_KEY;
-// Sempat coba glm-4.7-flash (sama-sama gratis, generasi lebih baru)
-// tapi tier gratisnya jauh lebih padat -- diukur langsung via network
-// log dalam 2 hari pemakaian, ~70-80% percobaan gagal 429/503 vs
-// glm-4.5-flash yang jauh lebih stabil. Balik ke glm-4.5-flash atas
-// pilihan pemilik sampai kepadatan 4.7-flash reda (kalau reda).
-const MODEL_NAME = import.meta.env.VITE_ZAI_MODEL || "glm-4.5-flash";
-const BASE_URL = "https://api.z.ai/api/paas/v4/";
+const MODEL_NAME = import.meta.env.VITE_GEMINI_MODEL || "gemini-3.6-flash";
+const BASE_URL =
+  import.meta.env.VITE_AI_PROXY_URL ||
+  "https://asia-southeast2-dolan-sawah-ai-2026.cloudfunctions.net/chatCompletions/";
 
-const client = API_KEY
-  ? new OpenAI({ apiKey: API_KEY, baseURL: BASE_URL, dangerouslyAllowBrowser: true })
-  : null;
+const client = new OpenAI({ apiKey: "proxy", baseURL: BASE_URL, dangerouslyAllowBrowser: true });
 
 const SYSTEM_PROMPT =
   "Anda adalah asisten AI operasional untuk Dolan Sawah Group, yang menaungi 3 outlet " +
@@ -47,10 +46,6 @@ export function buildReportPrompt(question, contextJson) {
 // ============================================================
 
 export async function askAI(prompt) {
-  if (!client) {
-    throw new Error("AI API key belum dikonfigurasi (VITE_ZAI_API_KEY kosong).");
-  }
-
   const response = await client.chat.completions.create({
     model: MODEL_NAME,
     messages: [
@@ -88,7 +83,7 @@ const INGREDIENT_MATCH_SYSTEM_PROMPT =
   '"reason" singkat (maksimal 12 kata) dalam Bahasa Indonesia, jelaskan alasannya.';
 
 export async function analyzeIngredientPairs(pairs) {
-  if (!client || !pairs.length) return null;
+  if (!pairs.length) return null;
 
   const prompt =
     "Pasangan nama bahan berikut ditulis berdekatan dalam catatan belanja yang sama, " +
@@ -229,10 +224,6 @@ export function buildAgentInitialMessages(userMessage, businessContext) {
 // sempit dan turn akan terpotong "TERLALU BANYAK LANGKAH" padahal
 // sebenarnya baru separuh jalan.
 export async function runAgentLoop({ messages, tools, executeTool, isWriteTool, maxIterations = 10 }) {
-  if (!client) {
-    throw new Error("AI API key belum dikonfigurasi (VITE_ZAI_API_KEY kosong).");
-  }
-
   const workingMessages = [...messages];
   const toolLog = [];
 

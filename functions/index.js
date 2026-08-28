@@ -12,6 +12,8 @@
 // ============================================================
 
 const { onSchedule } = require("firebase-functions/v2/scheduler");
+const { onRequest } = require("firebase-functions/v2/https");
+const { defineSecret } = require("firebase-functions/params");
 const { logger } = require("firebase-functions");
 const admin = require("firebase-admin");
 
@@ -306,6 +308,55 @@ exports.checkOverdueTodos = onSchedule(
     await batch.commit();
 
     logger.info(`checkOverdueTodos selesai: ${snapshot.size} notifikasi tugas dibuat.`);
+  }
+);
+
+// ============================================================
+// chatCompletions: proxy HTTP ke endpoint OpenAI-compatible Gemini,
+// supaya API key Gemini yang sesungguhnya hanya hidup sebagai secret
+// server-side (GEMINI_API_KEY) -- tidak pernah ikut ter-bundle ke JS
+// publik di GitHub Pages seperti waktu masih pakai z.ai client-side.
+// Client (src/aiEngine.js) kirim body persis bentuk request OpenAI
+// chat.completions (model/messages/tools/tool_choice), function ini
+// cuma neruskan ke Gemini dengan Authorization asli, lalu kembalikan
+// responsnya apa adanya -- supaya SDK `openai` di client tetap bisa
+// dipakai tanpa perubahan bentuk request/response.
+// CORS dibatasi ke origin situs publik + localhost (dev) supaya tidak
+// sembarang origin bisa numpang pakai kuota Gemini lewat URL ini.
+// ============================================================
+
+const GEMINI_API_KEY = defineSecret("GEMINI_API_KEY");
+
+exports.chatCompletions = onRequest(
+  {
+    region: "asia-southeast2",
+    secrets: [GEMINI_API_KEY],
+    cors: ["https://dewatalaptop.github.io", /^http:\/\/localhost:\d+$/]
+  },
+  async (req, res) => {
+    if (req.method !== "POST") {
+      res.status(405).json({ error: "Method not allowed" });
+      return;
+    }
+
+    try {
+      const geminiRes = await fetch(
+        "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions",
+        {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            Authorization: `Bearer ${GEMINI_API_KEY.value()}`
+          },
+          body: JSON.stringify(req.body)
+        }
+      );
+      const data = await geminiRes.json();
+      res.status(geminiRes.status).json(data);
+    } catch (err) {
+      logger.error("chatCompletions gagal:", err);
+      res.status(502).json({ error: "Proxy ke Gemini gagal" });
+    }
   }
 );
 
