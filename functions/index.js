@@ -181,6 +181,8 @@ exports.checkFollowUpNotifications = onSchedule(
       const data = doc.data();
       batch.update(doc.ref, { followUpNotified: true });
       batch.set(ownDb.collection("notifications").doc(), {
+        type: "followup",
+        refId: doc.id,
         decisionId: doc.id,
         message: data.followUpNote || data.userMessage || "Follow-up perlu ditindaklanjuti",
         dueDate: data.followUpDate,
@@ -235,6 +237,8 @@ exports.checkTomorrowReservations = onSchedule(
       batch.set(
         ownDb.collection("notifications").doc(`resv-reminder-${doc.id}-${tomorrowDate}`),
         {
+          type: "reservation",
+          refId: doc.id,
           decisionId: "",
           message:
             `Reservasi besok: ${data.nama || "(tanpa nama)"}${jamText}, ` +
@@ -289,6 +293,8 @@ exports.checkOverdueTodos = onSchedule(
       batch.set(
         ownDb.collection("notifications").doc(`todo-reminder-${doc.id}-${today}`),
         {
+          type: "todo",
+          refId: doc.id,
           decisionId: "",
           message: `Tugas ${label}: ${data.title || "(tanpa judul)"} (${data.period || "harian"})`,
           dueDate: data.dueDate,

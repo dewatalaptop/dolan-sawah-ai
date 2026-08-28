@@ -335,7 +335,7 @@ function looksLikeReportRequest(t) {
     "kenapa", "mengapa", "kapan", "siapa", "coba ", "tolong ",
     "buatkan", "tampilkan", "tunjukkan", "rangkum", "ringkas",
     "ringkasan", "jelaskan", "kasih tau", "kasih tahu", "beritahu",
-    "info ", "cek "
+    "info ", "cek ", "analisa", "analisis", "beri saya", "berikan"
   ];
   if (starters.some((w) => t.startsWith(w))) return true;
 
@@ -1992,6 +1992,22 @@ export default function App() {
   const [todoFilterPeriod, setTodoFilterPeriod] = useState("semua");
   const [todoShowDone, setTodoShowDone] = useState(false);
 
+  // Reservasi 14 hari ke depan -- dipakai untuk grafik beban reservasi di
+  // Dashboard. Query terpisah dari getReservationForecast (tool Agent Core)
+  // karena ini dimuat sekali di awal untuk render, bukan dipanggil AI.
+  const [upcomingReservations, setUpcomingReservations] = useState([]);
+
+  async function loadUpcomingReservations() {
+    const from = getTodayISO();
+    const toDate = new Date();
+    toDate.setDate(toDate.getDate() + 14);
+    const to = toLocalISODate(toDate);
+    const snapshot = await getDocs(
+      query(collection(db, "reservations_mirror"), where("date", ">=", from), where("date", "<=", to))
+    );
+    setUpcomingReservations(snapshot.docs.map((d) => d.data()));
+  }
+
   async function loadTodos() {
     const snapshot = await getDocs(collection(db, COLLECTIONS.TODOS));
     const list = snapshot.docs
@@ -2469,7 +2485,15 @@ export default function App() {
     queueMicrotask(() => {
       setDataLoading(true);
       setDataLoadError("");
-      Promise.all([checkConnection(), refreshData(), loadCategories(), loadActivityLog(), loadNotifications(), loadTodos()])
+      Promise.all([
+        checkConnection(),
+        refreshData(),
+        loadCategories(),
+        loadActivityLog(),
+        loadNotifications(),
+        loadTodos(),
+        loadUpcomingReservations()
+      ])
         .catch((error) => {
           console.error("Gagal memuat data awal:", error);
           setDataLoadError(error?.message || "Gagal memuat data dari Firestore.");
@@ -3267,7 +3291,8 @@ export default function App() {
       const rows = items.map((title) => createTodo({ title, period, dueDate, outlet }));
       const ids = await saveRowsTracked(COLLECTIONS.TODOS, rows, "create", `${rows.length} tugas ${period}, ${formatDateID(dueDate)}`);
       setTodos((prev) => [...prev, ...rows.map((r, i) => ({ id: ids[i], ...r }))]);
-      const periodLabel = period === "mingguan" ? "minggu ini" : period === "bulanan" ? "bulan ini" : "hari ini";
+      const periodLabel =
+        period === "mingguan" ? "mingguan" : period === "bulanan" ? "bulanan" : dueDate === getTodayISO() ? "hari ini" : "harian";
       return {
         text:
           `TUGAS (${periodLabel}, tenggat ${formatDateID(dueDate)}) tersimpan.\n\n` +
@@ -3689,6 +3714,31 @@ export default function App() {
     });
     const maxTrendRevenue = Math.max(1, ...trend.map((t) => t.revenue));
 
+    const todayISO = getTodayISO();
+    const todoPending = todos.filter((t) => !t.done);
+    const todoOverdueCount = todoPending.filter((t) => t.dueDate < todayISO).length;
+
+    const varianceTop = varianceReport.items
+      .slice()
+      .sort((a, b) => a.variance - b.variance)
+      .slice(0, 6);
+    const maxAbsVariance = Math.max(1, ...varianceTop.map((x) => Math.abs(x.variance)));
+
+    const resWindowDays = 7;
+    const resDates = [];
+    {
+      const cursor = new Date(`${todayISO}T00:00:00Z`);
+      for (let i = 0; i < resWindowDays; i++) {
+        resDates.push(cursor.toISOString().slice(0, 10));
+        cursor.setUTCDate(cursor.getUTCDate() + 1);
+      }
+    }
+    const reservationPerDay = resDates.map((d) => {
+      const rows = upcomingReservations.filter((r) => r.date === d && (activeOutlet === "ALL" || r.outlet === activeOutlet));
+      return { date: d, guests: rows.reduce((s, r) => s + Number(r.jumlah || 0), 0), count: rows.length };
+    });
+    const maxGuests = Math.max(1, ...reservationPerDay.map((r) => r.guests));
+
     return (
       <div className="page">
         <div className="section-header">
@@ -3703,6 +3753,13 @@ export default function App() {
           <StatCard title="Penjualan" value={formatNumber(totalSalesPortions)} subtitle="total porsi tercatat" icon="cart" tone="green" />
           <StatCard title="Pembelian" value={rawData.purchases.length} subtitle="record" icon="cart" tone="green" />
           <StatCard title="Item Bervariance" value={criticalCount} subtitle="perlu ditinjau" icon="trend" tone={criticalCount > 0 ? "orange" : "green"} />
+          <StatCard
+            title="Tugas Belum Selesai"
+            value={todoPending.length}
+            subtitle={todoOverdueCount > 0 ? `${todoOverdueCount} terlambat` : "tidak ada yang terlambat"}
+            icon="check"
+            tone={todoOverdueCount > 0 ? "orange" : "green"}
+          />
         </div>
 
         {!hasAnyPrice && (
@@ -3732,6 +3789,64 @@ export default function App() {
             })}
           </div>
         </div>
+
+        <div className="card">
+          <div className="card-title">Beban reservasi 7 hari ke depan</div>
+          <div className="card-description">Total tamu per hari dari reservasi tersinkron, outlet: {OUTLETS.find((o) => o.id === activeOutlet)?.label}.</div>
+          {reservationPerDay.every((r) => r.guests === 0) ? (
+            <div className="empty-state">
+              <div className="empty-title">Belum ada reservasi dalam 7 hari ke depan.</div>
+            </div>
+          ) : (
+            <div style={{ display: "flex", alignItems: "flex-end", gap: 8, height: 120, marginTop: 14 }}>
+              {reservationPerDay.map((r) => {
+                const heightPct = Math.max((r.guests / maxGuests) * 100, 2);
+                return (
+                  <div key={r.date} title={`${formatDateID(r.date)}: ${r.guests} tamu (${r.count} reservasi)`} style={{ flex: 1, display: "flex", flexDirection: "column", alignItems: "center", gap: 4, minWidth: 0 }}>
+                    <span style={{ fontSize: 10, color: "var(--ink-faint)" }}>{r.guests || ""}</span>
+                    <div style={{ width: "100%", height: 90, display: "flex", alignItems: "flex-end" }}>
+                      <div style={{ width: "100%", height: `${heightPct}%`, background: "var(--green-500)", borderRadius: "4px 4px 0 0", minHeight: 2 }} />
+                    </div>
+                    <span style={{ fontSize: 9, color: "var(--ink-faint)" }}>{r.date.slice(8, 10)}/{r.date.slice(5, 7)}</span>
+                  </div>
+                );
+              })}
+            </div>
+          )}
+        </div>
+
+        {varianceTop.length > 0 && (
+          <div className="card">
+            <div className="card-title">Item variance terbesar</div>
+            <div className="card-description">Selisih stok teoritis vs aktual (hasil stock opname), paling defisit di atas.</div>
+            <div style={{ display: "flex", flexDirection: "column", gap: 10, marginTop: 14 }}>
+              {varianceTop.map((x) => {
+                const widthPct = Math.max((Math.abs(x.variance) / maxAbsVariance) * 100, 2);
+                const isShortage = x.variance < 0;
+                return (
+                  <div key={`${x.itemName}-${x.outlet}`} style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                    <span style={{ fontSize: 12, width: 140, flexShrink: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }} title={x.itemName}>
+                      {x.itemName} <span style={{ color: "var(--ink-faint)" }}>({x.outlet})</span>
+                    </span>
+                    <div style={{ flex: 1, background: "var(--green-050)", borderRadius: 4, height: 14 }}>
+                      <div
+                        style={{
+                          width: `${widthPct}%`,
+                          height: "100%",
+                          borderRadius: 4,
+                          background: isShortage ? "#c0392b" : "var(--green-500)"
+                        }}
+                      />
+                    </div>
+                    <span style={{ fontSize: 12, width: 90, textAlign: "right", flexShrink: 0 }}>
+                      {formatNumber(x.variance)} {x.unit}
+                    </span>
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+        )}
 
         {activeOutlet === "ALL" && (
           <div className="card">
@@ -5370,7 +5485,7 @@ export default function App() {
             >
               <span className="followup-notif-banner-icon">🔔</span>
               <span className="followup-notif-banner-title">
-                {notifications.length} follow-up perlu ditindaklanjuti
+                {notifications.length} notifikasi perlu ditindaklanjuti
               </span>
               <span className="followup-notif-banner-toggle">
                 {notifBannerExpanded ? "Sembunyikan ▲" : "Lihat detail ▼"}
@@ -5383,12 +5498,25 @@ export default function App() {
                     <span>
                       [{n.dueDate}] {n.message}
                     </span>
-                    <button
-                      className="followup-notif-dismiss"
-                      onClick={() => dismissNotification(n.id)}
-                    >
-                      ✓ Selesai
-                    </button>
+                    <span style={{ display: "flex", gap: 6 }}>
+                      {n.type === "todo" && (
+                        <button
+                          className="secondary-button"
+                          onClick={() => {
+                            setActiveMenu("todo");
+                            setNotifBannerExpanded(false);
+                          }}
+                        >
+                          Lihat di To-Do
+                        </button>
+                      )}
+                      <button
+                        className="followup-notif-dismiss"
+                        onClick={() => dismissNotification(n.id)}
+                      >
+                        ✓ Selesai
+                      </button>
+                    </span>
                   </li>
                 ))}
               </ul>
@@ -5570,6 +5698,16 @@ export default function App() {
               <button onClick={() => quickAction(`Penjualan hari ini ${chatOutlet}\nAyam Bakar 45 porsi\nAyam Geprek 32 porsi`)}>Penjualan</button>
               <button onClick={() => quickAction(`Stock opname hari ini ${chatOutlet}\nAyam 28 kg`)}>Stock Opname</button>
               <button onClick={() => quickAction("Apa saja yang perlu dibeli besok?")}>Kebutuhan Besok</button>
+              <button
+                onClick={() =>
+                  quickAction(
+                    "Analisa performa bisnis saya secara menyeluruh (penjualan, variance, reservasi, dan tugas yang belum selesai) " +
+                      "dan berikan saran pengembangan yang konkret, spesifik, dan bisa langsung ditindaklanjuti untuk meningkatkan kinerja saya sebagai manager."
+                  )
+                }
+              >
+                Saran Pengembangan
+              </button>
             </div>
 
             <div className="input-area">

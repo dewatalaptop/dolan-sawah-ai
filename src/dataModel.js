@@ -238,6 +238,12 @@ export function createDecisionLog(data = {}) {
 
 export function createNotification(data = {}) {
   return {
+    // "followup" (decisions_log), "reservation" (reservations_mirror),
+    // "todo" (todos) -- dipakai UI bell untuk tombol "Lihat" yang
+    // relevan (mis. loncat ke halaman To-Do). Notifikasi lama tanpa
+    // field ini tetap tampil, cuma tanpa tombol navigasi.
+    type: data.type || "",
+    refId: data.refId || "",
     decisionId: data.decisionId || "",
     message: data.message || "",
     dueDate: data.dueDate || "",
