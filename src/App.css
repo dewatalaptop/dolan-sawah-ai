@@ -723,6 +723,56 @@ tbody tr:hover { background: var(--green-050); }
 }
 .chat-context-hint { margin-left: auto; font-size: 10.5px; }
 
+.chat-fullscreen-toggle {
+  flex-shrink: 0;
+  width: 30px; height: 30px;
+  border: 1px solid var(--border);
+  background: var(--surface);
+  border-radius: 8px;
+  display: flex; align-items: center; justify-content: center;
+  color: var(--ink-soft);
+}
+.chat-fullscreen-toggle:hover { border-color: var(--green-500); color: var(--green-700); }
+
+/* =========================================================
+   MODE LAYAR PENUH UNTUK CHAT -- sembunyikan sidebar, topbar,
+   context-bar, quick-actions, dan mobile nav supaya area pesan dapat
+   ruang maksimal (diminta khusus untuk HP, tapi berlaku semua ukuran
+   layar). Tombol keluar mengambang karena topbar (tempat biasa
+   kontrol) ikut disembunyikan.
+   ========================================================= */
+
+.app.chat-fullscreen .sidebar,
+.app.chat-fullscreen .sidebar-backdrop,
+.app.chat-fullscreen .topbar,
+.app.chat-fullscreen .mobile-nav,
+.app.chat-fullscreen .chat-context-bar,
+.app.chat-fullscreen .quick-actions {
+  display: none !important;
+}
+.app.chat-fullscreen .main { width: 100%; margin-left: 0; }
+.app.chat-fullscreen .chat-page { padding-bottom: 0; }
+.app.chat-fullscreen .chat-messages { padding-top: 16px; }
+
+.chat-fullscreen-exit {
+  position: fixed;
+  top: max(12px, env(safe-area-inset-top));
+  right: 12px;
+  z-index: 50;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 8px 13px;
+  border: 1px solid var(--border);
+  background: var(--surface);
+  border-radius: var(--radius-pill);
+  color: var(--ink-soft);
+  font-size: 12px;
+  font-weight: 650;
+  box-shadow: var(--shadow-md);
+}
+.chat-fullscreen-exit:hover { border-color: var(--green-500); color: var(--green-700); }
+
 .chat-messages {
   flex: 1;
   min-height: 0;

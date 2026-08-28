@@ -1812,7 +1812,9 @@ const ICONS = {
   bell: "M6 10a6 6 0 1 1 12 0c0 4 1.5 5.5 1.5 5.5H4.5S6 14 6 10zM10 19a2 2 0 0 0 4 0",
   arrowUp: "M12 19V5M5 12l7-7 7 7",
   arrowDown: "M12 5v14M5 12l7 7 7-7",
-  close: "M6 6l12 12M18 6L6 18"
+  close: "M6 6l12 12M18 6L6 18",
+  expand: "M9 4H4v5M15 4h5v5M4 15v5h5M20 15v5h-5",
+  compress: "M4 9h5V4M15 4v5h5M9 20v-5H4M20 15h-5v5"
 };
 
 // Label ramah pengguna per nama tool Agent Core, dipakai untuk
@@ -2716,6 +2718,7 @@ export default function App() {
   const chatRef = useRef(null);
 
   const [historyOpen, setHistoryOpen] = useState(false);
+  const [chatFullscreen, setChatFullscreen] = useState(false);
   const [historyDate, setHistoryDate] = useState("");
   const [historyMessages, setHistoryMessages] = useState(null);
   const [historyLoading, setHistoryLoading] = useState(false);
@@ -5936,7 +5939,7 @@ export default function App() {
   }
 
   return (
-    <div className="app">
+    <div className={`app ${chatFullscreen ? "chat-fullscreen" : ""}`}>
       {toast && (
         <div className={`toast toast-${toast.type}`} role="alert">
           <span className="toast-icon">{toast.type === "error" ? "⚠️" : "✓"}</span>
@@ -6166,6 +6169,14 @@ export default function App() {
               >
                 Riwayat Chat
               </button>
+              <button
+                className="chat-fullscreen-toggle"
+                onClick={() => setChatFullscreen(true)}
+                aria-label="Perbesar area chat"
+                title="Perbesar area chat (sembunyikan menu lain)"
+              >
+                <Icon name="expand" size={15} />
+              </button>
             </div>
 
             {historyOpen && (
@@ -6254,6 +6265,18 @@ export default function App() {
                   <Icon name="arrowDown" size={16} />
                 </button>
               </div>
+            )}
+
+            {chatFullscreen && (
+              <button
+                className="chat-fullscreen-exit"
+                onClick={() => setChatFullscreen(false)}
+                aria-label="Keluar dari mode layar penuh"
+                title="Kembali ke tampilan normal"
+              >
+                <Icon name="compress" size={15} />
+                <span>Tutup</span>
+              </button>
             )}
 
             {pendingSimilarity && (
