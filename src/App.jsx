@@ -2749,6 +2749,27 @@ export default function App() {
     chatRef.current.scrollTop = chatRef.current.scrollHeight;
   }, [messages, loading]);
 
+  // Tinggi layar "sungguhan" mengikuti visualViewport (bukan 100dvh) --
+  // di HP, saat keyboard virtual muncul, dvh/vh TIDAK ikut menyusut di
+  // banyak browser (keyboard dianggap overlay), jadi textarea/tombol
+  // kirim bisa ketutup keyboard dan yang diketik tidak kelihatan.
+  // visualViewport.height memang berubah saat keyboard buka/tutup, jadi
+  // dipakai sebagai custom property --app-height yang membungkus
+  // seluruh .app (lihat App.css).
+  useEffect(() => {
+    function setAppHeight() {
+      const h = window.visualViewport?.height || window.innerHeight;
+      document.documentElement.style.setProperty("--app-height", `${h}px`);
+    }
+    setAppHeight();
+    window.visualViewport?.addEventListener("resize", setAppHeight);
+    window.addEventListener("resize", setAppHeight);
+    return () => {
+      window.visualViewport?.removeEventListener("resize", setAppHeight);
+      window.removeEventListener("resize", setAppHeight);
+    };
+  }, []);
+
   async function checkConnection() {
     try {
       await getDocs(query(collection(db, COLLECTIONS.SALES), limit(1)));

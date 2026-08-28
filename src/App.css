@@ -88,6 +88,7 @@ textarea:focus-visible,
   display: flex;
   height: 100vh;
   height: 100dvh;
+  height: var(--app-height, 100dvh);
   width: 100%;
   background: var(--paper);
 }
@@ -1090,19 +1091,34 @@ tbody tr:hover { background: var(--green-050); }
 }
 
 @media (max-width: 640px) {
-  .topbar { height: auto; padding: 12px 14px; flex-wrap: wrap; gap: 10px; }
-  .page-title { font-size: 15px; }
+  .topbar { height: auto; min-height: 0; padding: 8px 14px; flex-wrap: wrap; gap: 8px; }
+  .page-title { font-size: 14px; }
+  .page-description { display: none; }
   .topbar-right { width: 100%; justify-content: space-between; }
 
   .section-header { flex-direction: column; align-items: flex-start; gap: 10px; }
   .section-header h1 { font-size: 21px; }
 
-  .chat-messages { padding: 16px 4.5% 12px; }
-  .quick-actions { padding: 6px 4.5% 8px; }
+  .chat-messages { padding: 12px 4.5% 12px; }
+  .quick-actions { padding: 5px 4.5% 6px; }
   .input-area { margin: 0 4.5% 8px; }
   .input-hint { padding: 0 4.5% 10px; }
-  .chat-context-bar { padding: 8px 4.5% 0; }
+  .chat-context-bar { padding: 6px 4.5% 0; }
   .chat-context-hint { display: none; }
+
+  /* Saat textarea difokus (keyboard virtual kemungkinan terbuka),
+     sembunyikan sementara context-bar & quick-actions supaya area
+     pesan + kotak ketik dapat ruang maksimal -- pola umum di app
+     chat (WhatsApp/Telegram web) saat sedang mengetik di HP. */
+  .chat-page:has(.input-area textarea:focus) .chat-context-bar,
+  .chat-page:has(.input-area textarea:focus) .quick-actions {
+    display: none;
+  }
+
+  /* Font input WAJIB >= 16px di HP -- di bawah itu Safari/iOS otomatis
+     zoom in saat fokus, dan zoom-nya sering tidak balik rapi setelah
+     keyboard ditutup (persis keluhan "zoom layar berubah"). */
+  input, select, textarea { font-size: 16px !important; }
 
   .chat-bubble { max-width: 88%; font-size: 13px; }
   .hero h2 { font-size: 20px; }
