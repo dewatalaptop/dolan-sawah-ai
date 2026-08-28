@@ -767,16 +767,111 @@ tbody tr:hover { background: var(--green-050); }
   box-shadow: var(--shadow-sm);
 }
 .chat-bubble-ai {
+  max-width: 92%;
   background: var(--surface);
   border: 1px solid var(--border-soft);
   color: var(--ink);
   border-radius: 17px 17px 17px 4px;
+  white-space: normal;
 }
 .chat-bubble-user {
   background: linear-gradient(135deg, var(--green-600), var(--green-500));
   color: #fff;
   border-radius: 17px 17px 4px 17px;
 }
+
+/* =========================================================
+   MARKDOWN JAWABAN AI -- rendering visual jawaban Agent Core/
+   laporan lokal, disesuaikan ke bentuk data (tabel untuk data
+   tabular, heading+ikon untuk bagian laporan, callout untuk
+   rekomendasi/quote) supaya tidak tampil sebagai teks mentah
+   berisi tanda **, ##, | dan semacamnya.
+   ========================================================= */
+
+.md-content { font-size: 13.5px; line-height: 1.65; }
+.md-content > *:first-child { margin-top: 0; }
+.md-content > *:last-child { margin-bottom: 0; }
+
+.md-content p { margin: 0 0 10px; }
+.md-content strong { font-weight: 800; color: var(--green-700); }
+.md-content em { color: var(--ink-soft); }
+
+.md-heading {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  margin: 16px 0 8px;
+  font-size: 13.5px;
+  font-weight: 800;
+  color: var(--ink);
+  letter-spacing: 0.01em;
+}
+.md-heading:first-child { margin-top: 2px; }
+.md-heading-sm { font-size: 12.5px; margin: 12px 0 6px; }
+.md-heading-icon {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 22px; height: 22px;
+  min-width: 22px;
+  border-radius: 7px;
+  background: var(--green-050);
+  color: var(--green-700);
+}
+
+.md-content ul, .md-content ol { margin: 0 0 10px; padding-left: 20px; }
+.md-content li { margin-bottom: 5px; }
+.md-content li::marker { color: var(--green-600); font-weight: 700; }
+.md-content li > p { margin-bottom: 4px; }
+
+.md-table-wrap {
+  overflow-x: auto;
+  margin: 8px 0 12px;
+  border: 1px solid var(--border-soft);
+  border-radius: var(--radius-sm);
+}
+.md-table-wrap table { width: 100%; min-width: 0; border-collapse: collapse; font-size: 12px; }
+.md-table-wrap thead { background: var(--green-050); }
+.md-table-wrap th {
+  text-align: left;
+  padding: 8px 11px;
+  font-size: 9.5px;
+  font-weight: 800;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--green-700);
+  border-bottom: 1px solid var(--border-soft);
+  white-space: nowrap;
+}
+.md-table-wrap td {
+  padding: 8px 11px;
+  color: var(--ink-soft);
+  border-bottom: 1px solid var(--border-soft);
+  vertical-align: top;
+}
+.md-table-wrap tbody tr:last-child td { border-bottom: none; }
+.md-table-wrap tbody tr:hover { background: var(--green-050); }
+
+.md-callout {
+  margin: 8px 0 12px;
+  padding: 10px 13px;
+  background: var(--orange-050);
+  border-left: 3px solid var(--orange-500);
+  border-radius: 0 var(--radius-sm) var(--radius-sm) 0;
+  color: var(--ink);
+  font-size: 12.5px;
+}
+.md-callout p { margin: 0; }
+.md-callout p + p { margin-top: 6px; }
+
+.md-content hr { border: none; border-top: 1px solid var(--border-soft); margin: 12px 0; }
+.md-content code {
+  background: var(--border-soft);
+  padding: 1px 5px;
+  border-radius: 4px;
+  font-size: 12px;
+}
+.md-content a { color: var(--green-700); font-weight: 650; }
 
 .chat-tags { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 11px; }
 .chat-tag {

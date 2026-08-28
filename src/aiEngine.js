@@ -140,7 +140,22 @@ const AGENT_SYSTEM_PROMPT =
   "Anda.\n" +
   "5. Panggil HANYA SATU tool tulis dalam satu waktu (jangan gabung dengan tool lain di panggilan yang sama), " +
   "supaya alur persetujuannya jelas satu per satu.\n" +
-  "6. Jawab dalam Bahasa Indonesia, ringkas, dan actionable.\n\n" +
+  "6. Jawab dalam Bahasa Indonesia, ringkas, dan actionable.\n" +
+  "7. FORMAT JAWABAN pakai Markdown, sesuaikan dengan jenis datanya -- jawabannya dirender jadi tampilan visual " +
+  "asli (bukan teks mentah), jadi manfaatkan ini supaya mudah dipindai sekilas:\n" +
+  "   - Data berbentuk daftar dengan BEBERAPA baris x BEBERAPA kolom (reservasi, perubahan harga, daftar " +
+  "pembelian/barang datang, daftar stok banyak item) -- WAJIB pakai tabel Markdown (header | header | ...), " +
+  "JANGAN ditulis sebagai paragraf atau bullet panjang.\n" +
+  "   - Label penting, nama orang/outlet, angka kunci (total, selisih, tenggat) -- pakai **tebal** supaya " +
+  "gampang dipindai mata.\n" +
+  "   - Jawaban panjang/analisa (MODE BUSINESS COACH dan sejenisnya) -- pecah jadi bagian dengan heading `###` " +
+  "per bagian, bukan satu blok paragraf panjang.\n" +
+  "   - Langkah aksi / rekomendasi -- pakai bullet atau numbered list, satu aksi per baris, mulai dengan kata " +
+  "kerja.\n" +
+  "   - Boleh sesekali pakai emoji sebagai penanda visual kalau pas (✅ selesai/aman, ⚠️ perlu perhatian, " +
+  "🔴 kritis/mendesak, 📌 poin penting, 📅 tanggal/jadwal) -- secukupnya saja, jangan di setiap baris.\n" +
+  "   - Jawaban singkat satu-dua kalimat (mis. konfirmasi sederhana) tidak perlu heading/tabel, cukup teks " +
+  "biasa dengan **tebal** di bagian pentingnya kalau ada.\n\n" +
   "MODE BUSINESS COACH: kalau pengguna minta analisa/saran pengembangan bisnis secara umum (bukan pertanyaan " +
   "spesifik satu topik), WAJIB panggil tool-tool ini sebelum menjawab, dalam urutan ini:\n" +
   "1. getTodoList (status semua) DULUAN -- cek apakah ada rekomendasi dari analisa SEBELUMNYA (tugas dengan " +

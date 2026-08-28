@@ -1,4 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import ReactMarkdown from "react-markdown";
+import remarkGfm from "remark-gfm";
 import { collection, addDoc, getDocs, getDoc, query, limit, where, doc, writeBatch, updateDoc, deleteDoc, setDoc } from "firebase/firestore";
 import {
   onAuthStateChanged,
@@ -1802,7 +1804,11 @@ const ICONS = {
   upload: "M12 16V4M7 9l5-5 5 5M4 16v3a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-3",
   doc: "M6 3h8l4 4v14H6zM14 3v4h4M9 12h6M9 16h6M9 8h2",
   book: "M4 5c0-1 1-2 3-2h5v16H7c-2 0-3 1-3 2zM12 3h5c2 0 3 1 3 2v14c0-1-1-2-3-2h-5z",
-  check: "M4 6h13v13H4zM7.5 12.5l2.5 2.5 5-5M17 6V4h3v3"
+  check: "M4 6h13v13H4zM7.5 12.5l2.5 2.5 5-5M17 6V4h3v3",
+  calendar: "M5 4h14v16H5zM5 9h14M8 2v4M16 2v4M9 13h2M13 13h2M9 17h2M13 17h2",
+  alert: "M12 3l10 18H2zM12 9v5M12 17h.01",
+  target: "M12 21a9 9 0 1 0 0-18 9 9 0 0 0 0 18zM12 16a4 4 0 1 0 0-8 4 4 0 0 0 0 8zM12 12h.01",
+  sparkle: "M12 3l2 5 5 2-5 2-2 5-2-5-5-2 5-2z"
 };
 
 function Icon({ name, size = 17 }) {
@@ -1913,13 +1919,73 @@ function FilterBar({ search, onSearchChange, searchPlaceholder, start, onStartCh
   );
 }
 
+// Cocokkan judul bagian (### Reservasi, ### Rekomendasi Aksi, dst.) ke
+// salah satu ikon yang sudah ada, supaya jawaban AI kelihatan terstruktur
+// secara visual walau modelnya cuma menulis Markdown biasa -- tidak
+// bergantung pada AI memilih emoji yang konsisten sendiri.
+const HEADING_ICON_RULES = [
+  [/reservasi/i, "calendar"],
+  [/(stok|variance|opname|waste)/i, "box"],
+  [/(rekomendasi|aksi|tindak)/i, "check"],
+  [/(masalah|risiko|kritis|mendesak|darurat)/i, "alert"],
+  [/(target|kpi)/i, "target"],
+  [/(penjualan|omzet)/i, "coin"],
+  [/(pembelian|belanja|kebutuhan)/i, "cart"],
+  [/harga/i, "tag"],
+  [/(kondisi|ringkasan|saat ini|overview)/i, "trend"],
+  [/follow.?up/i, "calendar"]
+];
+
+function extractPlainText(node) {
+  if (node == null || typeof node === "boolean") return "";
+  if (typeof node === "string" || typeof node === "number") return String(node);
+  if (Array.isArray(node)) return node.map(extractPlainText).join("");
+  if (node.props?.children != null) return extractPlainText(node.props.children);
+  return "";
+}
+
+function pickHeadingIcon(text) {
+  const rule = HEADING_ICON_RULES.find(([re]) => re.test(text));
+  return rule ? rule[1] : "sparkle";
+}
+
+function MarkdownHeading({ level, children }) {
+  const icon = pickHeadingIcon(extractPlainText(children));
+  const Tag = level === 3 ? "h4" : "h3";
+  return (
+    <Tag className={`md-heading${level === 3 ? " md-heading-sm" : ""}`}>
+      <span className="md-heading-icon"><Icon name={icon} size={level === 3 ? 12 : 13} /></span>
+      {children}
+    </Tag>
+  );
+}
+
+const MARKDOWN_COMPONENTS = {
+  h1: ({ children }) => <MarkdownHeading level={2}>{children}</MarkdownHeading>,
+  h2: ({ children }) => <MarkdownHeading level={2}>{children}</MarkdownHeading>,
+  h3: ({ children }) => <MarkdownHeading level={3}>{children}</MarkdownHeading>,
+  table: ({ children }) => <div className="md-table-wrap"><table>{children}</table></div>,
+  blockquote: ({ children }) => <div className="md-callout">{children}</div>,
+  a: ({ children, href }) => <a href={href} target="_blank" rel="noreferrer">{children}</a>
+};
+
+function AiMarkdown({ text }) {
+  return (
+    <div className="md-content">
+      <ReactMarkdown remarkPlugins={[remarkGfm]} components={MARKDOWN_COMPONENTS}>
+        {text || ""}
+      </ReactMarkdown>
+    </div>
+  );
+}
+
 function ChatMessage({ message }) {
   const isUser = message.role === "user";
   return (
     <div className={`chat-row ${isUser ? "chat-row-user" : "chat-row-ai"}`}>
       {!isUser && <div className="chat-avatar">DS</div>}
       <div className={`chat-bubble ${isUser ? "chat-bubble-user" : "chat-bubble-ai"}`}>
-        {message.text}
+        {isUser ? message.text : <AiMarkdown text={message.text} />}
         <ChatCharts charts={message.charts} />
         {message.tags?.length > 0 && (
           <div className="chat-tags">
