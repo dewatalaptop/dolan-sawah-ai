@@ -29,7 +29,9 @@ export const COLLECTIONS = {
 
   NOTIFICATIONS: "notifications",
 
-  TODOS: "todos"
+  TODOS: "todos",
+
+  VARIANCE_HISTORY: "variance_history"
 };
 
 // ============================================================
@@ -271,6 +273,30 @@ export function createTodo(data = {}) {
     outlet: data.outlet || "ALL",
     done: !!data.done,
     doneAt: data.doneAt || null,
+    // "user" (diketik lewat chat/halaman To-Do) | "ai" (dibuat Agent
+    // Core lewat tool logRecommendations, ditandai badge di UI) --
+    // pemilik tetap bisa hapus/selesaikan bebas seperti tugas biasa.
+    source: data.source === "ai" ? "ai" : "user",
+    createdAt: new Date().toISOString()
+  };
+}
+
+// ============================================================
+// VARIANCE HISTORY (snapshot variance tiap kali stock opname baru
+// disimpan -- dipakai untuk tool getVarianceTrend supaya Agent Core
+// bisa lihat pola dari waktu ke waktu, bukan cuma angka opname
+// terakhir. Terus bertambah kaya seiring opname rutin dilakukan.)
+// ============================================================
+
+export function createVarianceSnapshot(data = {}) {
+  return {
+    itemName: data.itemName || "",
+    outlet: data.outlet || "DS",
+    date: data.date || "",
+    theoretical: Number(data.theoretical || 0),
+    actual: data.actual === null || data.actual === undefined ? null : Number(data.actual),
+    variance: data.variance === null || data.variance === undefined ? null : Number(data.variance),
+    unit: data.unit || "",
     createdAt: new Date().toISOString()
   };
 }

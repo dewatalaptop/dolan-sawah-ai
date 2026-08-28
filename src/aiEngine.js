@@ -142,15 +142,25 @@ const AGENT_SYSTEM_PROMPT =
   "supaya alur persetujuannya jelas satu per satu.\n" +
   "6. Jawab dalam Bahasa Indonesia, ringkas, dan actionable.\n\n" +
   "MODE BUSINESS COACH: kalau pengguna minta analisa/saran pengembangan bisnis secara umum (bukan pertanyaan " +
-  "spesifik satu topik), WAJIB panggil KEEMPAT tool baca ini sebelum menjawab -- getSalesSummary, " +
-  "getVarianceReport, getReservationForecast, getTodoList -- supaya gambarannya benar-benar menyeluruh, bukan " +
-  "cuma sebagian. Boleh dipanggil beberapa sekaligus dalam satu putaran atau menyebar ke beberapa putaran, yang " +
-  "penting keempatnya terpanggil sebelum jawaban akhir. Susun jawaban akhir sebagai laporan singkat terstruktur: " +
+  "spesifik satu topik), WAJIB panggil tool-tool ini sebelum menjawab, dalam urutan ini:\n" +
+  "1. getTodoList (status semua) DULUAN -- cek apakah ada rekomendasi dari analisa SEBELUMNYA (tugas dengan " +
+  "sumber saran_ai_sebelumnya) yang masih belum selesai. Kalau ada, itu WAJIB disebutkan di jawaban -- jangan " +
+  "kasih saran baru yang isinya mengulang saran lama yang belum sempat dikerjakan; tegaskan progresnya dulu.\n" +
+  "2. getSalesSummary, getVarianceReport, getReservationForecast -- kondisi operasional terkini.\n" +
+  "3. getReservationPatterns dan getVarianceTrend -- pola historis (hari ramai/sepi, item yang berulang kali " +
+  "bermasalah). Kalau datanya masih tipis (jumlah_hari_data atau jumlah_data kecil), katakan itu terus terang " +
+  "sebagai keterbatasan data, jangan berlagak yakin dari sampel kecil.\n" +
+  "Boleh dipanggil beberapa sekaligus dalam satu putaran atau menyebar ke beberapa putaran, yang penting semua " +
+  "terpanggil sebelum jawaban akhir. Susun jawaban akhir sebagai laporan singkat terstruktur: " +
   "(a) Kondisi saat ini -- 2-3 poin fakta paling penting dari data, dengan angka konkret; " +
-  "(b) Masalah/risiko -- apa yang paling mendesak diperbaiki, urutkan dari paling kritis; " +
+  "(b) Masalah/risiko -- apa yang paling mendesak diperbaiki, urutkan dari paling kritis, sebutkan kalau ada " +
+  "pola berulang dari getReservationPatterns/getVarianceTrend (bukan cuma kejadian sekali); " +
   "(c) Rekomendasi aksi -- 3-5 langkah KONKRET dan spesifik (bukan saran generik seperti \"tingkatkan pemasaran\" " +
   "tanpa detail), sebutkan target/ukuran keberhasilan kalau memungkinkan; " +
-  "(d) Follow-up -- kalau ada hal yang perlu dicek ulang nanti, tawarkan untuk dicatat lewat tool flagFollowUp.";
+  "(d) Follow-up -- kalau ada hal yang perlu dicek ulang nanti, tawarkan untuk dicatat lewat tool flagFollowUp. " +
+  "SETELAH menulis (c), WAJIB panggil tool logRecommendations dengan daftar rekomendasi yang baru saja " +
+  "ditulis di (c), supaya bisa dipantau progresnya di analisa berikutnya (lihat langkah 1) -- ini yang membuat " +
+  "coaching-nya makin tajam tiap kali dipakai, bukan mengulang dari nol setiap saat.";
 
 const HARI_ID = ["Minggu", "Senin", "Selasa", "Rabu", "Kamis", "Jumat", "Sabtu"];
 
@@ -176,16 +186,25 @@ function buildDateContextMessage() {
 }
 
 export function buildAgentInitialMessages(userMessage) {
+  // Konteks tanggal TIDAK disimpan di sini -- runAgentLoop() menambahkan
+  // pesan tanggal segar ke tiap panggilan API (lihat komentar di sana),
+  // jadi cukup ditambahkan sekali per panggilan, bukan disimpan permanen
+  // dan ikut menumpuk di riwayat percakapan yang panjang.
   return [
     { role: "system", content: AGENT_SYSTEM_PROMPT },
-    buildDateContextMessage(),
     { role: "user", content: userMessage }
   ];
 }
 
 // executeTool(name, args) -> Promise<any> (hasil JSON-serializable, dipakai
 // sebagai isi pesan role "tool"). isWriteTool(name) -> boolean.
-export async function runAgentLoop({ messages, tools, executeTool, isWriteTool, maxIterations = 6 }) {
+// maxIterations dinaikkan dari 6 -> 10: MODE BUSINESS COACH sekarang
+// wajib panggil 6 tool baca + logRecommendations sebelum jawaban akhir
+// (lihat AGENT_SYSTEM_PROMPT) -- kalau modelnya kebetulan memanggil
+// tool satu-satu per putaran (bukan digabung), 6 masih terlalu
+// sempit dan turn akan terpotong "TERLALU BANYAK LANGKAH" padahal
+// sebenarnya baru separuh jalan.
+export async function runAgentLoop({ messages, tools, executeTool, isWriteTool, maxIterations = 10 }) {
   if (!client) {
     throw new Error("AI API key belum dikonfigurasi (VITE_ZAI_API_KEY kosong).");
   }
@@ -194,9 +213,18 @@ export async function runAgentLoop({ messages, tools, executeTool, isWriteTool, 
   const toolLog = [];
 
   for (let i = 0; i < maxIterations; i++) {
+    // Konteks tanggal dikirim ULANG sebagai pesan TERAKHIR di tiap
+    // putaran (bukan cuma sekali di awal) -- supaya tidak "hilang di
+    // tengah" percakapan panjang (kejadian nyata: MODE BUSINESS COACH
+    // dengan 6+ tool call sempat balik mengarang tanggal 2024 di
+    // flagFollowUp meski konteks tanggal sudah dikirim di pesan
+    // pertama). Reminder ini TIDAK disimpan permanen ke workingMessages
+    // supaya tidak menumpuk duplikat tiap putaran -- cuma ditambahkan
+    // ke payload API untuk putaran ini saja.
+    const apiMessages = [...workingMessages, buildDateContextMessage()];
     const response = await client.chat.completions.create({
       model: MODEL_NAME,
-      messages: workingMessages,
+      messages: apiMessages,
       tools,
       tool_choice: "auto"
     });

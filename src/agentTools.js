@@ -15,7 +15,10 @@ export const READ_TOOL_NAMES = [
   "getSalesSummary",
   "getReservationForecast",
   "getTodoList",
-  "flagFollowUp"
+  "getReservationPatterns",
+  "getVarianceTrend",
+  "flagFollowUp",
+  "logRecommendations"
 ];
 
 // Semua tool tulis WAJIB approval manual pemilik -- tidak ada
@@ -149,6 +152,77 @@ export const AGENT_TOOLS = [
           }
         },
         required: []
+      }
+    }
+  },
+  {
+    type: "function",
+    function: {
+      name: "getReservationPatterns",
+      description:
+        "Ambil pola permintaan reservasi historis per hari-dalam-minggu (rata-rata jumlah tamu & jumlah " +
+        "reservasi untuk tiap Senin/Selasa/dst.), dihitung dari seluruh data reservasi confirmed yang ada. " +
+        "Pakai ini untuk pertanyaan soal hari mana biasanya paling ramai/sepi, atau untuk memperkirakan beban " +
+        "operasional hari tertentu berdasarkan pola masa lalu -- BUKAN untuk daftar reservasi konkret (pakai " +
+        "getReservationForecast untuk itu). Kalau jumlah_hari_data sedikit, sampaikan dengan hati-hati bahwa " +
+        "polanya baru indikasi awal.",
+      parameters: {
+        type: "object",
+        properties: {
+          outlet: { type: "string", enum: OUTLET_ENUM, description: "Kode outlet, atau ALL untuk gabungan semua outlet." }
+        },
+        required: []
+      }
+    }
+  },
+  {
+    type: "function",
+    function: {
+      name: "getVarianceTrend",
+      description:
+        "Ambil riwayat variance (selisih stok teoritis vs aktual) dari waktu ke waktu -- setiap kali stock " +
+        "opname baru disimpan, satu titik data ditambahkan. Sebutkan `bahan` untuk riwayat satu item spesifik " +
+        "(mis. tren Bawang Putih tiap opname), atau kosongkan untuk ringkasan item mana yang PALING SERING " +
+        "bermasalah (rata-rata selisih paling negatif) di seluruh riwayat. Pakai ini untuk pertanyaan soal pola " +
+        "kebocoran/susut berulang, bukan cuma variance hari ini (itu pakai getVarianceReport).",
+      parameters: {
+        type: "object",
+        properties: {
+          bahan: { type: "string", description: "Nama bahan tertentu (opsional). Kosongkan untuk ringkasan semua bahan." },
+          outlet: { type: "string", enum: OUTLET_ENUM, description: "Kode outlet, atau ALL untuk gabungan semua outlet." }
+        },
+        required: []
+      }
+    }
+  },
+  {
+    type: "function",
+    function: {
+      name: "logRecommendations",
+      description:
+        "Catat rekomendasi/saran pengembangan yang baru saja Anda berikan sebagai tugas (to-do) yang bisa " +
+        "dipantau progresnya -- BUKAN aksi ke data operasional, jadi otomatis dieksekusi tanpa approval (sama " +
+        "seperti flagFollowUp). WAJIB dipanggil di akhir setiap analisa MODE BUSINESS COACH supaya rekomendasi " +
+        "tidak hilang begitu saja dan bisa dicek lagi progresnya lewat getTodoList/halaman To-Do di lain waktu. " +
+        "Pemilik tetap bebas menghapus/menyelesaikan tugas ini kapan saja seperti tugas biasa.",
+      parameters: {
+        type: "object",
+        properties: {
+          rekomendasi: {
+            type: "array",
+            description: "Daftar rekomendasi yang barusan diberikan.",
+            items: {
+              type: "object",
+              properties: {
+                judul: { type: "string", description: "Ringkasan singkat rekomendasi/aksi, mis. \"Lakukan stock opname 5 bahan utama\"." },
+                target: { type: "string", description: "Ukuran keberhasilan/target, kalau ada (opsional)." },
+                tenggatHari: { type: "number", description: "Berapa hari dari sekarang tenggatnya masuk akal untuk dicek. Default 7." }
+              },
+              required: ["judul"]
+            }
+          }
+        },
+        required: ["rekomendasi"]
       }
     }
   },

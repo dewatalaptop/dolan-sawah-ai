@@ -22,7 +22,8 @@ import {
   createChatMessage,
   createActivityLog,
   createDecisionLog,
-  createTodo
+  createTodo,
+  createVarianceSnapshot
 } from "./dataModel";
 
 import {
@@ -2163,10 +2164,47 @@ export default function App() {
       const logEntry = createActivityLog({ actionType, collectionName, documentIds: ids, summary });
       const ref = await addDoc(collection(db, COLLECTIONS.ACTIVITY_LOG), logEntry);
       setActivityLog((prev) => [{ id: ref.id, ...logEntry }, ...prev]);
+      if (collectionName === COLLECTIONS.STOCK_OPNAME) {
+        snapshotVarianceForOpname(rows).catch((error) =>
+          console.error("Gagal mencatat riwayat variance:", error)
+        );
+      }
       return ids;
     } finally {
       setSaveProgress(null);
     }
+  }
+
+  // Setiap kali stock opname baru tersimpan, hitung ulang variance
+  // (teoritis vs aktual) untuk item yang baru diopname dan simpan
+  // sebagai satu titik data di variance_history -- inilah yang bikin
+  // getVarianceTrend makin kaya/berguna tiap kali opname rutin
+  // dilakukan, bukan cuma menampilkan angka opname terakhir.
+  // Data diambil ULANG dari Firestore (bukan pakai rawData di state)
+  // karena saveRowsTracked() dipanggil SEBELUM refreshData() oleh
+  // pemanggilnya -- state lokal belum tentu termasuk opname yang baru
+  // saja disimpan ini.
+  async function snapshotVarianceForOpname(opnameRows) {
+    const freshData = await loadInventoryData();
+    const inventory = calculateTheoreticalStock(freshData);
+    const inventoryByKey = new Map(inventory.map((x) => [`${x.outlet}|${x.itemName}`, x]));
+
+    const snapshots = opnameRows
+      .map((row) => ({ row, match: inventoryByKey.get(`${row.outlet}|${row.itemName}`) }))
+      .filter(({ match }) => match && match.actual !== null)
+      .map(({ row, match: x }) =>
+        createVarianceSnapshot({
+          itemName: x.itemName,
+          outlet: x.outlet,
+          date: row.date || getTodayISO(),
+          theoretical: x.theoretical,
+          actual: x.actual,
+          variance: x.variance,
+          unit: x.unit
+        })
+      );
+
+    await Promise.all(snapshots.map((snap) => addDoc(collection(db, COLLECTIONS.VARIANCE_HISTORY), snap)));
   }
 
   async function undoActivity(logEntry) {
@@ -2850,9 +2888,127 @@ export default function App() {
             judul: t.title,
             periode: t.period,
             tenggat: t.dueDate,
-            selesai: !!t.done
+            selesai: !!t.done,
+            sumber: t.source === "ai" ? "saran_ai_sebelumnya" : "user"
           }))
         };
+      }
+
+      case "getReservationPatterns": {
+        const snap = await getDocs(collection(db, "reservations_mirror"));
+        const rows = snap.docs
+          .map((d) => d.data())
+          .filter((r) => r.status === "confirmed" && (outlet === "ALL" || r.outlet === outlet));
+
+        const byDate = new Map();
+        rows.forEach((r) => {
+          const cur = byDate.get(r.date) || { tamu: 0, reservasi: 0 };
+          cur.tamu += Number(r.jumlah || 0);
+          cur.reservasi += 1;
+          byDate.set(r.date, cur);
+        });
+
+        const HARI_ID = ["Minggu", "Senin", "Selasa", "Rabu", "Kamis", "Jumat", "Sabtu"];
+        const perHari = HARI_ID.map((nama, idx) => ({ nama, idx, hariCount: 0, totalTamu: 0, totalReservasi: 0 }));
+        byDate.forEach((val, dateStr) => {
+          const dow = new Date(`${dateStr}T00:00:00`).getDay();
+          perHari[dow].hariCount += 1;
+          perHari[dow].totalTamu += val.tamu;
+          perHari[dow].totalReservasi += val.reservasi;
+        });
+
+        return {
+          outlet,
+          jumlah_hari_data: byDate.size,
+          per_hari: perHari.map((h) => ({
+            hari: h.nama,
+            jumlah_hari_observasi: h.hariCount,
+            rata_rata_tamu_per_hari: h.hariCount ? Math.round((h.totalTamu / h.hariCount) * 10) / 10 : 0,
+            rata_rata_reservasi_per_hari: h.hariCount ? Math.round((h.totalReservasi / h.hariCount) * 10) / 10 : 0
+          })),
+          catatan:
+            byDate.size < 14
+              ? "Data historis masih sedikit (kurang dari 2 minggu) -- pola ini baru indikasi awal, sampaikan dengan hati-hati, jangan terlalu percaya diri."
+              : "Data cukup untuk melihat pola mingguan yang lebih andal."
+        };
+      }
+
+      case "getVarianceTrend": {
+        const snap = await getDocs(collection(db, COLLECTIONS.VARIANCE_HISTORY));
+        let rows = snap.docs.map((d) => d.data());
+        if (outlet !== "ALL") rows = rows.filter((r) => r.outlet === outlet);
+        if (args.bahan) {
+          const key = normalizeText(args.bahan);
+          rows = rows.filter((r) => normalizeText(r.itemName) === key);
+        }
+        rows.sort((a, b) => (a.date < b.date ? -1 : 1));
+
+        if (args.bahan) {
+          return {
+            bahan: args.bahan,
+            outlet,
+            jumlah_data: rows.length,
+            riwayat: rows.slice(-15).map((r) => ({
+              tanggal: r.date,
+              outlet: r.outlet,
+              teoritis: r.theoretical,
+              aktual: r.actual,
+              selisih: r.variance,
+              satuan: r.unit
+            }))
+          };
+        }
+
+        const byItem = new Map();
+        rows.forEach((r) => {
+          const key = `${r.itemName}|${r.outlet}`;
+          const cur = byItem.get(key) || { itemName: r.itemName, outlet: r.outlet, jumlahOpname: 0, jumlahMinus: 0, totalVariance: 0, satuan: r.unit };
+          cur.jumlahOpname += 1;
+          if (r.variance < 0) cur.jumlahMinus += 1;
+          cur.totalVariance += r.variance;
+          byItem.set(key, cur);
+        });
+        const summary = Array.from(byItem.values())
+          .map((x) => ({ ...x, rataVariance: Math.round((x.totalVariance / x.jumlahOpname) * 100) / 100 }))
+          .sort((a, b) => a.rataVariance - b.rataVariance)
+          .slice(0, 10);
+
+        return {
+          outlet,
+          jumlah_item_dengan_riwayat: byItem.size,
+          item_paling_sering_bermasalah: summary.map((x) => ({
+            bahan: x.itemName,
+            outlet: x.outlet,
+            jumlah_opname: x.jumlahOpname,
+            jumlah_minus: x.jumlahMinus,
+            rata_rata_selisih: x.rataVariance,
+            satuan: x.satuan
+          }))
+        };
+      }
+
+      case "logRecommendations": {
+        const items = Array.isArray(args.rekomendasi) ? args.rekomendasi : [];
+        if (!items.length) return { dicatat: 0 };
+        const rows = items.map((r) => {
+          const days = Number(r.tenggatHari) > 0 ? Number(r.tenggatHari) : 7;
+          const due = new Date();
+          due.setDate(due.getDate() + days);
+          return createTodo({
+            title: r.target ? `${r.judul} (target: ${r.target})` : r.judul,
+            period: days <= 1 ? "harian" : days <= 10 ? "mingguan" : "bulanan",
+            dueDate: toLocalISODate(due),
+            outlet: "ALL",
+            source: "ai"
+          });
+        });
+        const ids = [];
+        for (const row of rows) {
+          const ref = await addDoc(collection(db, COLLECTIONS.TODOS), row);
+          ids.push(ref.id);
+        }
+        setTodos((prev) => [...prev, ...rows.map((r, i) => ({ id: ids[i], ...r }))]);
+        return { dicatat: rows.length, judul: rows.map((r) => r.title) };
       }
 
       case "flagFollowUp":
@@ -5055,6 +5211,14 @@ export default function App() {
                   onChange={(e) => toggleTodoDone(t.id, e.target.checked)}
                 />,
                 <span key="title" style={t.done ? { textDecoration: "line-through", color: "#999" } : undefined}>
+                  {t.source === "ai" && (
+                    <span
+                      title="Dibuat otomatis dari saran Agent Core"
+                      style={{ fontSize: 10, fontWeight: 700, color: "#2e7d32", marginRight: 6, whiteSpace: "nowrap" }}
+                    >
+                      🤖 Saran AI
+                    </span>
+                  )}
                   {t.title}
                 </span>,
                 periodLabel[t.period] || t.period,
