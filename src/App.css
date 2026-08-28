@@ -1250,9 +1250,12 @@ tbody tr:hover { background: var(--green-050); }
 }
 
 .notif-dropdown {
-  position: absolute;
-  top: calc(100% + 10px);
-  right: 0;
+  /* top/right diisi inline lewat JS (posisi tombol lonceng saat
+     dibuka) -- lihat notifDropdownPos di App.jsx. Elemen ini di-portal
+     ke document.body supaya position:fixed dihitung relatif ke
+     viewport sungguhan, bukan ke .topbar (yang punya backdrop-filter,
+     itu bikin containing-block-nya jadi topbar, bukan viewport). */
+  position: fixed;
   z-index: 40;
   width: min(380px, 88vw);
   max-height: min(70vh, 520px);
@@ -1334,7 +1337,16 @@ tbody tr:hover { background: var(--green-050); }
 .followup-notif-dismiss:hover { background: var(--green-100); }
 
 @media (max-width: 720px) {
-  .notif-dropdown { position: fixed; top: auto; bottom: 78px; left: 12px; right: 12px; width: auto; }
+  /* !important perlu di sini karena top/right normalnya diisi inline
+     lewat JS (posisi tombol lonceng) -- di layar sempit kita mau
+     override jadi lembar bawah full-width, bukan ikut posisi tombol. */
+  .notif-dropdown {
+    top: auto !important;
+    bottom: 78px !important;
+    left: 12px !important;
+    right: 12px !important;
+    width: auto !important;
+  }
 }
 
 /* =========================================================

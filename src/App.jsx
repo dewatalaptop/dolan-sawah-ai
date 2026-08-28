@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { createPortal } from "react-dom";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { collection, addDoc, getDocs, getDoc, query, limit, where, doc, writeBatch, updateDoc, deleteDoc, setDoc } from "firebase/firestore";
@@ -2167,6 +2168,15 @@ export default function App() {
 
   const [notifications, setNotifications] = useState([]);
   const [notifDropdownOpen, setNotifDropdownOpen] = useState(false);
+  const notifBellRef = useRef(null);
+  // Dropdown-nya di-portal ke document.body (lihat JSX di bawah) supaya
+  // posisinya TIDAK ikut kena "containing block" dari .topbar yang
+  // punya backdrop-filter -- backdrop-filter/filter pada ancestor
+  // membuat position:fixed anak-anaknya dihitung relatif ke ancestor
+  // itu (bukan ke viewport), yang sebelumnya bikin dropdown ini
+  // ke-render jauh di luar layar (ketutup/ilang di atas topbar).
+  // Posisi dihitung manual dari posisi tombol lonceng saat dibuka.
+  const [notifDropdownPos, setNotifDropdownPos] = useState({ top: 70, right: 16 });
 
   async function loadNotifications() {
     const snapshot = await getDocs(
@@ -6038,8 +6048,18 @@ export default function App() {
           <div className="topbar-right">
             <div className="notif-bell-wrap">
               <button
+                ref={notifBellRef}
                 className={`notif-bell ${totalAlertCount > 0 ? "has-alerts" : ""}`}
-                onClick={() => setNotifDropdownOpen((v) => !v)}
+                onClick={() => {
+                  if (!notifDropdownOpen && notifBellRef.current) {
+                    const rect = notifBellRef.current.getBoundingClientRect();
+                    setNotifDropdownPos({
+                      top: rect.bottom + 10,
+                      right: Math.max(12, window.innerWidth - rect.right)
+                    });
+                  }
+                  setNotifDropdownOpen((v) => !v);
+                }}
                 aria-label="Notifikasi"
                 title="Notifikasi"
               >
@@ -6048,79 +6068,6 @@ export default function App() {
                   <span className="notif-bell-badge">{totalAlertCount > 99 ? "99+" : totalAlertCount}</span>
                 )}
               </button>
-
-              {notifDropdownOpen && (
-                <>
-                  <div className="notif-backdrop" onClick={() => setNotifDropdownOpen(false)} />
-                  <div className="notif-dropdown">
-                    <div className="notif-dropdown-header">
-                      <span>Notifikasi</span>
-                      <button className="notif-dropdown-close" onClick={() => setNotifDropdownOpen(false)} aria-label="Tutup">
-                        <Icon name="close" size={14} />
-                      </button>
-                    </div>
-
-                    {totalAlertCount === 0 ? (
-                      <div className="notif-dropdown-empty">Semua beres -- tidak ada notifikasi.</div>
-                    ) : (
-                      <div className="notif-dropdown-body">
-                        {notifications.length > 0 && (
-                          <div className="notif-section">
-                            <div className="notif-section-title">
-                              <Icon name="bell" size={13} /> Perlu ditindaklanjuti ({notifications.length})
-                            </div>
-                            <ul className="notif-section-list">
-                              {notifications.map((n) => (
-                                <li key={n.id}>
-                                  <span>[{n.dueDate}] {n.message}</span>
-                                  <span className="notif-item-actions">
-                                    {n.type === "todo" && (
-                                      <button
-                                        className="secondary-button"
-                                        onClick={() => {
-                                          setActiveMenu("todo");
-                                          setNotifDropdownOpen(false);
-                                        }}
-                                      >
-                                        Lihat di To-Do
-                                      </button>
-                                    )}
-                                    <button className="followup-notif-dismiss" onClick={() => dismissNotification(n.id)}>
-                                      ✓ Selesai
-                                    </button>
-                                  </span>
-                                </li>
-                              ))}
-                            </ul>
-                          </div>
-                        )}
-
-                        {opsAlerts.length > 0 && (
-                          <div className="notif-section">
-                            <div className="notif-section-title">
-                              <Icon name="alert" size={13} /> Peringatan operasional ({opsAlerts.length})
-                            </div>
-                            <ul className="notif-section-list">
-                              {opsAlerts.map((issue, i) => <li key={i}><span>{issue.message}</span></li>)}
-                            </ul>
-                          </div>
-                        )}
-
-                        {dataQualityIssues.length > 0 && (
-                          <div className="notif-section">
-                            <div className="notif-section-title">
-                              <Icon name="alert" size={13} /> Potensi masalah data ({dataQualityIssues.length})
-                            </div>
-                            <ul className="notif-section-list">
-                              {dataQualityIssues.map((issue, i) => <li key={i}><span>{issue.message}</span></li>)}
-                            </ul>
-                          </div>
-                        )}
-                      </div>
-                    )}
-                  </div>
-                </>
-              )}
             </div>
 
             <div className="outlet-switch">
@@ -6140,6 +6087,80 @@ export default function App() {
             </div>
           </div>
         </header>
+
+        {notifDropdownOpen && createPortal(
+          <>
+            <div className="notif-backdrop" onClick={() => setNotifDropdownOpen(false)} />
+            <div className="notif-dropdown" style={{ top: notifDropdownPos.top, right: notifDropdownPos.right }}>
+              <div className="notif-dropdown-header">
+                <span>Notifikasi</span>
+                <button className="notif-dropdown-close" onClick={() => setNotifDropdownOpen(false)} aria-label="Tutup">
+                  <Icon name="close" size={14} />
+                </button>
+              </div>
+
+              {totalAlertCount === 0 ? (
+                <div className="notif-dropdown-empty">Semua beres -- tidak ada notifikasi.</div>
+              ) : (
+                <div className="notif-dropdown-body">
+                  {notifications.length > 0 && (
+                    <div className="notif-section">
+                      <div className="notif-section-title">
+                        <Icon name="bell" size={13} /> Perlu ditindaklanjuti ({notifications.length})
+                      </div>
+                      <ul className="notif-section-list">
+                        {notifications.map((n) => (
+                          <li key={n.id}>
+                            <span>[{n.dueDate}] {n.message}</span>
+                            <span className="notif-item-actions">
+                              {n.type === "todo" && (
+                                <button
+                                  className="secondary-button"
+                                  onClick={() => {
+                                    setActiveMenu("todo");
+                                    setNotifDropdownOpen(false);
+                                  }}
+                                >
+                                  Lihat di To-Do
+                                </button>
+                              )}
+                              <button className="followup-notif-dismiss" onClick={() => dismissNotification(n.id)}>
+                                ✓ Selesai
+                              </button>
+                            </span>
+                          </li>
+                        ))}
+                      </ul>
+                    </div>
+                  )}
+
+                  {opsAlerts.length > 0 && (
+                    <div className="notif-section">
+                      <div className="notif-section-title">
+                        <Icon name="alert" size={13} /> Peringatan operasional ({opsAlerts.length})
+                      </div>
+                      <ul className="notif-section-list">
+                        {opsAlerts.map((issue, i) => <li key={i}><span>{issue.message}</span></li>)}
+                      </ul>
+                    </div>
+                  )}
+
+                  {dataQualityIssues.length > 0 && (
+                    <div className="notif-section">
+                      <div className="notif-section-title">
+                        <Icon name="alert" size={13} /> Potensi masalah data ({dataQualityIssues.length})
+                      </div>
+                      <ul className="notif-section-list">
+                        {dataQualityIssues.map((issue, i) => <li key={i}><span>{issue.message}</span></li>)}
+                      </ul>
+                    </div>
+                  )}
+                </div>
+              )}
+            </div>
+          </>,
+          document.body
+        )}
 
         {activeMenu === "chat" ? (
           <section className="chat-page">
