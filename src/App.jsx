@@ -1808,8 +1808,50 @@ const ICONS = {
   calendar: "M5 4h14v16H5zM5 9h14M8 2v4M16 2v4M9 13h2M13 13h2M9 17h2M13 17h2",
   alert: "M12 3l10 18H2zM12 9v5M12 17h.01",
   target: "M12 21a9 9 0 1 0 0-18 9 9 0 0 0 0 18zM12 16a4 4 0 1 0 0-8 4 4 0 0 0 0 8zM12 12h.01",
-  sparkle: "M12 3l2 5 5 2-5 2-2 5-2-5-5-2 5-2z"
+  sparkle: "M12 3l2 5 5 2-5 2-2 5-2-5-5-2 5-2z",
+  bell: "M6 10a6 6 0 1 1 12 0c0 4 1.5 5.5 1.5 5.5H4.5S6 14 6 10zM10 19a2 2 0 0 0 4 0",
+  arrowUp: "M12 19V5M5 12l7-7 7 7",
+  arrowDown: "M12 5v14M5 12l7 7 7-7",
+  close: "M6 6l12 12M18 6L6 18"
 };
+
+// Label ramah pengguna per nama tool Agent Core, dipakai untuk
+// menampilkan langkah yang SEDANG BERJALAN secara nyata (bukan animasi
+// dikarang) di bar progres chat -- lihat computeAgentProgress.
+const TOOL_LABELS = {
+  getVarianceReport: "Mengecek laporan variance stok",
+  getCurrentStock: "Mengecek stok saat ini",
+  getPriceHistory: "Mengecek riwayat harga",
+  getRecipeCost: "Menghitung biaya resep",
+  getSalesSummary: "Mengecek ringkasan penjualan",
+  getReservationForecast: "Mengecek jadwal reservasi",
+  getTodoList: "Mengecek daftar tugas",
+  getKpiStatus: "Mengecek status target KPI",
+  getRecentPriceChanges: "Mengecek perubahan harga terbaru",
+  getReservationPatterns: "Menganalisa pola reservasi",
+  getVarianceTrend: "Menganalisa tren variance",
+  logRecommendations: "Mencatat rekomendasi",
+  flagFollowUp: "Mencatat pengingat follow-up",
+  proposeStockAdjustment: "Menyusun usulan penyesuaian stok",
+  proposePurchaseSuggestion: "Menyusun usulan belanja"
+};
+
+// Bar progres dihitung dari langkah NYATA yang sedang dijalankan Agent
+// Core (lihat onProgress di runAgentLoop), bukan animasi/timer buatan --
+// persentasenya = posisi iterasi saat ini terhadap batas maksimum
+// (maxIterations), jadi selalu naik seiring progres asli, walau jumlah
+// langkah akhirnya bisa lebih sedikit dari batas (pertanyaan sederhana
+// biasanya kelar di iterasi ke-2-3, MODE BUSINESS COACH bisa sampai 7-8).
+function computeAgentProgress(progress) {
+  if (!progress) return { pct: 4, label: "Memulai..." };
+  const { phase, iteration, maxIterations, toolName } = progress;
+  if (phase === "done") return { pct: 100, label: "Selesai" };
+  const pct = Math.min(96, Math.max(4, Math.round(((iteration + 0.5) / maxIterations) * 100)));
+  if (phase === "tool") {
+    return { pct, label: TOOL_LABELS[toolName] || `Menjalankan ${toolName}...` };
+  }
+  return { pct, label: iteration === 0 ? "Memikirkan langkah pertama..." : "Menyusun jawaban..." };
+}
 
 function Icon({ name, size = 17 }) {
   const path = ICONS[name] || ICONS.doc;
@@ -2122,7 +2164,7 @@ export default function App() {
      ======================================================= */
 
   const [notifications, setNotifications] = useState([]);
-  const [notifBannerExpanded, setNotifBannerExpanded] = useState(false);
+  const [notifDropdownOpen, setNotifDropdownOpen] = useState(false);
 
   async function loadNotifications() {
     const snapshot = await getDocs(
@@ -2626,6 +2668,7 @@ export default function App() {
 
   const [input, setInput] = useState("");
   const [loading, setLoading] = useState(false);
+  const [agentProgress, setAgentProgress] = useState(null); // { phase, iteration, maxIterations, toolName }
   const [systemOnline, setSystemOnline] = useState(false);
   const [dataLoading, setDataLoading] = useState(true);
   const [dataLoadError, setDataLoadError] = useState("");
@@ -2800,7 +2843,6 @@ export default function App() {
   );
 
   const dataQualityIssues = useMemo(() => analyzeDataQuality(rawData), [rawData]);
-  const [qualityBannerExpanded, setQualityBannerExpanded] = useState(false);
 
   const normalizedData = useMemo(() => toBaseUnitDataset(filteredData), [filteredData]);
 
@@ -2836,7 +2878,8 @@ export default function App() {
     () => analyzeOpsAlerts(purchaseSuggestions, priceHistory),
     [purchaseSuggestions, priceHistory]
   );
-  const [opsAlertBannerExpanded, setOpsAlertBannerExpanded] = useState(false);
+
+  const totalAlertCount = notifications.length + opsAlerts.length + dataQualityIssues.length;
 
   const receivingIssues = useMemo(
     () => filteredData.receiving.filter((r) => Math.abs(Number(r.difference || 0)) > 0.0001),
@@ -3275,7 +3318,13 @@ export default function App() {
 
   async function runAgentTurn(userMessage) {
     const messages = buildAgentInitialMessages(userMessage, businessSettings?.businessContext);
-    const result = await runAgentLoop({ messages, tools: AGENT_TOOLS, executeTool: executeAgentTool, isWriteTool });
+    const result = await runAgentLoop({
+      messages,
+      tools: AGENT_TOOLS,
+      executeTool: executeAgentTool,
+      isWriteTool,
+      onProgress: setAgentProgress
+    });
 
     if (result.status === "pending_approval") {
       setAgentPending({ toolCalls: result.toolCalls, messages: result.messages, toolLog: result.toolLog, userMessage });
@@ -3342,7 +3391,8 @@ export default function App() {
         messages: nextMessages,
         tools: AGENT_TOOLS,
         executeTool: executeAgentTool,
-        isWriteTool
+        isWriteTool,
+        onProgress: setAgentProgress
       });
 
       if (next.status === "pending_approval") {
@@ -3375,6 +3425,7 @@ export default function App() {
       return null;
     } finally {
       setAgentApprovalBusy(false);
+      setAgentProgress(null);
     }
   }
 
@@ -3833,6 +3884,7 @@ export default function App() {
       persistChatMessage(sendDate, "assistant", errorText, ["ERROR"]);
     } finally {
       setLoading(false);
+      setAgentProgress(null);
     }
   }
 
@@ -5960,6 +6012,93 @@ export default function App() {
           </div>
 
           <div className="topbar-right">
+            <div className="notif-bell-wrap">
+              <button
+                className={`notif-bell ${totalAlertCount > 0 ? "has-alerts" : ""}`}
+                onClick={() => setNotifDropdownOpen((v) => !v)}
+                aria-label="Notifikasi"
+                title="Notifikasi"
+              >
+                <Icon name="bell" size={18} />
+                {totalAlertCount > 0 && (
+                  <span className="notif-bell-badge">{totalAlertCount > 99 ? "99+" : totalAlertCount}</span>
+                )}
+              </button>
+
+              {notifDropdownOpen && (
+                <>
+                  <div className="notif-backdrop" onClick={() => setNotifDropdownOpen(false)} />
+                  <div className="notif-dropdown">
+                    <div className="notif-dropdown-header">
+                      <span>Notifikasi</span>
+                      <button className="notif-dropdown-close" onClick={() => setNotifDropdownOpen(false)} aria-label="Tutup">
+                        <Icon name="close" size={14} />
+                      </button>
+                    </div>
+
+                    {totalAlertCount === 0 ? (
+                      <div className="notif-dropdown-empty">Semua beres -- tidak ada notifikasi.</div>
+                    ) : (
+                      <div className="notif-dropdown-body">
+                        {notifications.length > 0 && (
+                          <div className="notif-section">
+                            <div className="notif-section-title">
+                              <Icon name="bell" size={13} /> Perlu ditindaklanjuti ({notifications.length})
+                            </div>
+                            <ul className="notif-section-list">
+                              {notifications.map((n) => (
+                                <li key={n.id}>
+                                  <span>[{n.dueDate}] {n.message}</span>
+                                  <span className="notif-item-actions">
+                                    {n.type === "todo" && (
+                                      <button
+                                        className="secondary-button"
+                                        onClick={() => {
+                                          setActiveMenu("todo");
+                                          setNotifDropdownOpen(false);
+                                        }}
+                                      >
+                                        Lihat di To-Do
+                                      </button>
+                                    )}
+                                    <button className="followup-notif-dismiss" onClick={() => dismissNotification(n.id)}>
+                                      ✓ Selesai
+                                    </button>
+                                  </span>
+                                </li>
+                              ))}
+                            </ul>
+                          </div>
+                        )}
+
+                        {opsAlerts.length > 0 && (
+                          <div className="notif-section">
+                            <div className="notif-section-title">
+                              <Icon name="alert" size={13} /> Peringatan operasional ({opsAlerts.length})
+                            </div>
+                            <ul className="notif-section-list">
+                              {opsAlerts.map((issue, i) => <li key={i}><span>{issue.message}</span></li>)}
+                            </ul>
+                          </div>
+                        )}
+
+                        {dataQualityIssues.length > 0 && (
+                          <div className="notif-section">
+                            <div className="notif-section-title">
+                              <Icon name="alert" size={13} /> Potensi masalah data ({dataQualityIssues.length})
+                            </div>
+                            <ul className="notif-section-list">
+                              {dataQualityIssues.map((issue, i) => <li key={i}><span>{issue.message}</span></li>)}
+                            </ul>
+                          </div>
+                        )}
+                      </div>
+                    )}
+                  </div>
+                </>
+              )}
+            </div>
+
             <div className="outlet-switch">
               {OUTLETS.map((o) => (
                 <button
@@ -5977,101 +6116,6 @@ export default function App() {
             </div>
           </div>
         </header>
-
-        {dataQualityIssues.length > 0 && (
-          <div className="data-quality-banner">
-            <div
-              className="data-quality-banner-header"
-              onClick={() => setQualityBannerExpanded((v) => !v)}
-            >
-              <span className="data-quality-banner-icon">⚠️</span>
-              <span className="data-quality-banner-title">
-                {dataQualityIssues.length} potensi masalah data ditemukan
-              </span>
-              <span className="data-quality-banner-toggle">
-                {qualityBannerExpanded ? "Sembunyikan ▲" : "Lihat detail ▼"}
-              </span>
-            </div>
-            {qualityBannerExpanded && (
-              <ul className="data-quality-banner-list">
-                {dataQualityIssues.map((issue, i) => (
-                  <li key={i}>{issue.message}</li>
-                ))}
-              </ul>
-            )}
-          </div>
-        )}
-
-        {opsAlerts.length > 0 && (
-          <div className="ops-alert-banner">
-            <div
-              className="ops-alert-banner-header"
-              onClick={() => setOpsAlertBannerExpanded((v) => !v)}
-            >
-              <span className="ops-alert-banner-icon">🔔</span>
-              <span className="ops-alert-banner-title">
-                {opsAlerts.length} peringatan operasional (stok menipis / harga naik)
-              </span>
-              <span className="ops-alert-banner-toggle">
-                {opsAlertBannerExpanded ? "Sembunyikan ▲" : "Lihat detail ▼"}
-              </span>
-            </div>
-            {opsAlertBannerExpanded && (
-              <ul className="ops-alert-banner-list">
-                {opsAlerts.map((issue, i) => (
-                  <li key={i}>{issue.message}</li>
-                ))}
-              </ul>
-            )}
-          </div>
-        )}
-
-        {notifications.length > 0 && (
-          <div className="followup-notif-banner">
-            <div
-              className="followup-notif-banner-header"
-              onClick={() => setNotifBannerExpanded((v) => !v)}
-            >
-              <span className="followup-notif-banner-icon">🔔</span>
-              <span className="followup-notif-banner-title">
-                {notifications.length} notifikasi perlu ditindaklanjuti
-              </span>
-              <span className="followup-notif-banner-toggle">
-                {notifBannerExpanded ? "Sembunyikan ▲" : "Lihat detail ▼"}
-              </span>
-            </div>
-            {notifBannerExpanded && (
-              <ul className="followup-notif-banner-list">
-                {notifications.map((n) => (
-                  <li key={n.id}>
-                    <span>
-                      [{n.dueDate}] {n.message}
-                    </span>
-                    <span style={{ display: "flex", gap: 6 }}>
-                      {n.type === "todo" && (
-                        <button
-                          className="secondary-button"
-                          onClick={() => {
-                            setActiveMenu("todo");
-                            setNotifBannerExpanded(false);
-                          }}
-                        >
-                          Lihat di To-Do
-                        </button>
-                      )}
-                      <button
-                        className="followup-notif-dismiss"
-                        onClick={() => dismissNotification(n.id)}
-                      >
-                        ✓ Selesai
-                      </button>
-                    </span>
-                  </li>
-                ))}
-              </ul>
-            )}
-          </div>
-        )}
 
         {activeMenu === "chat" ? (
           <section className="chat-page">
@@ -6156,11 +6200,40 @@ export default function App() {
               {loading && (
                 <div className="chat-typing">
                   <div className="chat-avatar small">DS</div>
-                  <div className="typing">Dolan Sawah AI sedang memproses...</div>
+                  <div className="typing-progress">
+                    <div className="typing-progress-label">{computeAgentProgress(agentProgress).label}</div>
+                    <div className="typing-progress-track">
+                      <div
+                        className="typing-progress-fill"
+                        style={{ width: `${computeAgentProgress(agentProgress).pct}%` }}
+                      />
+                    </div>
+                  </div>
                 </div>
               )}
               <div style={{ height: 12 }} />
             </div>
+
+            {messages.length > 2 && (
+              <div className="chat-scroll-fabs">
+                <button
+                  className="chat-scroll-fab"
+                  onClick={() => chatRef.current?.scrollTo({ top: 0, behavior: "smooth" })}
+                  aria-label="Scroll ke atas"
+                  title="Scroll ke paling atas"
+                >
+                  <Icon name="arrowUp" size={16} />
+                </button>
+                <button
+                  className="chat-scroll-fab"
+                  onClick={() => chatRef.current?.scrollTo({ top: chatRef.current.scrollHeight, behavior: "smooth" })}
+                  aria-label="Scroll ke bawah"
+                  title="Scroll ke paling bawah"
+                >
+                  <Icon name="arrowDown" size={16} />
+                </button>
+              </div>
+            )}
 
             {pendingSimilarity && (
               <div className="similarity-confirm-card">

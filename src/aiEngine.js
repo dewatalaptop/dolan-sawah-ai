@@ -238,11 +238,13 @@ export function buildAgentInitialMessages(userMessage, businessContext) {
 // tool satu-satu per putaran (bukan digabung), 6 masih terlalu
 // sempit dan turn akan terpotong "TERLALU BANYAK LANGKAH" padahal
 // sebenarnya baru separuh jalan.
-export async function runAgentLoop({ messages, tools, executeTool, isWriteTool, maxIterations = 10 }) {
+export async function runAgentLoop({ messages, tools, executeTool, isWriteTool, maxIterations = 10, onProgress }) {
   const workingMessages = [...messages];
   const toolLog = [];
 
   for (let i = 0; i < maxIterations; i++) {
+    onProgress?.({ phase: "thinking", iteration: i, maxIterations });
+
     // Konteks tanggal dikirim ULANG sebagai pesan TERAKHIR di tiap
     // putaran (bukan cuma sekali di awal) -- supaya tidak "hilang di
     // tengah" percakapan panjang (kejadian nyata: MODE BUSINESS COACH
@@ -265,6 +267,7 @@ export async function runAgentLoop({ messages, tools, executeTool, isWriteTool, 
     }
 
     if (!message.tool_calls || message.tool_calls.length === 0) {
+      onProgress?.({ phase: "done", iteration: i, maxIterations });
       return { status: "done", finalAnswer: message.content || "", toolLog, messages: [...workingMessages, message] };
     }
 
@@ -272,6 +275,7 @@ export async function runAgentLoop({ messages, tools, executeTool, isWriteTool, 
 
     const hasWriteCall = message.tool_calls.some((tc) => isWriteTool(tc.function.name));
     if (hasWriteCall) {
+      onProgress?.({ phase: "done", iteration: i, maxIterations });
       return { status: "pending_approval", toolCalls: message.tool_calls, toolLog, messages: workingMessages };
     }
 
@@ -282,6 +286,7 @@ export async function runAgentLoop({ messages, tools, executeTool, isWriteTool, 
       } catch {
         args = {};
       }
+      onProgress?.({ phase: "tool", iteration: i, maxIterations, toolName: toolCall.function.name });
       const result = await executeTool(toolCall.function.name, args);
       toolLog.push({ name: toolCall.function.name, args, type: "read", result });
       workingMessages.push({ role: "tool", tool_call_id: toolCall.id, content: JSON.stringify(result ?? null) });
