@@ -321,16 +321,50 @@ exports.checkOverdueTodos = onSchedule(
 // cuma neruskan ke Gemini dengan Authorization asli, lalu kembalikan
 // responsnya apa adanya -- supaya SDK `openai` di client tetap bisa
 // dipakai tanpa perubahan bentuk request/response.
+//
+// FALLBACK ke z.ai (GLM): tier gratis Gemini cuma 20 request/hari per
+// project -- kalau kena limit (429) atau Gemini lagi bermasalah (5xx),
+// request yang SAMA dicoba ulang lewat z.ai secara diam-diam (client
+// tidak perlu tahu, cuma dapat jawaban seperti biasa). Nama model di
+// body ditukar ke model z.ai yang paling stabil dari histori pemakaian
+// proyek ini (glm-4.5-flash -- glm-4.7-flash pernah dicoba tapi tier
+// gratisnya jauh lebih padat) karena client selalu kirim nama model
+// Gemini, yang tidak dikenali z.ai.
+//
 // CORS dibatasi ke origin situs publik + localhost (dev) supaya tidak
-// sembarang origin bisa numpang pakai kuota Gemini lewat URL ini.
+// sembarang origin bisa numpang pakai kuota lewat URL ini.
 // ============================================================
 
 const GEMINI_API_KEY = defineSecret("GEMINI_API_KEY");
+const ZAI_API_KEY = defineSecret("ZAI_API_KEY");
+const ZAI_FALLBACK_MODEL = "glm-4.5-flash";
+
+async function callGemini(body) {
+  return fetch("https://generativelanguage.googleapis.com/v1beta/openai/chat/completions", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${GEMINI_API_KEY.value()}`
+    },
+    body: JSON.stringify(body)
+  });
+}
+
+async function callZai(body) {
+  return fetch("https://api.z.ai/api/paas/v4/chat/completions", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${ZAI_API_KEY.value()}`
+    },
+    body: JSON.stringify({ ...body, model: ZAI_FALLBACK_MODEL })
+  });
+}
 
 exports.chatCompletions = onRequest(
   {
     region: "asia-southeast2",
-    secrets: [GEMINI_API_KEY],
+    secrets: [GEMINI_API_KEY, ZAI_API_KEY],
     cors: ["https://dewatalaptop.github.io", /^http:\/\/localhost:\d+$/]
   },
   async (req, res) => {
@@ -340,22 +374,21 @@ exports.chatCompletions = onRequest(
     }
 
     try {
-      const geminiRes = await fetch(
-        "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions",
-        {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-            Authorization: `Bearer ${GEMINI_API_KEY.value()}`
-          },
-          body: JSON.stringify(req.body)
-        }
-      );
+      const geminiRes = await callGemini(req.body);
+
+      if (geminiRes.status === 429 || geminiRes.status >= 500) {
+        logger.warn(`chatCompletions: Gemini gagal (${geminiRes.status}), coba fallback ke z.ai.`);
+        const zaiRes = await callZai(req.body);
+        const zaiData = await zaiRes.json();
+        res.status(zaiRes.status).json(zaiData);
+        return;
+      }
+
       const data = await geminiRes.json();
       res.status(geminiRes.status).json(data);
     } catch (err) {
       logger.error("chatCompletions gagal:", err);
-      res.status(502).json({ error: "Proxy ke Gemini gagal" });
+      res.status(502).json({ error: "Proxy ke AI gagal" });
     }
   }
 );
