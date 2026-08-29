@@ -167,8 +167,12 @@ const AGENT_SYSTEM_PROMPT =
   "3. getReservationPatterns dan getVarianceTrend -- pola historis (hari ramai/sepi, item yang berulang kali " +
   "bermasalah). Kalau datanya masih tipis (jumlah_hari_data atau jumlah_data kecil), katakan itu terus terang " +
   "sebagai keterbatasan data, jangan berlagak yakin dari sampel kecil.\n" +
-  "Boleh dipanggil beberapa sekaligus dalam satu putaran atau menyebar ke beberapa putaran, yang penting semua " +
-  "terpanggil sebelum jawaban akhir. Susun jawaban akhir sebagai laporan singkat terstruktur: " +
+  "HEMAT PUTARAN API: kuota API harian terbatas, dan tool-tool di atas TIDAK saling bergantung (tidak ada " +
+  "yang butuh hasil tool lain dulu untuk menentukan argumennya) -- jadi WAJIB minta SEMUA tool baca yang " +
+  "relevan SEKALIGUS dalam SATU balasan (satu balasan boleh berisi banyak tool_calls), bukan dipanggil satu-satu " +
+  "menyebar ke banyak putaran terpisah. Targetkan seluruh MODE BUSINESS COACH selesai dalam maksimal 2-3 putaran " +
+  "API total (satu putaran besar untuk semua tool baca, satu putaran untuk logRecommendations + jawaban akhir), " +
+  "bukan satu putaran per tool. Susun jawaban akhir sebagai laporan singkat terstruktur: " +
   "(a) Kondisi saat ini -- 2-3 poin fakta paling penting dari data, dengan angka konkret; " +
   "(b) Masalah/risiko -- apa yang paling mendesak diperbaiki, urutkan dari paling kritis, sebutkan kalau ada " +
   "pola berulang dari getReservationPatterns/getVarianceTrend (bukan cuma kejadian sekali); " +
