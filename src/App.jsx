@@ -1088,8 +1088,16 @@ function findRecipeByMenu(menuName, recipes) {
 
 function computeRevenue(sales, recipes) {
   return sales.reduce((sum, s) => {
-    const recipe = findRecipeByMenu(s.menuName, recipes);
-    const price = recipe ? Number(recipe.sellPrice || 0) : 0;
+    // Utamakan harga yang di-snapshot saat transaksi dicatat (field
+    // unitPrice) -- itu harga SESUNGGUHNYA saat itu. Fallback ke harga
+    // resep saat ini cuma untuk baris lama sebelum unitPrice ada;
+    // fallback ini tetap punya kelemahan lama (ikut berubah kalau
+    // harga resep diedit), tapi tidak ada cara lain untuk data historis
+    // yang memang belum pernah menyimpan snapshotnya.
+    const price =
+      s.unitPrice !== null && s.unitPrice !== undefined
+        ? Number(s.unitPrice)
+        : Number(findRecipeByMenu(s.menuName, recipes)?.sellPrice || 0);
     return sum + price * Number(s.quantity || 0);
   }, 0);
 }
@@ -2994,11 +3002,21 @@ export default function App() {
         const recipe = findRecipeByMenu(args.menu, rawData.recipes);
         if (!recipe) return { ditemukan: false, menu: args.menu };
         const cost = computeRecipeCost(recipe, priceHistory);
+        const hpp = cost.complete ? Math.round(cost.totalCost * 100) / 100 : null;
+        const hargaJual = Number(recipe.sellPrice || 0);
+        // Margin dihitung di sini (bukan dibiarkan AI hitung sendiri dari
+        // harga_jual - estimasi_hpp) supaya konsisten dengan aturan sistem
+        // "pakai field yang disediakan, jangan hitung ulang" -- sebelumnya
+        // tool ini cuma kasih dua angka mentah tanpa margin-nya.
+        const marginRupiah = hpp !== null && hargaJual > 0 ? Math.round((hargaJual - hpp) * 100) / 100 : null;
+        const marginPersen = hpp !== null && hargaJual > 0 ? Math.round(((hargaJual - hpp) / hargaJual) * 1000) / 10 : null;
         return {
           ditemukan: true,
           menu: recipe.menuName,
           harga_jual: recipe.sellPrice,
-          estimasi_hpp: cost.complete ? Math.round(cost.totalCost * 100) / 100 : null,
+          estimasi_hpp: hpp,
+          margin_rupiah: marginRupiah,
+          margin_persen: marginPersen,
           lengkap: cost.complete,
           rincian_bahan: cost.lines.map((l) => ({
             bahan: l.itemName,
@@ -3057,7 +3075,16 @@ export default function App() {
             outlet: r.outlet,
             status: r.status,
             nomor_hp: r.nomorHp || "",
-            catatan: r.tambahan || ""
+            catatan: r.tambahan || "",
+            // Paket/menu yang dipesan (kalau ada) -- ini nama PAKET catering
+            // (mis. "Paket D", "OTS"), BUKAN nama resep di master_recipes,
+            // jadi tidak bisa dicocokkan otomatis ke stok bahan. Tetap
+            // ditampilkan supaya AI/pemilik bisa lihat apa yang dipesan saat
+            // menyiapkan hari itu -- sebelumnya field ini ada di database
+            // tapi tidak pernah ditampilkan sama sekali.
+            paket_dipesan: Array.isArray(r.menus)
+              ? r.menus.map((m) => `${m.name || "?"} x${m.quantity || 0}`)
+              : []
           }))
         };
       }
@@ -3174,6 +3201,71 @@ export default function App() {
           jumlah_perubahan: changes.length,
           daftar: changes.slice(0, 10)
         };
+      }
+
+      case "getWasteBreakdown": {
+        const rows = ((outlet === "ALL" ? rawData.waste : (rawData.waste || []).filter((w) => w.outlet === outlet)) || []);
+        if (!rows.length) return { outlet, total_kejadian: 0, per_alasan: [], bahan_paling_sering_waste: [] };
+
+        const byReason = {};
+        const byItem = {};
+        rows.forEach((w) => {
+          const reasonKey = String(w.reason || "").trim() || "(tidak diisi)";
+          byReason[reasonKey] = (byReason[reasonKey] || 0) + 1;
+
+          const itemKey = w.itemName || "(tanpa nama)";
+          if (!byItem[itemKey]) byItem[itemKey] = { jumlahKejadian: 0, totalQuantity: 0, unit: w.unit || "" };
+          byItem[itemKey].jumlahKejadian += 1;
+          byItem[itemKey].totalQuantity += Number(w.quantity || 0);
+        });
+
+        return {
+          outlet,
+          total_kejadian: rows.length,
+          per_alasan: Object.entries(byReason)
+            .map(([alasan, jumlah]) => ({ alasan, jumlah_kejadian: jumlah }))
+            .sort((a, b) => b.jumlah_kejadian - a.jumlah_kejadian),
+          bahan_paling_sering_waste: Object.entries(byItem)
+            .map(([bahan, v]) => ({
+              bahan,
+              jumlah_kejadian: v.jumlahKejadian,
+              total_jumlah: `${formatNumber(v.totalQuantity)} ${v.unit}`.trim()
+            }))
+            .sort((a, b) => b.jumlah_kejadian - a.jumlah_kejadian)
+            .slice(0, 10)
+        };
+      }
+
+      case "getSupplierReliability": {
+        const rows = (rawData.receiving || []).filter(
+          (r) => (outlet === "ALL" || r.outlet === outlet) && String(r.supplier || "").trim()
+        );
+        if (!rows.length) return { outlet, jumlah_supplier: 0, daftar: [] };
+
+        const bySupplier = {};
+        rows.forEach((r) => {
+          const key = String(r.supplier).trim();
+          if (!bySupplier[key]) bySupplier[key] = { jumlahPengiriman: 0, jumlahKurang: 0, jumlahLebih: 0, jumlahPas: 0 };
+          const b = bySupplier[key];
+          b.jumlahPengiriman += 1;
+          const diff = Number(r.difference || 0);
+          if (diff < 0) b.jumlahKurang += 1;
+          else if (diff > 0) b.jumlahLebih += 1;
+          else b.jumlahPas += 1;
+        });
+
+        const daftar = Object.entries(bySupplier)
+          .map(([supplier, v]) => ({
+            supplier,
+            jumlah_pengiriman: v.jumlahPengiriman,
+            jumlah_kurang_kirim: v.jumlahKurang,
+            jumlah_lebih_kirim: v.jumlahLebih,
+            jumlah_sesuai: v.jumlahPas,
+            persen_bermasalah: Math.round((100 * (v.jumlahKurang + v.jumlahLebih)) / v.jumlahPengiriman)
+          }))
+          .sort((a, b) => b.persen_bermasalah - a.persen_bermasalah);
+
+        return { outlet, jumlah_supplier: daftar.length, daftar };
       }
 
       case "getReservationPatterns": {
@@ -3662,7 +3754,15 @@ export default function App() {
           tags: ["PENJUALAN"]
         };
       }
-      const rows = items.map((x) => createSale({ ...x, date, outlet, source: "AI" }));
+      const rows = items.map((x) =>
+        createSale({
+          ...x,
+          date,
+          outlet,
+          source: "AI",
+          unitPrice: findRecipeByMenu(x.menuName, rawData.recipes)?.sellPrice ?? null
+        })
+      );
       await saveRowsTracked(COLLECTIONS.SALES, rows, "Penjualan (chat)", `${rows.length} menu, ${outlet}, ${formatDateID(date)}`);
       await refreshData();
       const total = items.reduce((sum, x) => sum + x.quantity, 0);
@@ -3974,7 +4074,16 @@ export default function App() {
         // jadi baris kosong harus disaring di sini juga.
         const rows = sheet.rows
           .filter((r) => r.itemName || r.menuName)
-          .map((r) => ({ ...r, outlet: r.outlet || "DS" }));
+          .map((r) => ({
+            ...r,
+            outlet: r.outlet || "DS",
+            // Sama seperti input penjualan lewat chat: snapshot harga jual
+            // menu SAAT ini supaya omzet dari import Excel juga tidak ikut
+            // berubah retroaktif kalau harga menu diedit di kemudian hari.
+            ...(sheet.type === "SALES"
+              ? { unitPrice: findRecipeByMenu(r.menuName, rawData.recipes)?.sellPrice ?? null }
+              : {})
+          }));
         if (!rows.length) continue;
         await saveRowsTracked(target, rows, `${sheet.type} (Import Excel)`, `${rows.length} baris dari sheet "${sheet.sheetName}"`);
       }
@@ -4676,8 +4785,10 @@ export default function App() {
               .slice()
               .sort((a, b) => (a.date < b.date ? 1 : -1))
               .map((x) => {
-                const recipe = findRecipeByMenu(x.menuName, rawData.recipes);
-                const price = recipe ? Number(recipe.sellPrice || 0) : 0;
+                const price =
+                  x.unitPrice !== null && x.unitPrice !== undefined
+                    ? Number(x.unitPrice)
+                    : Number(findRecipeByMenu(x.menuName, rawData.recipes)?.sellPrice || 0);
                 const editing = editingRow?.id === x.id;
                 return [
                   editing ? fieldInput("date", "date") : formatDateID(x.date),

@@ -19,6 +19,8 @@ export const READ_TOOL_NAMES = [
   "getVarianceTrend",
   "getKpiStatus",
   "getRecentPriceChanges",
+  "getWasteBreakdown",
+  "getSupplierReliability",
   "flagFollowUp",
   "logRecommendations"
 ];
@@ -85,7 +87,10 @@ export const AGENT_TOOLS = [
     type: "function",
     function: {
       name: "getRecipeCost",
-      description: "Hitung biaya bahan (HPP) untuk satu resep/menu, berdasarkan harga bahan terkini.",
+      description:
+        "Hitung biaya bahan (HPP) untuk satu resep/menu, berdasarkan harga bahan terkini. Hasilnya sudah " +
+        "termasuk margin_rupiah dan margin_persen (harga_jual - estimasi_hpp) -- PAKAI LANGSUNG field ini untuk " +
+        "pertanyaan soal profitabilitas/margin menu, jangan hitung ulang manual dari harga_jual dan estimasi_hpp.",
       parameters: {
         type: "object",
         properties: {
@@ -117,9 +122,12 @@ export const AGENT_TOOLS = [
     function: {
       name: "getReservationForecast",
       description:
-        "Ambil daftar reservasi (confirmed & pending, termasuk nama, jam, jumlah tamu, dan nomor HP) untuk " +
-        "outlet dan rentang tanggal tertentu, dari data sinkronisasi reservasi -- pakai ini untuk menjawab " +
-        "pertanyaan soal reservasi (mis. \"reservasi besok apa saja\") maupun untuk memperkirakan beban dapur.",
+        "Ambil daftar reservasi (confirmed & pending, termasuk nama, jam, jumlah tamu, nomor HP, dan " +
+        "paket_dipesan) untuk outlet dan rentang tanggal tertentu, dari data sinkronisasi reservasi -- pakai " +
+        "ini untuk menjawab pertanyaan soal reservasi (mis. \"reservasi besok apa saja\") maupun untuk " +
+        "memperkirakan beban dapur. CATATAN soal paket_dipesan: itu nama PAKET catering (mis. \"Paket D x23\"), " +
+        "BUKAN nama menu/resep di sistem -- jangan mencocokkannya ke stok bahan atau resep, cukup sebutkan apa " +
+        "adanya sebagai info persiapan.",
       parameters: {
         type: "object",
         properties: {
@@ -188,6 +196,40 @@ export const AGENT_TOOLS = [
         type: "object",
         properties: {
           hariTerakhir: { type: "number", description: "Jumlah hari terakhir yang dicek. Default 14 kalau tidak disebutkan." }
+        },
+        required: []
+      }
+    }
+  },
+  {
+    type: "function",
+    function: {
+      name: "getWasteBreakdown",
+      description:
+        "Ambil rincian waste (barang terbuang/rusak) dikelompokkan per ALASAN (field yang selama ini tersimpan " +
+        "tapi tidak pernah dianalisa) dan per bahan yang paling sering kena waste. Pakai untuk pertanyaan soal " +
+        "kenapa banyak waste, alasan waste apa yang paling sering, atau bahan mana yang paling sering terbuang.",
+      parameters: {
+        type: "object",
+        properties: {
+          outlet: { type: "string", enum: OUTLET_ENUM, description: "Kode outlet, atau ALL untuk gabungan semua outlet." }
+        },
+        required: []
+      }
+    }
+  },
+  {
+    type: "function",
+    function: {
+      name: "getSupplierReliability",
+      description:
+        "Bandingkan keandalan tiap supplier berdasarkan riwayat barang datang (receiving) -- berapa kali kirim " +
+        "kurang/lebih/sesuai dari pesanan, diurutkan dari yang paling sering bermasalah. Pakai untuk pertanyaan " +
+        "soal supplier mana yang sering kurang kirim atau paling bisa diandalkan.",
+      parameters: {
+        type: "object",
+        properties: {
+          outlet: { type: "string", enum: OUTLET_ENUM, description: "Kode outlet, atau ALL untuk gabungan semua outlet." }
         },
         required: []
       }

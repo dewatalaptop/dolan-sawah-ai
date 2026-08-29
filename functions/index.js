@@ -360,6 +360,104 @@ exports.chatCompletions = onRequest(
   }
 );
 
+// ============================================================
+// checkPriceSpikes: tiap pagi, cek kenaikan harga bahan signifikan
+// (>=20% dibanding catatan SEBELUMNYA -- bukan dibanding harga
+// pertama kali dicatat, supaya kenaikan bertahap yang wajar tidak
+// jadi "alarm palsu") dari collection price_history, buat notifikasi
+// per bahan. Logika PERSIS sama dengan checkPriceSpikes di App.jsx
+// (dipakai untuk banner "peringatan operasional" saat halaman chat
+// dibuka) -- versi ini yang membuatnya PROAKTIF, tidak perlu pemilik
+// buka halaman dulu supaya kelihatan. ID dokumen deterministik dari
+// nama bahan + tanggal berlaku harga terbaru, supaya kalau function
+// ini jalan ulang di hari yang sama (retry/redeploy) atau lonjakan
+// yang sama masih jadi kenaikan TERBARU, notifikasinya di-overwrite,
+// bukan digandakan -- begitu ada harga baru lagi yang bukan lonjakan,
+// otomatis berhenti dibuat ulang.
+// ============================================================
+
+const PRICE_SPIKE_THRESHOLD_PERCENT = 20;
+
+function normalizeItemName(value) {
+  return String(value || "")
+    .toLowerCase()
+    .replace(/[""]/g, "")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function slugify(value) {
+  return String(value || "")
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "") || "item";
+}
+
+exports.checkPriceSpikes = onSchedule(
+  {
+    schedule: "0 7 * * *",
+    timeZone: "Asia/Jakarta",
+    region: "asia-southeast2"
+  },
+  async () => {
+    const snapshot = await ownDb.collection("price_history").get();
+    if (snapshot.empty) {
+      logger.info("checkPriceSpikes: belum ada data harga sama sekali.");
+      return;
+    }
+
+    const byItem = {};
+    snapshot.docs.forEach((doc) => {
+      const data = doc.data();
+      const key = normalizeItemName(data.itemName);
+      if (!key) return;
+      byItem[key] = byItem[key] || [];
+      byItem[key].push(data);
+    });
+
+    const batch = ownDb.batch();
+    let count = 0;
+
+    Object.values(byItem).forEach((records) => {
+      if (records.length < 2) return;
+      const sorted = [...records].sort((a, b) => {
+        const dateCompare = String(a.effectiveDate || "").localeCompare(String(b.effectiveDate || ""));
+        if (dateCompare !== 0) return dateCompare;
+        return String(a.createdAt || "").localeCompare(String(b.createdAt || ""));
+      });
+      const previous = sorted[sorted.length - 2];
+      const latest = sorted[sorted.length - 1];
+      const oldPrice = Number(previous.price || 0);
+      const newPrice = Number(latest.price || 0);
+      if (oldPrice <= 0) return;
+      const changePercent = ((newPrice - oldPrice) / oldPrice) * 100;
+      if (changePercent < PRICE_SPIKE_THRESHOLD_PERCENT) return;
+
+      const docId = `price-spike-${slugify(latest.itemName)}-${latest.effectiveDate || "unknown"}`;
+      batch.set(ownDb.collection("notifications").doc(docId), {
+        type: "price-spike",
+        refId: "",
+        decisionId: "",
+        message:
+          `Harga "${latest.itemName}" naik ${Math.round(changePercent)}% ` +
+          `(Rp ${oldPrice.toLocaleString("id-ID")} -> Rp ${newPrice.toLocaleString("id-ID")}) ` +
+          `sejak ${latest.effectiveDate}.`,
+        dueDate: latest.effectiveDate || "",
+        createdAt: admin.firestore.FieldValue.serverTimestamp(),
+        read: false
+      });
+      count++;
+    });
+
+    if (count === 0) {
+      logger.info("checkPriceSpikes: tidak ada kenaikan harga signifikan.");
+      return;
+    }
+    await batch.commit();
+    logger.info(`checkPriceSpikes selesai: ${count} notifikasi lonjakan harga dibuat.`);
+  }
+);
+
 exports.syncReservations = onSchedule(
   {
     schedule: "0 * * * *",

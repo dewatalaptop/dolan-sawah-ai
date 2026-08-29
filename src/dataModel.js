@@ -387,6 +387,17 @@ export function createSale(data = {}) {
     quantity:
       Number(data.quantity || 0),
 
+    // Snapshot harga jual menu SAAT transaksi ini dicatat -- bukan
+    // dihitung ulang dari resep saat laporan dibuka. Tanpa ini, mengubah
+    // harga jual menu di halaman Resep diam-diam mengubah omzet HISTORIS
+    // (laporan bulan lalu ikut berubah hari ini). null untuk data lama
+    // sebelum field ini ada -- computeRevenue tetap fallback ke harga
+    // resep saat ini untuk baris seperti itu.
+    unitPrice:
+      data.unitPrice === null || data.unitPrice === undefined
+        ? null
+        : Number(data.unitPrice),
+
     outlet:
       data.outlet || "DS",
 
