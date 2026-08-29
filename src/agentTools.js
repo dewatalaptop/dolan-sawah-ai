@@ -27,7 +27,7 @@ export const READ_TOOL_NAMES = [
 
 // Semua tool tulis WAJIB approval manual pemilik -- tidak ada
 // pengecualian auto-approve (keputusan eksplisit pemilik).
-export const WRITE_TOOL_NAMES = ["proposeStockAdjustment", "proposePurchaseSuggestion"];
+export const WRITE_TOOL_NAMES = ["proposeStockAdjustment", "proposePurchaseSuggestion", "proposeDataDeletion"];
 
 export function isWriteTool(name) {
   return WRITE_TOOL_NAMES.includes(name);
@@ -372,6 +372,43 @@ export const AGENT_TOOLS = [
           }
         },
         required: ["daftarBahan"]
+      }
+    }
+  },
+  {
+    type: "function",
+    function: {
+      name: "proposeDataDeletion",
+      description:
+        "USULKAN penghapusan data historis dalam SATU jenis data + rentang tanggal tertentu (bukan langsung " +
+        "menghapus -- ini SELALU perlu persetujuan manual pemilik, dan draft-nya akan menunjukkan JUMLAH BARIS " +
+        "PERSIS yang akan terhapus supaya pemilik bisa mengecek sebelum menyetujui). Dipakai kalau pemilik minta " +
+        "membersihkan/menghapus data lama, data salah input massal, atau data uji coba.\n\n" +
+        "ATURAN KETAT (tindakan ini berisiko tinggi kalau salah cakupan):\n" +
+        "1. JANGAN PERNAH memanggil tool ini tanpa dariTanggal DAN sampaiTanggal yang eksplisit dan pasti -- " +
+        "kalau pemilik bilang sesuatu yang ambigu seperti \"hapus data lama\" atau \"hapus yang salah kemarin\" " +
+        "tanpa tanggal jelas, TANYA BALIK dulu untuk memastikan rentang tanggal pastinya, jangan menebak.\n" +
+        "2. Kalau pemilik menyebut nama bahan/menu spesifik (bukan rentang tanggal), itu BUKAN untuk tool ini -- " +
+        "arahkan ke penghapusan baris manual di halaman terkait, tool ini khusus untuk hapus massal per tanggal.\n" +
+        "3. Sebelum memanggil, tulis dulu di jawaban Anda: jenis data, rentang tanggal, dan outlet yang akan " +
+        "dihapus, supaya pemilik sudah lihat rencananya di teks SEBELUM kartu persetujuan muncul.\n" +
+        "4. Data yang terhapus tetap bisa di-undo lewat menu Riwayat Aktivitas setelah disetujui -- boleh " +
+        "disebutkan ke pemilik sebagai jaring pengaman, tapi jangan jadikan alasan untuk kurang hati-hati soal " +
+        "cakupan tanggal/jenis data.",
+      parameters: {
+        type: "object",
+        properties: {
+          tipeData: {
+            type: "string",
+            enum: ["pembelian", "barang_datang", "penjualan", "stock_opname", "waste", "stok_awal", "penyesuaian"],
+            description: "Jenis data yang akan dihapus. Resep TIDAK termasuk (tidak berbasis tanggal, tidak didukung tool ini)."
+          },
+          dariTanggal: { type: "string", description: "Tanggal mulai (inklusif), format YYYY-MM-DD. WAJIB diisi eksplisit." },
+          sampaiTanggal: { type: "string", description: "Tanggal akhir (inklusif), format YYYY-MM-DD. WAJIB diisi eksplisit." },
+          outlet: { type: "string", enum: ["DS", "SS", "SP", "ALL"], description: "Outlet tertentu, atau ALL untuk semua outlet. Default ALL kalau tidak disebutkan." },
+          alasan: { type: "string", description: "Alasan penghapusan, akan ditampilkan ke pemilik untuk keputusan." }
+        },
+        required: ["tipeData", "dariTanggal", "sampaiTanggal", "alasan"]
       }
     }
   }

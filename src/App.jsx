@@ -97,6 +97,43 @@ const OUTLETS = [
   { id: "SP", label: "Soto Pagi" }
 ];
 
+// Jenis data yang bisa dihapus MASSAL berdasarkan rentang tanggal --
+// cuma koleksi yang punya field `date` (resep TIDAK termasuk, sudah
+// ada hapus-per-baris sendiri di halaman Resep karena tidak berbasis
+// tanggal). `key` = nama field di state rawData (dipakai untuk preview
+// dari data yang sudah termuat di client, tanpa query Firestore baru),
+// `agentKey` = nilai enum yang dipakai tool Agent Core biar gampang
+// disebut lewat chat.
+const BULK_DELETE_TYPES = [
+  { key: "purchases", agentKey: "pembelian", collection: COLLECTIONS.PURCHASES, label: "Pembelian" },
+  { key: "receiving", agentKey: "barang_datang", collection: COLLECTIONS.RECEIVING, label: "Barang Datang" },
+  { key: "sales", agentKey: "penjualan", collection: COLLECTIONS.SALES, label: "Penjualan" },
+  { key: "stockOpname", agentKey: "stock_opname", collection: COLLECTIONS.STOCK_OPNAME, label: "Stock Opname" },
+  { key: "waste", agentKey: "waste", collection: COLLECTIONS.WASTE, label: "Waste" },
+  { key: "openingStock", agentKey: "stok_awal", collection: COLLECTIONS.OPENING_STOCK, label: "Stok Awal" },
+  { key: "adjustments", agentKey: "penyesuaian", collection: COLLECTIONS.ADJUSTMENTS, label: "Penyesuaian Stok" }
+];
+
+function findBulkDeleteType(agentKey) {
+  return BULK_DELETE_TYPES.find((t) => t.agentKey === agentKey || t.key === agentKey) || null;
+}
+
+// Baris yang cocok dengan filter tanggal (+ outlet opsional), dihitung
+// dari data yang SUDAH termuat di rawData (bukan query Firestore baru)
+// -- konsisten dengan pola tool baca lain di executeAgentTool, dan
+// menghindari kebutuhan index Firestore tambahan untuk kombinasi
+// filter tanggal+outlet.
+function findBulkDeleteMatches(rawData, typeConfig, { dateFrom, dateTo, outlet }) {
+  if (!typeConfig) return [];
+  return (rawData[typeConfig.key] || []).filter((r) => {
+    const d = String(r.date || "");
+    if (dateFrom && d < dateFrom) return false;
+    if (dateTo && d > dateTo) return false;
+    if (outlet && outlet !== "ALL" && r.outlet !== outlet) return false;
+    return true;
+  });
+}
+
 const MENU = [
   { id: "chat", label: "AI Assistant", icon: "chat" },
   { id: "todo", label: "To-Do List", icon: "check" },
@@ -116,6 +153,7 @@ const MENU = [
   { id: "import", label: "Import Excel", icon: "upload" },
   { id: "import-wa", label: "Import Chat WA", icon: "chat" },
   { id: "riwayat", label: "Riwayat Aktivitas", icon: "trend" },
+  { id: "hapus-data", label: "Hapus Data", icon: "close" },
   { id: "laporan", label: "Laporan AI", icon: "doc" },
   { id: "pengaturan", label: "Pengaturan", icon: "tag" }
 ];
@@ -2161,6 +2199,17 @@ export default function App() {
   const [activityLog, setActivityLog] = useState([]);
   const [undoBusyId, setUndoBusyId] = useState(null);
 
+  // Halaman "Hapus Data" -- preview di-reset tiap kali filter berubah,
+  // supaya tombol hapus tidak pernah bisa dipencet dengan angka preview
+  // yang sudah basi (mis. jenis data/tanggal diganti setelah cek dulu).
+  const [bulkDeleteType, setBulkDeleteType] = useState(BULK_DELETE_TYPES[0].key);
+  const [bulkDeleteFrom, setBulkDeleteFrom] = useState("");
+  const [bulkDeleteTo, setBulkDeleteTo] = useState("");
+  const [bulkDeleteOutlet, setBulkDeleteOutlet] = useState("ALL");
+  const [bulkDeleteReason, setBulkDeleteReason] = useState("");
+  const [bulkDeletePreview, setBulkDeletePreview] = useState(null);
+  const [bulkDeleteBusy, setBulkDeleteBusy] = useState(false);
+
   async function loadActivityLog() {
     const snapshot = await getDocs(collection(db, COLLECTIONS.ACTIVITY_LOG));
     const list = snapshot.docs
@@ -2514,6 +2563,81 @@ export default function App() {
       showToast("Gagal menghapus: " + (error?.message || "unknown error"));
     } finally {
       setRowDeleteBusy(false);
+    }
+  }
+
+  // Hapus MASSAL berdasarkan rentang tanggal (+ outlet opsional) --
+  // dipakai baik dari halaman "Hapus Data" maupun dari tool Agent Core
+  // proposeDataDeletion setelah disetujui pemilik. Satu entri Riwayat
+  // Aktivitas untuk SELURUH baris yang dihapus (bukan satu per baris),
+  // jadi seluruh operasi bisa di-undo sekali klik seperti aksi lain.
+  async function executeBulkDelete(typeConfig, rows, alasan) {
+    if (!rows.length) return { deleted: 0 };
+    setSaveProgress({ done: 0, total: rows.length });
+    try {
+      const ids = rows.map((r) => r.id);
+      const previousData = {};
+      rows.forEach((r) => {
+        const { id, ...rest } = r;
+        previousData[id] = rest;
+      });
+      await deleteDocsBatched(typeConfig.collection, ids, (done, total) => setSaveProgress({ done, total }));
+      const logEntry = createActivityLog({
+        actionType: `Hapus massal (${typeConfig.label})`,
+        collectionName: typeConfig.collection,
+        documentIds: ids,
+        summary: `${ids.length} baris ${typeConfig.label} dihapus${alasan ? ` -- ${alasan}` : ""}`,
+        undoType: "delete",
+        previousData
+      });
+      const ref = await addDoc(collection(db, COLLECTIONS.ACTIVITY_LOG), logEntry);
+      setActivityLog((prev) => [{ id: ref.id, ...logEntry }, ...prev]);
+      await refreshData();
+      return { deleted: ids.length };
+    } finally {
+      setSaveProgress(null);
+    }
+  }
+
+  // Ubah filter APA SAJA setelah preview dihitung -> preview dianggap
+  // basi dan disembunyikan lagi, supaya tombol "Hapus" tidak pernah
+  // bisa dipencet dengan angka dari kombinasi filter yang berbeda.
+  function updateBulkDeleteFilter(setter, value) {
+    setter(value);
+    setBulkDeletePreview(null);
+  }
+
+  function checkBulkDeletePreview() {
+    if (!bulkDeleteFrom || !bulkDeleteTo) {
+      showToast("Isi tanggal mulai dan tanggal akhir dulu.");
+      return;
+    }
+    if (bulkDeleteFrom > bulkDeleteTo) {
+      showToast("Tanggal mulai tidak boleh lebih besar dari tanggal akhir.");
+      return;
+    }
+    const typeConfig = findBulkDeleteType(bulkDeleteType);
+    const rows = findBulkDeleteMatches(rawData, typeConfig, {
+      dateFrom: bulkDeleteFrom,
+      dateTo: bulkDeleteTo,
+      outlet: bulkDeleteOutlet
+    });
+    setBulkDeletePreview({ typeConfig, rows, filterKey: `${bulkDeleteType}|${bulkDeleteFrom}|${bulkDeleteTo}|${bulkDeleteOutlet}` });
+  }
+
+  async function confirmBulkDelete() {
+    if (!bulkDeletePreview || !bulkDeletePreview.rows.length) return;
+    setBulkDeleteBusy(true);
+    try {
+      const result = await executeBulkDelete(bulkDeletePreview.typeConfig, bulkDeletePreview.rows, bulkDeleteReason);
+      showToast(`${result.deleted} baris berhasil dihapus. Bisa di-undo lewat Riwayat Aktivitas.`, "success");
+      setBulkDeletePreview(null);
+      setBulkDeleteReason("");
+    } catch (error) {
+      console.error(error);
+      showToast("Gagal menghapus: " + (error?.message || "unknown error"));
+    } finally {
+      setBulkDeleteBusy(false);
     }
   }
 
@@ -3439,6 +3563,32 @@ export default function App() {
         .join("\n");
       return `🤖 Agent Core mengusulkan SARAN BELANJA:\n\n${list}\n\nIni baru rekomendasi -- perlu persetujuan Anda di bawah.`;
     }
+    if (toolCall.function.name === "proposeDataDeletion") {
+      const typeConfig = findBulkDeleteType(args.tipeData);
+      if (!typeConfig) {
+        return `🤖 Agent Core mengusulkan penghapusan data, tapi jenis data "${args.tipeData}" tidak dikenali -- tolak usulan ini.`;
+      }
+      const matches = findBulkDeleteMatches(rawData, typeConfig, {
+        dateFrom: args.dariTanggal,
+        dateTo: args.sampaiTanggal,
+        outlet: args.outlet
+      });
+      const rentang =
+        args.dariTanggal && args.sampaiTanggal
+          ? `${formatDateID(args.dariTanggal)} s/d ${formatDateID(args.sampaiTanggal)}`
+          : "(rentang tanggal tidak lengkap!)";
+      return (
+        `🤖 Agent Core mengusulkan HAPUS DATA (⚠️ tindakan ini akan menghapus data permanen dari database, ` +
+        `walau tetap bisa di-undo lewat Riwayat Aktivitas setelah disetujui):\n\n` +
+        `- Jenis data: ${typeConfig.label}\n- Rentang tanggal: ${rentang}\n` +
+        `- Outlet: ${args.outlet || "ALL"}\n- Alasan: ${args.alasan || "(tidak disebutkan)"}\n\n` +
+        `📌 JUMLAH BARIS YANG AKAN TERHAPUS: ${matches.length}\n\n` +
+        (matches.length === 0
+          ? "Tidak ada data yang cocok dengan filter ini -- kemungkinan rentang tanggal/outlet salah, periksa lagi sebelum menyetujui.\n\n"
+          : "") +
+        `Belum ada yang terhapus -- perlu persetujuan Anda di bawah. Periksa jumlah barisnya dulu sebelum menyetujui.`
+      );
+    }
     return `🤖 Agent Core mengusulkan aksi "${toolCall.function.name}" dengan parameter: ${JSON.stringify(args)}`;
   }
 
@@ -3583,6 +3733,30 @@ export default function App() {
       // ada transaksi pembelian otomatis (itu tetap lewat alur pembelian
       // manual/chat biasa seperti sekarang).
       return { disetujui: true, catatan: "Rekomendasi diterima pemilik. Input pembelian aktual tetap lewat menu Pembelian." };
+    }
+
+    if (name === "proposeDataDeletion") {
+      const typeConfig = findBulkDeleteType(args.tipeData);
+      if (!typeConfig) {
+        return { disetujui: false, alasan: `Jenis data "${args.tipeData}" tidak dikenali.` };
+      }
+      // Dihitung ULANG dari data terkini (bukan pakai angka draft yang
+      // ditampilkan sebelumnya) -- data bisa saja berubah sedikit di
+      // jeda antara usulan dan persetujuan.
+      const matches = findBulkDeleteMatches(rawData, typeConfig, {
+        dateFrom: args.dariTanggal,
+        dateTo: args.sampaiTanggal,
+        outlet: args.outlet
+      });
+      if (!matches.length) {
+        return { disetujui: true, dihapus: 0, catatan: "Tidak ada baris yang cocok dengan filter ini -- tidak ada yang dihapus." };
+      }
+      const result = await executeBulkDelete(typeConfig, matches, args.alasan);
+      return {
+        disetujui: true,
+        dihapus: result.deleted,
+        catatan: `${result.deleted} baris ${typeConfig.label} berhasil dihapus. Bisa di-undo lewat menu Riwayat Aktivitas.`
+      };
     }
 
     return { disetujui: false, alasan: "Tool tulis tidak dikenal." };
@@ -5788,6 +5962,130 @@ export default function App() {
     );
   }
 
+  function renderHapusData() {
+    const typeConfig = findBulkDeleteType(bulkDeleteType);
+    const previewStale =
+      bulkDeletePreview &&
+      bulkDeletePreview.filterKey !== `${bulkDeleteType}|${bulkDeleteFrom}|${bulkDeleteTo}|${bulkDeleteOutlet}`;
+    const activePreview = previewStale ? null : bulkDeletePreview;
+
+    return (
+      <div className="page">
+        <div className="section-header">
+          <div>
+            <h1>Hapus Data</h1>
+            <p>
+              Hapus banyak baris sekaligus berdasarkan jenis data + rentang tanggal (opsional per outlet).
+              Selalu cek dulu jumlah barisnya sebelum menghapus -- data yang terhapus tetap bisa dikembalikan
+              lewat menu Riwayat Aktivitas selama belum di-undo. Resep tidak termasuk di sini (tidak berbasis
+              tanggal) -- hapus resep lewat menu Resep.
+            </p>
+          </div>
+        </div>
+
+        <div className="card">
+          <div style={{ display: "flex", gap: 12, flexWrap: "wrap", alignItems: "flex-end" }}>
+            <label style={{ display: "flex", flexDirection: "column", gap: 4, fontSize: 12.5, color: "var(--ink-soft)" }}>
+              Jenis Data
+              <select
+                value={bulkDeleteType}
+                onChange={(e) => updateBulkDeleteFilter(setBulkDeleteType, e.target.value)}
+                style={{ padding: "8px 10px", borderRadius: 8, border: "1px solid var(--border)", minWidth: 180 }}
+              >
+                {BULK_DELETE_TYPES.map((t) => (
+                  <option key={t.key} value={t.key}>{t.label}</option>
+                ))}
+              </select>
+            </label>
+
+            <label style={{ display: "flex", flexDirection: "column", gap: 4, fontSize: 12.5, color: "var(--ink-soft)" }}>
+              Dari Tanggal
+              <input
+                type="date"
+                value={bulkDeleteFrom}
+                max={bulkDeleteTo || undefined}
+                onChange={(e) => updateBulkDeleteFilter(setBulkDeleteFrom, e.target.value)}
+                style={{ padding: "8px 10px", borderRadius: 8, border: "1px solid var(--border)" }}
+              />
+            </label>
+
+            <label style={{ display: "flex", flexDirection: "column", gap: 4, fontSize: 12.5, color: "var(--ink-soft)" }}>
+              Sampai Tanggal
+              <input
+                type="date"
+                value={bulkDeleteTo}
+                min={bulkDeleteFrom || undefined}
+                onChange={(e) => updateBulkDeleteFilter(setBulkDeleteTo, e.target.value)}
+                style={{ padding: "8px 10px", borderRadius: 8, border: "1px solid var(--border)" }}
+              />
+            </label>
+
+            <label style={{ display: "flex", flexDirection: "column", gap: 4, fontSize: 12.5, color: "var(--ink-soft)" }}>
+              Outlet
+              <select
+                value={bulkDeleteOutlet}
+                onChange={(e) => updateBulkDeleteFilter(setBulkDeleteOutlet, e.target.value)}
+                style={{ padding: "8px 10px", borderRadius: 8, border: "1px solid var(--border)" }}
+              >
+                {OUTLETS.map((o) => (
+                  <option key={o.id} value={o.id}>{o.label}</option>
+                ))}
+              </select>
+            </label>
+
+            <button className="secondary-button" onClick={checkBulkDeletePreview}>
+              Cek Jumlah Data
+            </button>
+          </div>
+
+          {activePreview && (
+            <div
+              style={{
+                marginTop: 16,
+                padding: 14,
+                borderRadius: 10,
+                border: `1px solid ${activePreview.rows.length ? "#f3beb6" : "var(--border)"}`,
+                background: activePreview.rows.length ? "var(--red-100)" : "var(--border-soft)"
+              }}
+            >
+              {activePreview.rows.length === 0 ? (
+                <div style={{ fontSize: 13, color: "var(--ink-soft)" }}>
+                  Tidak ada data {typeConfig.label} yang cocok dengan filter ini.
+                </div>
+              ) : (
+                <>
+                  <div style={{ fontWeight: 700, marginBottom: 8 }}>
+                    ⚠️ {activePreview.rows.length} baris {typeConfig.label} akan dihapus permanen
+                    ({formatDateID(bulkDeleteFrom)} s/d {formatDateID(bulkDeleteTo)}
+                    {bulkDeleteOutlet !== "ALL" ? `, outlet ${bulkDeleteOutlet}` : ""}).
+                  </div>
+                  <label style={{ display: "flex", flexDirection: "column", gap: 4, fontSize: 12.5, marginBottom: 10, maxWidth: 420 }}>
+                    Alasan (opsional, tercatat di Riwayat Aktivitas)
+                    <input
+                      type="text"
+                      value={bulkDeleteReason}
+                      onChange={(e) => setBulkDeleteReason(e.target.value)}
+                      placeholder="mis. data uji coba, salah input tanggal"
+                      style={{ padding: "8px 10px", borderRadius: 8, border: "1px solid var(--border)" }}
+                    />
+                  </label>
+                  <button
+                    className="primary-button"
+                    style={{ background: "var(--red-600)" }}
+                    onClick={confirmBulkDelete}
+                    disabled={bulkDeleteBusy}
+                  >
+                    {bulkDeleteBusy ? "Menghapus..." : `Hapus ${activePreview.rows.length} Baris`}
+                  </button>
+                </>
+              )}
+            </div>
+          )}
+        </div>
+      </div>
+    );
+  }
+
   async function handleDownloadReport() {
     if (reportStart && reportEnd && reportStart > reportEnd) {
       showToast("Tanggal mulai tidak boleh lebih besar dari tanggal akhir.");
@@ -5976,6 +6274,7 @@ export default function App() {
       case "import": return renderImport();
       case "import-wa": return renderImportWa();
       case "riwayat": return renderRiwayat();
+      case "hapus-data": return renderHapusData();
       case "todo": return renderTodo();
       case "laporan": return renderLaporan();
       case "pengaturan": return renderPengaturan();
