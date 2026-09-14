@@ -526,29 +526,38 @@ exports.syncReservations = onSchedule(
 // "LAPORAN KASIR_DS.xlsx", satu sheet per hari x shift kasir) dan
 // kembalikan rekap "P. Moka" per hari/shift untuk dashboard.
 //
-// Live fetch tiap request (tanpa cache/sync berkala) -- selalu
-// menampilkan angka terbaru begitu kasir update spreadsheet-nya, dan
-// TIDAK butuh API key/secret apa pun: file-nya dibagikan "siapa saja
-// yang punya link", jadi dua endpoint publik Google ini bisa dipanggil
-// tanpa autentikasi ke Google:
-//  1. Halaman /edit (HTML) -- nama semua sheet tab dirender langsung
-//     sebagai teks di dalam <div class="docs-sheet-tab-caption">,
-//     jadi daftar sheet bisa didapat tanpa Sheets API/API key. Ini
-//     bergantung pada markup internal Google yang tidak didokumentasikan
-//     resmi -- kalau suatu saat class ini berubah, fungsi ini akan
-//     mengembalikan days:[] (title tidak ketemu = tidak ada yang
-//     diklasifikasi), bukan error keras.
-//  2. Endpoint gviz (`/gviz/tq?tqx=out:csv&sheet=<nama>`) -- fitur
-//     "Google Visualization API" resmi untuk sheet publik, dipakai
-//     luas untuk dashboard/embed, JAUH lebih stabil daripada (1).
+// Live fetch tiap request, TANPA API key/secret apa pun. File ini
+// adalah file Excel asli yang dibuka lewat editor Sheets (mode
+// kompatibilitas Office) -- Google Sheets API v4 resmi TIDAK mendukung
+// file semacam ini sama sekali ("must not be an Office file",
+// FAILED_PRECONDITION, diverifikasi langsung), jadi tidak bisa dipakai
+// di sini. Endpoint gviz publik (`/gviz/tq?tqx=out:csv`) MENDUKUNG
+// file Office tapi punya lag indexing yang tidak konsisten di sisi
+// Google (diverifikasi langsung: data yang baru saja diedit kasir
+// tetap muncul kosong walau sudah benar di UI Sheets), jadi juga tidak
+// bisa diandalkan untuk "selalu data terbaru".
+//
+// Kombinasi yang TERNYATA akurat & real-time (dan tetap tanpa
+// autentikasi ke Google, karena file dibagikan "siapa saja yang punya
+// link"):
+//  1. Halaman /edit (HTML) -- bootstrap data-nya (JSON yang di-escape
+//     di dalam sebuah <script>) memuat SEMUA sheet sekaligus sebagai
+//     pasangan [indexAcak,0,"<gid>",[{"1":[[0,0,"<judul sheet>"]...],
+//     jadi gid + judul tiap sheet bisa didapat dalam SATU request.
+//     Markup/struktur ini tidak didokumentasikan resmi oleh Google --
+//     kalau berubah, fungsi ini akan mengembalikan days:[] (tidak ada
+//     sheet yang cocok pola), bukan error keras.
+//  2. Endpoint `/export?format=csv&gid=<gid>` -- mekanisme "download
+//     as CSV" resmi Drive untuk satu sheet tertentu, diverifikasi
+//     SELALU real-time (tidak seperti gviz) dan mendukung file Office.
 //
 // Nama sheet TIDAK konsisten ("9 Sep Ds  Pagi" vs "11 DS Pagi" tanpa
 // "Sep", spasi ganda, dsb) jadi tanggal & shift diklasifikasi dari
 // nama sheet dengan regex toleran, bukan parsing sel "Hari/Tgl" (sering
 // dikosongkan kasir). Baris "P. Moka" dicari lewat pencocokan teks
 // (baris berbeda-beda per sheet), tapi kolom "Kredit"-nya dibaca dari
-// index tetap (4) -- lihat komentar di extractMokaCreditValue soal
-// kenapa TIDAK boleh dicari lewat teks header "Kredit".
+// index tetap (4) -- No.Bukti=1, Keterangan=2, Debet=3, Kredit=4,
+// Saldo=5, template yang sama di semua sheet.
 // ============================================================
 
 const MOKA_SPREADSHEET_ID = "1laLD-ZKRUY-SpGZQ9lKMxIojtnHmDUQx";
@@ -582,7 +591,8 @@ function classifyMokaSheetTitle(rawTitle) {
 
 // Parser CSV minimal (RFC4180: field berkutip, koma di dalam kutip
 // dianggap bagian dari field, "" di dalam kutip = karakter kutip
-// literal) -- cukup untuk output gviz, tidak perlu dependency tambahan.
+// literal) -- cukup untuk output /export, tidak perlu dependency
+// tambahan.
 function parseCsv(text) {
   const rows = [];
   let row = [];
@@ -622,37 +632,39 @@ function parseRupiahCell(raw) {
   return Number.isFinite(num) && num > 0 ? num : null;
 }
 
-// Kolom "Kredit" SELALU index 4 di grid CSV gviz (No.Bukti=1,
-// Keterangan=2, Debet=3, Kredit=4, Saldo=5 -- template yang sama
-// disalin di semua sheet). TIDAK dicari lewat teks header "Kredit"
-// karena gviz melakukan type-inference per kolom pada output CSV-nya:
-// begitu kolom itu dianggap "numerik" dari isi baris-baris di
-// bawahnya, teks header "Kredit"/"Debet"/"Saldo" (non-numerik) ikut
-// DIBUANG dari beberapa sheet (diverifikasi langsung lewat curl --
-// nilainya sendiri tetap ada di kolom 4, cuma teks header-nya yang
-// hilang), jadi pencarian berbasis teks header tidak bisa diandalkan.
+// Kolom "Kredit" SELALU index 4 (No.Bukti=1, Keterangan=2, Debet=3,
+// Kredit=4, Saldo=5 -- template yang sama disalin di semua sheet),
+// diverifikasi langsung terhadap data asli. Baris "P. Moka" dicari
+// lewat pencocokan teks karena posisi barisnya beda-beda per sheet.
 function extractMokaCreditValue(grid) {
   const MOKA_KREDIT_COL = 4;
   for (const row of grid) {
-    const isMokaRow = row.some((cell) => String(cell || "").trim().toLowerCase() === "p. moka");
+    const isMokaRow = (row || []).some((cell) => String(cell || "").trim().toLowerCase() === "p. moka");
     if (isMokaRow) return parseRupiahCell(row[MOKA_KREDIT_COL]);
   }
   return null;
 }
 
-async function fetchMokaSheetTitles() {
+// Ambil {gid, title} SEMUA sheet dari bootstrap data halaman /edit --
+// lihat komentar besar di atas soal kenapa lewat sini, bukan Sheets
+// API. Pola regexnya: [<angka apa saja>,0,"<gid>",[{"1":[[0,0,"<judul>"]
+// -- angka pertama BUKAN gid (itu semacam index internal yang beda-
+// beda per sheet), gid-nya ada di grup kedua (string angka).
+async function fetchMokaSheetMeta() {
   const editRes = await fetch(`https://docs.google.com/spreadsheets/d/${MOKA_SPREADSHEET_ID}/edit`);
   if (!editRes.ok) throw new Error(`Gagal buka spreadsheet (status ${editRes.status})`);
   const html = await editRes.text();
-  const titles = [];
-  const re = /docs-sheet-tab-caption">([^<]*)</g;
+  const re = /\[\d+,0,\\"(\d+)\\",\[\{\\"1\\":\[\[0,0,\\"([^\\]*?)\\"\]/g;
+  const seen = new Map();
   let m;
-  while ((m = re.exec(html)) !== null) titles.push(m[1]);
-  return titles;
+  while ((m = re.exec(html)) !== null) {
+    if (!seen.has(m[1])) seen.set(m[1], m[2]);
+  }
+  return Array.from(seen, ([gid, title]) => ({ gid, title }));
 }
 
-async function fetchMokaSheetGrid(rawTitle) {
-  const url = `https://docs.google.com/spreadsheets/d/${MOKA_SPREADSHEET_ID}/gviz/tq?tqx=out:csv&sheet=${encodeURIComponent(rawTitle)}`;
+async function fetchMokaSheetCsv(gid) {
+  const url = `https://docs.google.com/spreadsheets/d/${MOKA_SPREADSHEET_ID}/export?format=csv&gid=${gid}`;
   const res = await fetch(url);
   if (!res.ok) return null;
   const csvText = await res.text();
@@ -695,9 +707,9 @@ exports.getMokaSalesReport = onRequest(
     }
 
     try {
-      const rawTitles = await fetchMokaSheetTitles();
-      const classified = rawTitles
-        .map((rawTitle) => ({ rawTitle, cls: classifyMokaSheetTitle(rawTitle) }))
+      const sheetMeta = await fetchMokaSheetMeta();
+      const classified = sheetMeta
+        .map((s) => ({ gid: s.gid, rawTitle: s.title, cls: classifyMokaSheetTitle(s.title) }))
         .filter((s) => s.cls);
 
       if (!classified.length) {
@@ -714,9 +726,9 @@ exports.getMokaSalesReport = onRequest(
 
       const grids = await mapWithConcurrency(classified, 6, async (s) => {
         try {
-          return await fetchMokaSheetGrid(s.rawTitle);
+          return await fetchMokaSheetCsv(s.gid);
         } catch (err) {
-          logger.warn(`getMokaSalesReport: gagal ambil sheet "${s.rawTitle}":`, err.message);
+          logger.warn(`getMokaSalesReport: gagal ambil sheet "${s.rawTitle}" (gid ${s.gid}):`, err.message);
           return null;
         }
       });
