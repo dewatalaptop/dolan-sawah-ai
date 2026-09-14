@@ -520,3 +520,240 @@ exports.syncReservations = onSchedule(
     );
   }
 );
+
+// ============================================================
+// getMokaSalesReport: baca laporan kasir harian (Google Sheets
+// "LAPORAN KASIR_DS.xlsx", satu sheet per hari x shift kasir) dan
+// kembalikan rekap "P. Moka" per hari/shift untuk dashboard.
+//
+// Live fetch tiap request (tanpa cache/sync berkala) -- selalu
+// menampilkan angka terbaru begitu kasir update spreadsheet-nya, dan
+// TIDAK butuh API key/secret apa pun: file-nya dibagikan "siapa saja
+// yang punya link", jadi dua endpoint publik Google ini bisa dipanggil
+// tanpa autentikasi ke Google:
+//  1. Halaman /edit (HTML) -- nama semua sheet tab dirender langsung
+//     sebagai teks di dalam <div class="docs-sheet-tab-caption">,
+//     jadi daftar sheet bisa didapat tanpa Sheets API/API key. Ini
+//     bergantung pada markup internal Google yang tidak didokumentasikan
+//     resmi -- kalau suatu saat class ini berubah, fungsi ini akan
+//     mengembalikan days:[] (title tidak ketemu = tidak ada yang
+//     diklasifikasi), bukan error keras.
+//  2. Endpoint gviz (`/gviz/tq?tqx=out:csv&sheet=<nama>`) -- fitur
+//     "Google Visualization API" resmi untuk sheet publik, dipakai
+//     luas untuk dashboard/embed, JAUH lebih stabil daripada (1).
+//
+// Nama sheet TIDAK konsisten ("9 Sep Ds  Pagi" vs "11 DS Pagi" tanpa
+// "Sep", spasi ganda, dsb) jadi tanggal & shift diklasifikasi dari
+// nama sheet dengan regex toleran, bukan parsing sel "Hari/Tgl" (sering
+// dikosongkan kasir). Baris "P. Moka" dicari lewat pencocokan teks
+// (baris berbeda-beda per sheet), tapi kolom "Kredit"-nya dibaca dari
+// index tetap (4) -- lihat komentar di extractMokaCreditValue soal
+// kenapa TIDAK boleh dicari lewat teks header "Kredit".
+// ============================================================
+
+const MOKA_SPREADSHEET_ID = "1laLD-ZKRUY-SpGZQ9lKMxIojtnHmDUQx";
+const MOKA_MONTH_NUMBER = { JAN: 1, FEB: 2, MAR: 3, APR: 4, MEI: 5, JUN: 6, JUL: 7, AGU: 8, AGS: 8, SEP: 9, OKT: 10, NOV: 11, DES: 12 };
+const MOKA_MONTH_LABEL_ID = ["", "Jan", "Feb", "Mar", "Apr", "Mei", "Jun", "Jul", "Agu", "Sep", "Okt", "Nov", "Des"];
+const MOKA_SHIFT_LABELS = { SP: "Soto Pagi", "DS Pagi": "Dolan Sawah (Pagi)", SS: "Sawah Senja", "DS Siang": "Dolan Sawah (Siang)" };
+const MOKA_SHIFT_ORDER = ["SP", "DS Pagi", "SS", "DS Siang"];
+
+function classifyMokaSheetTitle(rawTitle) {
+  const normalized = String(rawTitle || "").replace(/\s+/g, " ").trim();
+  if (!normalized || /^salinan/i.test(normalized) || /rekap/i.test(normalized)) return null;
+  const dayMatch = normalized.match(/(\d{1,2})/);
+  if (!dayMatch) return null;
+  const day = Number(dayMatch[1]);
+  if (!(day >= 1 && day <= 31)) return null;
+
+  const upper = normalized.toUpperCase();
+  const hasDS = /\bDS\b/.test(upper);
+  const hasPagi = /PAGI/.test(upper);
+  const hasSiang = /SIANG/.test(upper);
+  let shiftKey = null;
+  if (hasDS && hasSiang) shiftKey = "DS Siang";
+  else if (hasDS && hasPagi) shiftKey = "DS Pagi";
+  else if (/\bSP\b/.test(upper)) shiftKey = "SP";
+  else if (/\bSS\b/.test(upper)) shiftKey = "SS";
+  if (!shiftKey) return null;
+
+  const monthMatch = upper.match(/\b(JAN|FEB|MAR|APR|MEI|JUN|JUL|AGU|AGS|SEP|OKT|NOV|DES)/);
+  return { day, shiftKey, monthKey: monthMatch ? monthMatch[1] : null };
+}
+
+// Parser CSV minimal (RFC4180: field berkutip, koma di dalam kutip
+// dianggap bagian dari field, "" di dalam kutip = karakter kutip
+// literal) -- cukup untuk output gviz, tidak perlu dependency tambahan.
+function parseCsv(text) {
+  const rows = [];
+  let row = [];
+  let field = "";
+  let inQuotes = false;
+  for (let i = 0; i < text.length; i++) {
+    const c = text[i];
+    if (inQuotes) {
+      if (c === "\"") {
+        if (text[i + 1] === "\"") { field += "\""; i++; }
+        else inQuotes = false;
+      } else {
+        field += c;
+      }
+    } else if (c === "\"") {
+      inQuotes = true;
+    } else if (c === ",") {
+      row.push(field);
+      field = "";
+    } else if (c === "\n") {
+      row.push(field);
+      rows.push(row);
+      row = [];
+      field = "";
+    } else if (c !== "\r") {
+      field += c;
+    }
+  }
+  if (field.length || row.length) { row.push(field); rows.push(row); }
+  return rows;
+}
+
+function parseRupiahCell(raw) {
+  const digitsOnly = String(raw || "").replace(/[^\d]/g, "");
+  if (!digitsOnly) return null;
+  const num = Number(digitsOnly);
+  return Number.isFinite(num) && num > 0 ? num : null;
+}
+
+// Kolom "Kredit" SELALU index 4 di grid CSV gviz (No.Bukti=1,
+// Keterangan=2, Debet=3, Kredit=4, Saldo=5 -- template yang sama
+// disalin di semua sheet). TIDAK dicari lewat teks header "Kredit"
+// karena gviz melakukan type-inference per kolom pada output CSV-nya:
+// begitu kolom itu dianggap "numerik" dari isi baris-baris di
+// bawahnya, teks header "Kredit"/"Debet"/"Saldo" (non-numerik) ikut
+// DIBUANG dari beberapa sheet (diverifikasi langsung lewat curl --
+// nilainya sendiri tetap ada di kolom 4, cuma teks header-nya yang
+// hilang), jadi pencarian berbasis teks header tidak bisa diandalkan.
+function extractMokaCreditValue(grid) {
+  const MOKA_KREDIT_COL = 4;
+  for (const row of grid) {
+    const isMokaRow = row.some((cell) => String(cell || "").trim().toLowerCase() === "p. moka");
+    if (isMokaRow) return parseRupiahCell(row[MOKA_KREDIT_COL]);
+  }
+  return null;
+}
+
+async function fetchMokaSheetTitles() {
+  const editRes = await fetch(`https://docs.google.com/spreadsheets/d/${MOKA_SPREADSHEET_ID}/edit`);
+  if (!editRes.ok) throw new Error(`Gagal buka spreadsheet (status ${editRes.status})`);
+  const html = await editRes.text();
+  const titles = [];
+  const re = /docs-sheet-tab-caption">([^<]*)</g;
+  let m;
+  while ((m = re.exec(html)) !== null) titles.push(m[1]);
+  return titles;
+}
+
+async function fetchMokaSheetGrid(rawTitle) {
+  const url = `https://docs.google.com/spreadsheets/d/${MOKA_SPREADSHEET_ID}/gviz/tq?tqx=out:csv&sheet=${encodeURIComponent(rawTitle)}`;
+  const res = await fetch(url);
+  if (!res.ok) return null;
+  const csvText = await res.text();
+  return parseCsv(csvText);
+}
+
+// Batasi paralelisme supaya tidak menembakkan puluhan request
+// bersamaan ke Google dalam satu request masuk.
+async function mapWithConcurrency(items, limit, fn) {
+  const results = new Array(items.length);
+  let next = 0;
+  async function worker() {
+    while (next < items.length) {
+      const i = next++;
+      results[i] = await fn(items[i], i);
+    }
+  }
+  await Promise.all(Array.from({ length: Math.min(limit, items.length) }, worker));
+  return results;
+}
+
+async function verifyFirebaseAuth(req) {
+  const header = req.get("Authorization") || "";
+  const match = header.match(/^Bearer (.+)$/);
+  if (!match) throw new Error("Missing Authorization header");
+  await admin.auth().verifyIdToken(match[1]);
+}
+
+exports.getMokaSalesReport = onRequest(
+  {
+    region: "asia-southeast2",
+    cors: ["https://dewatalaptop.github.io", /^http:\/\/localhost:\d+$/]
+  },
+  async (req, res) => {
+    try {
+      await verifyFirebaseAuth(req);
+    } catch (err) {
+      res.status(401).json({ error: "Unauthorized" });
+      return;
+    }
+
+    try {
+      const rawTitles = await fetchMokaSheetTitles();
+      const classified = rawTitles
+        .map((rawTitle) => ({ rawTitle, cls: classifyMokaSheetTitle(rawTitle) }))
+        .filter((s) => s.cls);
+
+      if (!classified.length) {
+        res.status(200).json({ updatedAt: new Date().toISOString(), days: [], grandTotal: 0, shiftLabels: MOKA_SHIFT_LABELS });
+        return;
+      }
+
+      const monthCounts = {};
+      classified.forEach((s) => {
+        if (s.cls.monthKey) monthCounts[s.cls.monthKey] = (monthCounts[s.cls.monthKey] || 0) + 1;
+      });
+      const defaultMonthKey = Object.keys(monthCounts).sort((a, b) => monthCounts[b] - monthCounts[a])[0];
+      const defaultMonth = MOKA_MONTH_NUMBER[defaultMonthKey] || new Date().getMonth() + 1;
+
+      const grids = await mapWithConcurrency(classified, 6, async (s) => {
+        try {
+          return await fetchMokaSheetGrid(s.rawTitle);
+        } catch (err) {
+          logger.warn(`getMokaSalesReport: gagal ambil sheet "${s.rawTitle}":`, err.message);
+          return null;
+        }
+      });
+
+      const dayMap = new Map();
+      classified.forEach((s, i) => {
+        const grid = grids[i];
+        const value = grid ? extractMokaCreditValue(grid) : null;
+        if (value == null) return;
+        const month = s.cls.monthKey ? (MOKA_MONTH_NUMBER[s.cls.monthKey] || defaultMonth) : defaultMonth;
+        const key = `${month}-${s.cls.day}`;
+        if (!dayMap.has(key)) dayMap.set(key, { day: s.cls.day, month, shifts: {} });
+        dayMap.get(key).shifts[s.cls.shiftKey] = value;
+      });
+
+      const days = Array.from(dayMap.values())
+        .map((d) => ({
+          day: d.day,
+          month: d.month,
+          dateLabel: `${d.day} ${MOKA_MONTH_LABEL_ID[d.month] || ""}`.trim(),
+          shifts: d.shifts,
+          total: Object.values(d.shifts).reduce((sum, v) => sum + v, 0)
+        }))
+        .sort((a, b) => a.month - b.month || a.day - b.day);
+
+      const grandTotal = days.reduce((sum, d) => sum + d.total, 0);
+
+      res.status(200).json({
+        updatedAt: new Date().toISOString(),
+        days,
+        grandTotal,
+        shiftOrder: MOKA_SHIFT_ORDER,
+        shiftLabels: MOKA_SHIFT_LABELS
+      });
+    } catch (err) {
+      logger.error("getMokaSalesReport gagal:", err);
+      res.status(502).json({ error: "Gagal memuat laporan Moka" });
+    }
+  }
+);
