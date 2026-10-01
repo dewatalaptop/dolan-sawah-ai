@@ -717,12 +717,34 @@ exports.getMokaSalesReport = onRequest(
         return;
       }
 
-      const monthCounts = {};
+      // Sheet TIDAK selalu mencantumkan nama bulan di judulnya (lihat komentar
+      // besar di atas -- "11 DS Pagi", "19 DS siang", dst). Pendekatan LAMA
+      // memilih bulan default lewat voting: bulan yang paling SERING disebut
+      // eksplisit di SELURUH spreadsheet. Itu pecah persis di pergantian bulan
+      // -- sheet tanggal 1 bulan baru nyaris selalu belum sempat berlabel
+      // bulan, jadi ikut ke bulan LAMA (yang masih mendominasi voting) sampai
+      // cukup banyak sheet baru berlabel eksplisit menumpuk, dan sementara itu
+      // nilainya nabrak & MENIMPA data tanggal 1 bulan sebelumnya karena key
+      // dayMap-nya sama persis (bug nyata: "1 Okt" tidak pernah muncul,
+      // ditemukan 2026-10-01). Ganti dengan inferensi berurutan: urutan hasil
+      // scrape = urutan tab asli di spreadsheet = kronologis, jadi jalan
+      // maju sambil pakai label eksplisit sebagai jangkar tiap kali ada, dan
+      // deteksi pergantian bulan dari nomor tanggal yang TURUN (mis. 30 -> 1)
+      // untuk sheet yang tidak berlabel -- sinyal ini jauh lebih andal
+      // daripada hitung suara global.
+      let runningMonth = null;
+      let prevDay = null;
       classified.forEach((s) => {
-        if (s.cls.monthKey) monthCounts[s.cls.monthKey] = (monthCounts[s.cls.monthKey] || 0) + 1;
+        if (s.cls.monthKey && MOKA_MONTH_NUMBER[s.cls.monthKey]) {
+          runningMonth = MOKA_MONTH_NUMBER[s.cls.monthKey];
+        } else if (runningMonth == null) {
+          runningMonth = new Date().getMonth() + 1;
+        } else if (prevDay != null && s.cls.day < prevDay) {
+          runningMonth = runningMonth === 12 ? 1 : runningMonth + 1;
+        }
+        s.cls.resolvedMonth = runningMonth;
+        prevDay = s.cls.day;
       });
-      const defaultMonthKey = Object.keys(monthCounts).sort((a, b) => monthCounts[b] - monthCounts[a])[0];
-      const defaultMonth = MOKA_MONTH_NUMBER[defaultMonthKey] || new Date().getMonth() + 1;
 
       const grids = await mapWithConcurrency(classified, 6, async (s) => {
         try {
@@ -738,7 +760,7 @@ exports.getMokaSalesReport = onRequest(
         const grid = grids[i];
         const value = grid ? extractMokaCreditValue(grid) : null;
         if (value == null) return;
-        const month = s.cls.monthKey ? (MOKA_MONTH_NUMBER[s.cls.monthKey] || defaultMonth) : defaultMonth;
+        const month = s.cls.resolvedMonth;
         const key = `${month}-${s.cls.day}`;
         if (!dayMap.has(key)) dayMap.set(key, { day: s.cls.day, month, shifts: {} });
         dayMap.get(key).shifts[s.cls.shiftKey] = value;
