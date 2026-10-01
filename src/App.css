@@ -382,6 +382,74 @@ textarea:focus-visible,
 .stat-value { font-size: 22px; font-weight: 750; color: var(--ink); margin-top: 2px; }
 .stat-subtitle { font-size: 11px; color: var(--ink-faint); margin-top: 2px; }
 
+.trend-up { color: var(--green-700); }
+.trend-down { color: var(--red-600); }
+
+/* =========================================================
+   MONTH SWITCHER -- default ke bulan aktif, bulan lain dipilih manual
+   (lihat MokaSalesPage.jsx). Baris pill yang bisa scroll horizontal di
+   layar sempit, sama seperti bar chart di bawahnya, supaya tidak pernah
+   bikin halaman scroll ke samping.
+   ========================================================= */
+
+.month-switcher {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 18px;
+}
+
+.month-switcher-label {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  font-weight: 700;
+  color: var(--ink-soft);
+  flex-shrink: 0;
+}
+
+.month-pills {
+  display: flex;
+  gap: 8px;
+  overflow-x: auto;
+  padding-bottom: 2px;
+}
+
+.month-pill {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  flex-shrink: 0;
+  padding: 7px 14px;
+  border-radius: var(--radius-pill);
+  border: 1px solid var(--border);
+  background: var(--surface);
+  color: var(--ink-soft);
+  font-size: 12.5px;
+  font-weight: 650;
+  cursor: pointer;
+  transition: background 0.15s ease, border-color 0.15s ease, color 0.15s ease, transform 0.15s ease;
+}
+.month-pill:hover { background: var(--green-050); border-color: var(--green-100); transform: translateY(-1px); }
+.month-pill.active {
+  background: linear-gradient(135deg, var(--green-600), var(--green-500));
+  border-color: var(--green-600);
+  color: #fff;
+  box-shadow: var(--shadow-sm);
+}
+.month-pill-count {
+  font-size: 10px;
+  font-weight: 750;
+  padding: 1px 6px;
+  border-radius: var(--radius-pill);
+  background: rgba(255, 255, 255, 0.25);
+}
+.month-pill:not(.active) .month-pill-count {
+  background: var(--border-soft);
+  color: var(--ink-faint);
+}
+
 /* =========================================================
    TABLE
    ========================================================= */

@@ -7,7 +7,7 @@
 // spreadsheet begitu kasir update.
 // ============================================================
 
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import { auth } from "./firebase";
 import { Icon, StatCard, DataTable } from "./uiKit";
 
@@ -26,6 +26,10 @@ const REMOVE_URL =
 // mengikuti gaya warna yang sudah dipakai di halaman lain.
 const SHIFT_COLORS = { SP: "#2c9660", "DS Pagi": "#e4692a", "DS Siang": "#f0803d", SS: "#2f6fd1" };
 const SHIFT_ORDER_FALLBACK = ["SP", "DS Pagi", "SS", "DS Siang"];
+const FULL_MONTH_NAMES = ["", "Januari", "Februari", "Maret", "April", "Mei", "Juni", "Juli", "Agustus", "September", "Oktober", "November", "Desember"];
+// Identitas stabil lintas render (bukan `[]` baru tiap kali) supaya
+// useMemo di bawah yang bergantung padanya tidak hitung ulang sia-sia.
+const EMPTY_DAYS = [];
 
 function formatRupiah(n) {
   return `Rp ${new Intl.NumberFormat("id-ID").format(Math.round(n || 0))}`;
@@ -40,6 +44,7 @@ export default function MokaSalesPage() {
   const [registering, setRegistering] = useState(false);
   const [registerError, setRegisterError] = useState("");
   const [removingId, setRemovingId] = useState("");
+  const [selectedMonth, setSelectedMonth] = useState(null);
 
   const loadReport = useCallback(async () => {
     setLoading(true);
@@ -126,13 +131,53 @@ export default function MokaSalesPage() {
     [loadReport]
   );
 
-  const days = report?.days || [];
+  const allDays = report?.days || EMPTY_DAYS;
   const shiftOrder = report?.shiftOrder || SHIFT_ORDER_FALLBACK;
   const shiftLabels = report?.shiftLabels || {};
-  const grandTotal = report?.grandTotal || 0;
+
+  // Default yang terlihat = bulan aktif saja (bulan TERBARU yang datanya
+  // benar-benar ada, bukan bulan kalender hari ini -- supaya di awal bulan
+  // baru, sebelum spreadsheet-nya sempat didaftarkan di bawah, halaman tetap
+  // menampilkan bulan terakhir yang nyata ada datanya, bukan kosong). Bulan
+  // lain harus dipilih manual lewat pill di bawah.
+  const monthGroups = useMemo(() => {
+    const map = new Map();
+    allDays.forEach((d) => {
+      if (!map.has(d.month)) {
+        map.set(d.month, { month: d.month, label: FULL_MONTH_NAMES[d.month] || `Bulan ${d.month}`, count: 0, total: 0 });
+      }
+      const g = map.get(d.month);
+      g.count += 1;
+      g.total += d.total;
+    });
+    return Array.from(map.values()).sort((a, b) => a.month - b.month);
+  }, [allDays]);
+
+  const defaultMonth = monthGroups.length ? monthGroups[monthGroups.length - 1].month : null;
+  const effectiveMonth =
+    selectedMonth != null && monthGroups.some((g) => g.month === selectedMonth) ? selectedMonth : defaultMonth;
+
+  useEffect(() => {
+    // Sinkronkan state asli ke default yang terhitung -- sekali saat laporan
+    // pertama kali termuat, dan lagi kalau bulan yang sedang dipilih hilang
+    // (mis. spreadsheet sumbernya baru saja dihapus).
+    if (effectiveMonth != null && effectiveMonth !== selectedMonth) {
+      // eslint-disable-next-line react-hooks/set-state-in-effect
+      setSelectedMonth(effectiveMonth);
+    }
+  }, [effectiveMonth, selectedMonth]);
+
+  const days = effectiveMonth == null ? [] : allDays.filter((d) => d.month === effectiveMonth);
+  const grandTotal = days.reduce((sum, d) => sum + d.total, 0);
   const avgPerDay = days.length ? grandTotal / days.length : 0;
   const bestDay = days.reduce((best, d) => (!best || d.total > best.total ? d : best), null);
   const maxTotal = Math.max(1, ...days.map((d) => d.total));
+
+  const selectedMonthIndex = monthGroups.findIndex((g) => g.month === effectiveMonth);
+  const previousMonthGroup = selectedMonthIndex > 0 ? monthGroups[selectedMonthIndex - 1] : null;
+  const monthDeltaPct =
+    previousMonthGroup && previousMonthGroup.total > 0 ? ((grandTotal - previousMonthGroup.total) / previousMonthGroup.total) * 100 : null;
+  const selectedMonthLabel = monthGroups.find((g) => g.month === effectiveMonth)?.label || "";
 
   return (
     <div className="page">
@@ -168,18 +213,54 @@ export default function MokaSalesPage() {
         </div>
       )}
 
+      {monthGroups.length > 0 && (
+        <div className="month-switcher">
+          <div className="month-switcher-label">
+            <Icon name="calendar" size={14} /> Bulan:
+          </div>
+          <div className="month-pills">
+            {monthGroups.map((g) => (
+              <button
+                key={g.month}
+                className={`month-pill${g.month === effectiveMonth ? " active" : ""}`}
+                onClick={() => setSelectedMonth(g.month)}
+                type="button"
+              >
+                {g.label}
+                <span className="month-pill-count">{g.count}</span>
+              </button>
+            ))}
+          </div>
+        </div>
+      )}
+
       {days.length > 0 && (
         <>
           <div className="stat-grid">
-            <StatCard title="Total Periode" value={formatRupiah(grandTotal)} subtitle={`${days.length} hari tercatat`} icon="coin" tone="orange" />
-            <StatCard title="Rata-rata / Hari" value={formatRupiah(avgPerDay)} subtitle="dari hari yang tercatat" icon="trend" tone="green" />
+            <StatCard
+              title={`Total ${selectedMonthLabel}`}
+              value={formatRupiah(grandTotal)}
+              subtitle={
+                monthDeltaPct == null ? (
+                  `${days.length} hari tercatat`
+                ) : (
+                  <span className={monthDeltaPct >= 0 ? "trend-up" : "trend-down"} style={{ display: "inline-flex", alignItems: "center", gap: 3 }}>
+                    <Icon name={monthDeltaPct >= 0 ? "arrowUp" : "arrowDown"} size={11} />
+                    {Math.abs(monthDeltaPct).toFixed(0)}% dari {previousMonthGroup.label}
+                  </span>
+                )
+              }
+              icon="coin"
+              tone="orange"
+            />
+            <StatCard title="Rata-rata / Hari" value={formatRupiah(avgPerDay)} subtitle={`dari ${days.length} hari di ${selectedMonthLabel}`} icon="trend" tone="green" />
             {bestDay && (
               <StatCard title="Hari Tertinggi" value={bestDay.dateLabel} subtitle={formatRupiah(bestDay.total)} icon="sparkle" tone="orange" />
             )}
           </div>
 
           <div className="card">
-            <div className="card-title">Total P. Moka per hari, per shift</div>
+            <div className="card-title">Total P. Moka per hari, per shift — {selectedMonthLabel}</div>
             <div className="card-description">
               Batang bertumpuk — satu warna satu shift.
               {report?.updatedAt && ` Diperbarui: ${new Date(report.updatedAt).toLocaleString("id-ID")}.`}
@@ -217,7 +298,7 @@ export default function MokaSalesPage() {
           </div>
 
           <div className="card">
-            <div className="card-title">Tabel rincian</div>
+            <div className="card-title">Tabel rincian — {selectedMonthLabel}</div>
             <div className="card-description">Nilai Kredit "P. Moka" per shift (Rupiah).</div>
             <DataTable
               columns={["Tanggal", ...shiftOrder.map((k) => shiftLabels[k] || k), "Total"]}
