@@ -14,6 +14,12 @@ import { Icon, StatCard, DataTable } from "./uiKit";
 const REPORT_URL =
   import.meta.env.VITE_MOKA_REPORT_URL ||
   "https://asia-southeast2-dolan-sawah-ai-2026.cloudfunctions.net/getMokaSalesReport";
+const REGISTER_URL =
+  import.meta.env.VITE_MOKA_REGISTER_URL ||
+  "https://asia-southeast2-dolan-sawah-ai-2026.cloudfunctions.net/registerMokaSpreadsheet";
+const REMOVE_URL =
+  import.meta.env.VITE_MOKA_REMOVE_URL ||
+  "https://asia-southeast2-dolan-sawah-ai-2026.cloudfunctions.net/removeMokaSpreadsheet";
 
 // DS Pagi/Siang berbagi keluarga warna oranye (outlet yang sama, shift
 // beda) supaya langsung kebaca sekilas mata, SP hijau & SS biru
@@ -29,6 +35,11 @@ export default function MokaSalesPage() {
   const [report, setReport] = useState(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
+  const [newUrl, setNewUrl] = useState("");
+  const [newLabel, setNewLabel] = useState("");
+  const [registering, setRegistering] = useState(false);
+  const [registerError, setRegisterError] = useState("");
+  const [removingId, setRemovingId] = useState("");
 
   const loadReport = useCallback(async () => {
     setLoading(true);
@@ -57,6 +68,63 @@ export default function MokaSalesPage() {
     // eslint-disable-next-line react-hooks/set-state-in-effect
     loadReport();
   }, [loadReport]);
+
+  // Setiap awal bulan, kasir/owner membuat spreadsheet laporan BARU (lewat
+  // "Buat salinan" di Google Sheets, bukan tab baru di file lama) -- daftarkan
+  // di sini sekali, tanpa perlu sesi coding, supaya "Penjualan Moka" langsung
+  // membaca bulan baru itu juga. Lihat MOKA_SPREADSHEET_SEED di functions/index.js.
+  const handleRegister = useCallback(
+    async (e) => {
+      e.preventDefault();
+      setRegistering(true);
+      setRegisterError("");
+      try {
+        const token = await auth.currentUser?.getIdToken();
+        if (!token) throw new Error("Belum login.");
+        const res = await fetch(REGISTER_URL, {
+          method: "POST",
+          headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
+          body: JSON.stringify({ url: newUrl, label: newLabel })
+        });
+        const body = await res.json().catch(() => ({}));
+        if (!res.ok) throw new Error(body.error || `Gagal mendaftarkan spreadsheet (status ${res.status}).`);
+        setNewUrl("");
+        setNewLabel("");
+        await loadReport();
+      } catch (err) {
+        console.error("Gagal mendaftarkan spreadsheet Moka:", err);
+        setRegisterError(err.message || "Gagal mendaftarkan spreadsheet.");
+      } finally {
+        setRegistering(false);
+      }
+    },
+    [newUrl, newLabel, loadReport]
+  );
+
+  const handleRemove = useCallback(
+    async (spreadsheetId) => {
+      setRemovingId(spreadsheetId);
+      setRegisterError("");
+      try {
+        const token = await auth.currentUser?.getIdToken();
+        if (!token) throw new Error("Belum login.");
+        const res = await fetch(REMOVE_URL, {
+          method: "POST",
+          headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
+          body: JSON.stringify({ spreadsheetId })
+        });
+        const body = await res.json().catch(() => ({}));
+        if (!res.ok) throw new Error(body.error || `Gagal menghapus (status ${res.status}).`);
+        await loadReport();
+      } catch (err) {
+        console.error("Gagal menghapus spreadsheet Moka:", err);
+        setRegisterError(err.message || "Gagal menghapus spreadsheet.");
+      } finally {
+        setRemovingId("");
+      }
+    },
+    [loadReport]
+  );
 
   const days = report?.days || [];
   const shiftOrder = report?.shiftOrder || SHIFT_ORDER_FALLBACK;
@@ -162,6 +230,87 @@ export default function MokaSalesPage() {
           </div>
         </>
       )}
+
+      <div className="card">
+        <div className="card-title">Sumber data spreadsheet</div>
+        <div className="card-description">
+          Setiap awal bulan, kasir/owner membuat spreadsheet laporan BARU (bukan tab baru di file
+          lama). Daftarkan link-nya di sini sekali setiap ada file baru — datanya langsung ikut
+          muncul di rekap di atas, tanpa perlu ubah kode.
+        </div>
+
+        <div style={{ display: "flex", flexDirection: "column", gap: 8, margin: "14px 0" }}>
+          {(report?.spreadsheets || []).map((sp) => (
+            <div
+              key={sp.id}
+              style={{
+                display: "flex",
+                alignItems: "center",
+                justifyContent: "space-between",
+                gap: 10,
+                padding: "8px 12px",
+                borderRadius: 8,
+                border: "1px solid var(--border)",
+                fontSize: 13
+              }}
+            >
+              <div style={{ display: "flex", alignItems: "center", gap: 8, minWidth: 0 }}>
+                <span style={{ fontWeight: 650, color: "var(--ink)" }}>{sp.label}</span>
+                <span
+                  style={{
+                    fontSize: 10.5,
+                    fontWeight: 650,
+                    padding: "2px 7px",
+                    borderRadius: 999,
+                    background: sp.source === "seed" ? "var(--border-soft)" : "var(--green-050)",
+                    color: sp.source === "seed" ? "var(--ink-faint)" : "var(--green-700, #1f7a4c)"
+                  }}
+                >
+                  {sp.source === "seed" ? "bawaan" : "terdaftar"}
+                </span>
+              </div>
+              {sp.source !== "seed" && (
+                <button
+                  className="secondary-button"
+                  onClick={() => handleRemove(sp.id)}
+                  disabled={removingId === sp.id}
+                  style={{ padding: "4px 10px", fontSize: 12 }}
+                >
+                  {removingId === sp.id ? "Menghapus..." : "Hapus"}
+                </button>
+              )}
+            </div>
+          ))}
+          {!report?.spreadsheets?.length && (
+            <div style={{ fontSize: 13, color: "var(--ink-faint)" }}>Belum ada info spreadsheet (muat ulang laporan dulu).</div>
+          )}
+        </div>
+
+        <form onSubmit={handleRegister} style={{ display: "flex", gap: 8, flexWrap: "wrap", alignItems: "center" }}>
+          <input
+            type="text"
+            value={newUrl}
+            onChange={(e) => setNewUrl(e.target.value)}
+            placeholder="Link atau ID spreadsheet baru"
+            style={{ padding: "7px 10px", borderRadius: 6, border: "1px solid var(--border)", minWidth: 260, flex: 1 }}
+            required
+          />
+          <input
+            type="text"
+            value={newLabel}
+            onChange={(e) => setNewLabel(e.target.value)}
+            placeholder='Label (mis. "November 2026")'
+            style={{ padding: "7px 10px", borderRadius: 6, border: "1px solid var(--border)", minWidth: 180 }}
+            required
+          />
+          <button className="primary-button" type="submit" disabled={registering}>
+            {registering ? "Mendaftarkan..." : "+ Tambah"}
+          </button>
+        </form>
+        {registerError && (
+          <div style={{ marginTop: 10, fontSize: 12.5, color: "var(--red-600, #c0392b)" }}>{registerError}</div>
+        )}
+      </div>
     </div>
   );
 }

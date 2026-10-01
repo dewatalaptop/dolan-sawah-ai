@@ -560,7 +560,21 @@ exports.syncReservations = onSchedule(
 // Saldo=5, template yang sama di semua sheet.
 // ============================================================
 
-const MOKA_SPREADSHEET_ID = "1laLD-ZKRUY-SpGZQ9lKMxIojtnHmDUQx";
+// Setiap awal bulan, kasir/owner membuat spreadsheet BARU (lewat "Buat
+// salinan" dari file bulan sebelumnya di Google Sheets -- bukan menambah
+// tab baru ke file yang sama), jadi satu spreadsheet ID TIDAK bisa
+// mewakili lebih dari satu bulan (bug nyata, ditemukan 2026-10-01: file
+// Oktober punya ID sendiri, laporan tetap baca file September sehingga
+// data Oktober tidak pernah muncul). MOKA_SPREADSHEET_SEED adalah
+// baseline yang sudah diketahui; `mokaSpreadsheets` (Firestore) adalah
+// registry yang BISA ditambah sendiri oleh pemilik lewat UI "Penjualan
+// Moka" tiap kali file baru dibuat (lihat registerMokaSpreadsheet di
+// bawah) -- tidak perlu sesi coding lagi tiap pergantian bulan.
+const MOKA_SPREADSHEET_SEED = [
+  { id: "1laLD-ZKRUY-SpGZQ9lKMxIojtnHmDUQx", label: "September 2026" },
+  { id: "1l7QGzLR2OneLVcRwpZ6j5V7m-KTVh8lC", label: "Oktober 2026" }
+];
+const MOKA_REGISTRY_COLLECTION = "mokaSpreadsheets";
 const MOKA_MONTH_NUMBER = { JAN: 1, FEB: 2, MAR: 3, APR: 4, MEI: 5, JUN: 6, JUL: 7, AGU: 8, AGS: 8, SEP: 9, OKT: 10, NOV: 11, DES: 12 };
 const MOKA_MONTH_LABEL_ID = ["", "Jan", "Feb", "Mar", "Apr", "Mei", "Jun", "Jul", "Agu", "Sep", "Okt", "Nov", "Des"];
 const MOKA_SHIFT_LABELS = { SP: "Soto Pagi", "DS Pagi": "Dolan Sawah (Pagi)", SS: "Sawah Senja", "DS Siang": "Dolan Sawah (Siang)" };
@@ -650,8 +664,8 @@ function extractMokaCreditValue(grid) {
 // API. Pola regexnya: [<angka apa saja>,0,"<gid>",[{"1":[[0,0,"<judul>"]
 // -- angka pertama BUKAN gid (itu semacam index internal yang beda-
 // beda per sheet), gid-nya ada di grup kedua (string angka).
-async function fetchMokaSheetMeta() {
-  const editRes = await fetch(`https://docs.google.com/spreadsheets/d/${MOKA_SPREADSHEET_ID}/edit`);
+async function fetchMokaSheetMeta(spreadsheetId) {
+  const editRes = await fetch(`https://docs.google.com/spreadsheets/d/${spreadsheetId}/edit`);
   if (!editRes.ok) throw new Error(`Gagal buka spreadsheet (status ${editRes.status})`);
   const html = await editRes.text();
   const re = /\[\d+,0,\\"(\d+)\\",\[\{\\"1\\":\[\[0,0,\\"([^\\]*?)\\"\]/g;
@@ -663,12 +677,51 @@ async function fetchMokaSheetMeta() {
   return Array.from(seen, ([gid, title]) => ({ gid, title }));
 }
 
-async function fetchMokaSheetCsv(gid) {
-  const url = `https://docs.google.com/spreadsheets/d/${MOKA_SPREADSHEET_ID}/export?format=csv&gid=${gid}`;
+async function fetchMokaSheetCsv(spreadsheetId, gid) {
+  const url = `https://docs.google.com/spreadsheets/d/${spreadsheetId}/export?format=csv&gid=${gid}`;
   const res = await fetch(url);
   if (!res.ok) return null;
   const csvText = await res.text();
   return parseCsv(csvText);
+}
+
+// Gabungan baseline (MOKA_SPREADSHEET_SEED) + apa pun yang sudah
+// didaftarkan pemilik lewat registerMokaSpreadsheet. ID yang sama di
+// kedua tempat: label dari registry (lebih baru) yang menang.
+async function getMokaSpreadsheetList() {
+  const merged = new Map(MOKA_SPREADSHEET_SEED.map((s) => [s.id, { id: s.id, label: s.label, source: "seed" }]));
+  const snap = await ownDb.collection(MOKA_REGISTRY_COLLECTION).get();
+  snap.forEach((doc) => {
+    const data = doc.data();
+    merged.set(doc.id, { id: doc.id, label: data.label || doc.id, source: "registry" });
+  });
+  return Array.from(merged.values());
+}
+
+// Klasifikasi + resolusi bulan untuk SATU spreadsheet -- runningMonth di-
+// reset per spreadsheet karena urutan tab tiap file dimulai dari awal lagi
+// (lihat komentar besar soal inferensi berurutan di handler utama).
+async function classifySpreadsheetSheets(spreadsheet) {
+  const sheetMeta = await fetchMokaSheetMeta(spreadsheet.id);
+  const classified = sheetMeta
+    .map((s) => ({ spreadsheetId: spreadsheet.id, gid: s.gid, rawTitle: s.title, cls: classifyMokaSheetTitle(s.title) }))
+    .filter((s) => s.cls);
+
+  let runningMonth = null;
+  let prevDay = null;
+  classified.forEach((s) => {
+    if (s.cls.monthKey && MOKA_MONTH_NUMBER[s.cls.monthKey]) {
+      runningMonth = MOKA_MONTH_NUMBER[s.cls.monthKey];
+    } else if (runningMonth == null) {
+      runningMonth = new Date().getMonth() + 1;
+    } else if (prevDay != null && s.cls.day < prevDay) {
+      runningMonth = runningMonth === 12 ? 1 : runningMonth + 1;
+    }
+    s.cls.resolvedMonth = runningMonth;
+    prevDay = s.cls.day;
+  });
+
+  return classified;
 }
 
 // Batasi paralelisme supaya tidak menembakkan puluhan request
@@ -707,48 +760,36 @@ exports.getMokaSalesReport = onRequest(
     }
 
     try {
-      const sheetMeta = await fetchMokaSheetMeta();
-      const classified = sheetMeta
-        .map((s) => ({ gid: s.gid, rawTitle: s.title, cls: classifyMokaSheetTitle(s.title) }))
-        .filter((s) => s.cls);
+      const spreadsheets = await getMokaSpreadsheetList();
+
+      // Satu spreadsheet yang gagal diakses (dihapus, izin share dicabut,
+      // dll) tidak boleh menjatuhkan seluruh laporan -- lewati & catat saja.
+      const perSpreadsheet = await Promise.all(
+        spreadsheets.map(async (sp) => {
+          try {
+            return await classifySpreadsheetSheets(sp);
+          } catch (err) {
+            logger.warn(`getMokaSalesReport: gagal baca spreadsheet "${sp.label}" (${sp.id}):`, err.message);
+            return [];
+          }
+        })
+      );
+      const classified = perSpreadsheet.flat();
 
       if (!classified.length) {
-        res.status(200).json({ updatedAt: new Date().toISOString(), days: [], grandTotal: 0, shiftLabels: MOKA_SHIFT_LABELS });
+        res.status(200).json({
+          updatedAt: new Date().toISOString(),
+          days: [],
+          grandTotal: 0,
+          shiftLabels: MOKA_SHIFT_LABELS,
+          spreadsheets
+        });
         return;
       }
 
-      // Sheet TIDAK selalu mencantumkan nama bulan di judulnya (lihat komentar
-      // besar di atas -- "11 DS Pagi", "19 DS siang", dst). Pendekatan LAMA
-      // memilih bulan default lewat voting: bulan yang paling SERING disebut
-      // eksplisit di SELURUH spreadsheet. Itu pecah persis di pergantian bulan
-      // -- sheet tanggal 1 bulan baru nyaris selalu belum sempat berlabel
-      // bulan, jadi ikut ke bulan LAMA (yang masih mendominasi voting) sampai
-      // cukup banyak sheet baru berlabel eksplisit menumpuk, dan sementara itu
-      // nilainya nabrak & MENIMPA data tanggal 1 bulan sebelumnya karena key
-      // dayMap-nya sama persis (bug nyata: "1 Okt" tidak pernah muncul,
-      // ditemukan 2026-10-01). Ganti dengan inferensi berurutan: urutan hasil
-      // scrape = urutan tab asli di spreadsheet = kronologis, jadi jalan
-      // maju sambil pakai label eksplisit sebagai jangkar tiap kali ada, dan
-      // deteksi pergantian bulan dari nomor tanggal yang TURUN (mis. 30 -> 1)
-      // untuk sheet yang tidak berlabel -- sinyal ini jauh lebih andal
-      // daripada hitung suara global.
-      let runningMonth = null;
-      let prevDay = null;
-      classified.forEach((s) => {
-        if (s.cls.monthKey && MOKA_MONTH_NUMBER[s.cls.monthKey]) {
-          runningMonth = MOKA_MONTH_NUMBER[s.cls.monthKey];
-        } else if (runningMonth == null) {
-          runningMonth = new Date().getMonth() + 1;
-        } else if (prevDay != null && s.cls.day < prevDay) {
-          runningMonth = runningMonth === 12 ? 1 : runningMonth + 1;
-        }
-        s.cls.resolvedMonth = runningMonth;
-        prevDay = s.cls.day;
-      });
-
       const grids = await mapWithConcurrency(classified, 6, async (s) => {
         try {
-          return await fetchMokaSheetCsv(s.gid);
+          return await fetchMokaSheetCsv(s.spreadsheetId, s.gid);
         } catch (err) {
           logger.warn(`getMokaSalesReport: gagal ambil sheet "${s.rawTitle}" (gid ${s.gid}):`, err.message);
           return null;
@@ -783,11 +824,99 @@ exports.getMokaSalesReport = onRequest(
         days,
         grandTotal,
         shiftOrder: MOKA_SHIFT_ORDER,
-        shiftLabels: MOKA_SHIFT_LABELS
+        shiftLabels: MOKA_SHIFT_LABELS,
+        spreadsheets
       });
     } catch (err) {
       logger.error("getMokaSalesReport gagal:", err);
       res.status(502).json({ error: "Gagal memuat laporan Moka" });
     }
+  }
+);
+
+function extractMokaSpreadsheetId(raw) {
+  const value = String(raw || "").trim();
+  const urlMatch = value.match(/\/d\/([a-zA-Z0-9_-]{15,})/);
+  if (urlMatch) return urlMatch[1];
+  if (/^[a-zA-Z0-9_-]{15,}$/.test(value)) return value;
+  return null;
+}
+
+// Dipanggil dari UI "Penjualan Moka" setiap kali ada spreadsheet baru
+// (lihat komentar besar di MOKA_SPREADSHEET_SEED) -- menggantikan sesi
+// coding manual tiap pergantian bulan dengan satu kali tempel link.
+exports.registerMokaSpreadsheet = onRequest(
+  {
+    region: "asia-southeast2",
+    cors: ["https://dewatalaptop.github.io", /^http:\/\/localhost:\d+$/]
+  },
+  async (req, res) => {
+    try {
+      await verifyFirebaseAuth(req);
+    } catch (err) {
+      res.status(401).json({ error: "Unauthorized" });
+      return;
+    }
+    if (req.method !== "POST") {
+      res.status(405).json({ error: "Method not allowed" });
+      return;
+    }
+
+    const spreadsheetId = extractMokaSpreadsheetId(req.body?.url ?? req.body?.spreadsheetId);
+    const label = String(req.body?.label || "").trim();
+    if (!spreadsheetId) {
+      res.status(400).json({ error: "Link atau ID spreadsheet tidak valid." });
+      return;
+    }
+    if (!label) {
+      res.status(400).json({ error: "Label (mis. \"November 2026\") wajib diisi." });
+      return;
+    }
+
+    try {
+      const check = await fetch(`https://docs.google.com/spreadsheets/d/${spreadsheetId}/edit`);
+      if (!check.ok) {
+        res.status(400).json({ error: `Spreadsheet tidak bisa diakses (status ${check.status}). Pastikan sudah di-share "siapa saja yang punya link".` });
+        return;
+      }
+    } catch (err) {
+      res.status(400).json({ error: "Gagal memverifikasi spreadsheet. Coba lagi." });
+      return;
+    }
+
+    await ownDb.collection(MOKA_REGISTRY_COLLECTION).doc(spreadsheetId).set(
+      { label, addedAt: admin.firestore.FieldValue.serverTimestamp() },
+      { merge: true }
+    );
+    res.status(200).json({ ok: true, spreadsheets: await getMokaSpreadsheetList() });
+  }
+);
+
+exports.removeMokaSpreadsheet = onRequest(
+  {
+    region: "asia-southeast2",
+    cors: ["https://dewatalaptop.github.io", /^http:\/\/localhost:\d+$/]
+  },
+  async (req, res) => {
+    try {
+      await verifyFirebaseAuth(req);
+    } catch (err) {
+      res.status(401).json({ error: "Unauthorized" });
+      return;
+    }
+    if (req.method !== "POST") {
+      res.status(405).json({ error: "Method not allowed" });
+      return;
+    }
+
+    const spreadsheetId = String(req.body?.spreadsheetId || "").trim();
+    if (!spreadsheetId) {
+      res.status(400).json({ error: "spreadsheetId wajib diisi." });
+      return;
+    }
+    // Baseline di MOKA_SPREADSHEET_SEED bukan dokumen Firestore -- delete di
+    // sini hanya pernah menghapus entri registry, tidak pernah baseline.
+    await ownDb.collection(MOKA_REGISTRY_COLLECTION).doc(spreadsheetId).delete();
+    res.status(200).json({ ok: true, spreadsheets: await getMokaSpreadsheetList() });
   }
 );
