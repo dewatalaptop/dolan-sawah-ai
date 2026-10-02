@@ -575,6 +575,22 @@ const MOKA_SPREADSHEET_SEED = [
   { id: "1l7QGzLR2OneLVcRwpZ6j5V7m-KTVh8lC", label: "Oktober 2026" }
 ];
 const MOKA_REGISTRY_COLLECTION = "mokaSpreadsheets";
+// Men-scrape SEMUA spreadsheet terdaftar tiap request (bootstrap HTML +
+// satu CSV export per sheet -- bisa 90+ request anonim ke Google untuk 2
+// spreadsheet saja) ternyata sangat lambat kalau dikerjakan ulang setiap
+// kali halaman dibuka (keluhan nyata, 2026-10-02). Hasilnya sekarang
+// disimpan di Firestore (bukan memory Cloud Function -- supaya tetap
+// konsisten lintas instance & selamat dari cold start) dan disegarkan oleh
+// jadwal berkala di latar belakang (lihat refreshMokaReportCacheSchedule),
+// bukan oleh pengguna yang sedang menunggu. Tombol "Refresh" di UI tetap
+// bisa minta data benar-benar baru lewat ?force=1 kalau kasir baru saja
+// mengisi sesuatu dan tidak mau menunggu jadwal berikutnya.
+const MOKA_CACHE_COLLECTION = "mokaReportCache";
+const MOKA_CACHE_DOC_ID = "latest";
+// Jaring pengaman kalau jadwal background gagal jalan beberapa kali
+// berturut-turut -- di luar ini, lebih baik lambat sekali daripada diam-
+// diam menampilkan angka yang sudah basi tanpa batas.
+const MOKA_CACHE_MAX_AGE_MS = 15 * 60 * 1000;
 const MOKA_MONTH_NUMBER = { JAN: 1, FEB: 2, MAR: 3, APR: 4, MEI: 5, JUN: 6, JUL: 7, AGU: 8, AGS: 8, SEP: 9, OKT: 10, NOV: 11, DES: 12 };
 const MOKA_MONTH_LABEL_ID = ["", "Jan", "Feb", "Mar", "Apr", "Mei", "Jun", "Jul", "Agu", "Sep", "Okt", "Nov", "Des"];
 const MOKA_SHIFT_LABELS = { SP: "Soto Pagi", "DS Pagi": "Dolan Sawah (Pagi)", SS: "Sawah Senja", "DS Siang": "Dolan Sawah (Siang)" };
@@ -746,6 +762,86 @@ async function verifyFirebaseAuth(req) {
   await admin.auth().verifyIdToken(match[1]);
 }
 
+// Kerja berat yang sesungguhnya (dulu langsung di dalam handler HTTP) --
+// sekarang fungsi berdiri sendiri supaya dipakai baik oleh request yang
+// minta data segar (?force=1) MAUPUN oleh jadwal background yang mengisi
+// cache (lihat MOKA_CACHE_* di atas).
+async function computeMokaReport() {
+  const spreadsheets = await getMokaSpreadsheetList();
+
+  // Satu spreadsheet yang gagal diakses (dihapus, izin share dicabut, dll)
+  // tidak boleh menjatuhkan seluruh laporan -- lewati & catat saja.
+  const perSpreadsheet = await Promise.all(
+    spreadsheets.map(async (sp) => {
+      try {
+        return await classifySpreadsheetSheets(sp);
+      } catch (err) {
+        logger.warn(`computeMokaReport: gagal baca spreadsheet "${sp.label}" (${sp.id}):`, err.message);
+        return [];
+      }
+    })
+  );
+  const classified = perSpreadsheet.flat();
+
+  if (!classified.length) {
+    return { updatedAt: new Date().toISOString(), days: [], grandTotal: 0, shiftLabels: MOKA_SHIFT_LABELS, spreadsheets };
+  }
+
+  // Konkurensi 10 (naik dari 6) -- batas aman yang sudah dicoba langsung
+  // terhadap data nyata (2 spreadsheet, ~96 sheet) tanpa kena rate-limit
+  // Google; dipadukan dengan cache ini jadi jarang benar-benar dipakai di
+  // jalur yang ditunggu pengguna.
+  const grids = await mapWithConcurrency(classified, 10, async (s) => {
+    try {
+      return await fetchMokaSheetCsv(s.spreadsheetId, s.gid);
+    } catch (err) {
+      logger.warn(`computeMokaReport: gagal ambil sheet "${s.rawTitle}" (gid ${s.gid}):`, err.message);
+      return null;
+    }
+  });
+
+  const dayMap = new Map();
+  classified.forEach((s, i) => {
+    const grid = grids[i];
+    const value = grid ? extractMokaCreditValue(grid) : null;
+    if (value == null) return;
+    const month = s.cls.resolvedMonth;
+    const key = `${month}-${s.cls.day}`;
+    if (!dayMap.has(key)) dayMap.set(key, { day: s.cls.day, month, shifts: {} });
+    dayMap.get(key).shifts[s.cls.shiftKey] = value;
+  });
+
+  const days = Array.from(dayMap.values())
+    .map((d) => ({
+      day: d.day,
+      month: d.month,
+      dateLabel: `${d.day} ${MOKA_MONTH_LABEL_ID[d.month] || ""}`.trim(),
+      shifts: d.shifts,
+      total: Object.values(d.shifts).reduce((sum, v) => sum + v, 0)
+    }))
+    .sort((a, b) => a.month - b.month || a.day - b.day);
+
+  const grandTotal = days.reduce((sum, d) => sum + d.total, 0);
+
+  return {
+    updatedAt: new Date().toISOString(),
+    days,
+    grandTotal,
+    shiftOrder: MOKA_SHIFT_ORDER,
+    shiftLabels: MOKA_SHIFT_LABELS,
+    spreadsheets
+  };
+}
+
+async function refreshMokaReportCache() {
+  const report = await computeMokaReport();
+  await ownDb
+    .collection(MOKA_CACHE_COLLECTION)
+    .doc(MOKA_CACHE_DOC_ID)
+    .set({ report, computedAtMs: Date.now() });
+  return report;
+}
+
 exports.getMokaSalesReport = onRequest(
   {
     region: "asia-southeast2",
@@ -759,77 +855,44 @@ exports.getMokaSalesReport = onRequest(
       return;
     }
 
+    const forceRefresh = req.query?.force === "1";
+
     try {
-      const spreadsheets = await getMokaSpreadsheetList();
-
-      // Satu spreadsheet yang gagal diakses (dihapus, izin share dicabut,
-      // dll) tidak boleh menjatuhkan seluruh laporan -- lewati & catat saja.
-      const perSpreadsheet = await Promise.all(
-        spreadsheets.map(async (sp) => {
-          try {
-            return await classifySpreadsheetSheets(sp);
-          } catch (err) {
-            logger.warn(`getMokaSalesReport: gagal baca spreadsheet "${sp.label}" (${sp.id}):`, err.message);
-            return [];
+      if (!forceRefresh) {
+        const cacheSnap = await ownDb.collection(MOKA_CACHE_COLLECTION).doc(MOKA_CACHE_DOC_ID).get();
+        if (cacheSnap.exists) {
+          const cached = cacheSnap.data();
+          const age = Date.now() - (cached.computedAtMs || 0);
+          if (age < MOKA_CACHE_MAX_AGE_MS) {
+            res.status(200).json(cached.report);
+            return;
           }
-        })
-      );
-      const classified = perSpreadsheet.flat();
-
-      if (!classified.length) {
-        res.status(200).json({
-          updatedAt: new Date().toISOString(),
-          days: [],
-          grandTotal: 0,
-          shiftLabels: MOKA_SHIFT_LABELS,
-          spreadsheets
-        });
-        return;
+          logger.warn(`getMokaSalesReport: cache basi (${Math.round(age / 60000)} menit) -- jadwal background mungkin gagal, ambil langsung.`);
+        }
       }
 
-      const grids = await mapWithConcurrency(classified, 6, async (s) => {
-        try {
-          return await fetchMokaSheetCsv(s.spreadsheetId, s.gid);
-        } catch (err) {
-          logger.warn(`getMokaSalesReport: gagal ambil sheet "${s.rawTitle}" (gid ${s.gid}):`, err.message);
-          return null;
-        }
-      });
-
-      const dayMap = new Map();
-      classified.forEach((s, i) => {
-        const grid = grids[i];
-        const value = grid ? extractMokaCreditValue(grid) : null;
-        if (value == null) return;
-        const month = s.cls.resolvedMonth;
-        const key = `${month}-${s.cls.day}`;
-        if (!dayMap.has(key)) dayMap.set(key, { day: s.cls.day, month, shifts: {} });
-        dayMap.get(key).shifts[s.cls.shiftKey] = value;
-      });
-
-      const days = Array.from(dayMap.values())
-        .map((d) => ({
-          day: d.day,
-          month: d.month,
-          dateLabel: `${d.day} ${MOKA_MONTH_LABEL_ID[d.month] || ""}`.trim(),
-          shifts: d.shifts,
-          total: Object.values(d.shifts).reduce((sum, v) => sum + v, 0)
-        }))
-        .sort((a, b) => a.month - b.month || a.day - b.day);
-
-      const grandTotal = days.reduce((sum, d) => sum + d.total, 0);
-
-      res.status(200).json({
-        updatedAt: new Date().toISOString(),
-        days,
-        grandTotal,
-        shiftOrder: MOKA_SHIFT_ORDER,
-        shiftLabels: MOKA_SHIFT_LABELS,
-        spreadsheets
-      });
+      const report = await refreshMokaReportCache();
+      res.status(200).json(report);
     } catch (err) {
       logger.error("getMokaSalesReport gagal:", err);
       res.status(502).json({ error: "Gagal memuat laporan Moka" });
+    }
+  }
+);
+
+// Menyegarkan cache di latar belakang tiap 5 menit, supaya pengguna yang
+// membuka halaman nyaris selalu dapat jawaban instan dari Firestore
+// (lihat getMokaSalesReport) alih-alih menunggu puluhan request ke Google
+// tiap kali. 5 menit dipilih sebagai titik tengah: cukup sering untuk
+// data penjualan toko (bukan sistem real-time), tidak membebani Google
+// dengan scraping tiap menit untuk data yang jarang berubah sesering itu.
+exports.refreshMokaReportCacheSchedule = onSchedule(
+  { schedule: "every 5 minutes", region: "asia-southeast2", timeoutSeconds: 180 },
+  async () => {
+    try {
+      await refreshMokaReportCache();
+    } catch (err) {
+      logger.error("refreshMokaReportCacheSchedule gagal:", err);
     }
   }
 );
@@ -888,6 +951,13 @@ exports.registerMokaSpreadsheet = onRequest(
       { label, addedAt: admin.firestore.FieldValue.serverTimestamp() },
       { merge: true }
     );
+    // Segarkan cache sekarang juga -- tanpa ini, laporan baru akan tetap
+    // menunjukkan versi lama sampai jadwal 5-menit berikutnya jalan.
+    try {
+      await refreshMokaReportCache();
+    } catch (err) {
+      logger.warn("registerMokaSpreadsheet: gagal menyegarkan cache setelah pendaftaran:", err.message);
+    }
     res.status(200).json({ ok: true, spreadsheets: await getMokaSpreadsheetList() });
   }
 );
@@ -917,6 +987,11 @@ exports.removeMokaSpreadsheet = onRequest(
     // Baseline di MOKA_SPREADSHEET_SEED bukan dokumen Firestore -- delete di
     // sini hanya pernah menghapus entri registry, tidak pernah baseline.
     await ownDb.collection(MOKA_REGISTRY_COLLECTION).doc(spreadsheetId).delete();
+    try {
+      await refreshMokaReportCache();
+    } catch (err) {
+      logger.warn("removeMokaSpreadsheet: gagal menyegarkan cache setelah penghapusan:", err.message);
+    }
     res.status(200).json({ ok: true, spreadsheets: await getMokaSpreadsheetList() });
   }
 );

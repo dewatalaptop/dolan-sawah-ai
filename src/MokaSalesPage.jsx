@@ -1,10 +1,14 @@
 // ============================================================
 // PENJUALAN MOKA -- baca laporan kasir harian (Google Sheets
 // "LAPORAN KASIR_DS.xlsx", satu sheet per hari x shift) lewat Cloud
-// Function `getMokaSalesReport`, lalu tampilkan rekap "P. Moka" per
-// hari/shift. Live fetch setiap halaman dibuka / tombol Refresh
-// ditekan -- tidak ada cache lokal, jadi selalu data terbaru dari
-// spreadsheet begitu kasir update.
+// Function `getMokaSalesReport`. Server-nya men-cache hasilnya di
+// Firestore dan menyegarkannya sendiri tiap 5 menit di latar belakang
+// (lihat refreshMokaReportCacheSchedule di functions/index.js) --
+// menggantikan desain lama yang men-scrape улang ~90+ sheet dari Google
+// pada SETIAP buka halaman (keluhan nyata: sangat lambat, 2026-10-02).
+// Buka halaman = baca cache (nyaris instan). Tombol "Refresh" di bawah
+// kirim ?force=1 untuk benar-benar menarik data terbaru kalau kasir baru
+// saja mengisi sesuatu dan tidak mau menunggu jadwal berikutnya.
 // ============================================================
 
 import { useCallback, useEffect, useMemo, useState } from "react";
@@ -46,13 +50,14 @@ export default function MokaSalesPage() {
   const [removingId, setRemovingId] = useState("");
   const [selectedMonth, setSelectedMonth] = useState(null);
 
-  const loadReport = useCallback(async () => {
+  const loadReport = useCallback(async (forceRefresh = false) => {
     setLoading(true);
     setError("");
     try {
       const token = await auth.currentUser?.getIdToken();
       if (!token) throw new Error("Belum login.");
-      const res = await fetch(REPORT_URL, { headers: { Authorization: `Bearer ${token}` } });
+      const url = forceRefresh ? `${REPORT_URL}?force=1` : REPORT_URL;
+      const res = await fetch(url, { headers: { Authorization: `Bearer ${token}` } });
       if (!res.ok) {
         const body = await res.json().catch(() => ({}));
         throw new Error(body.error || `Gagal memuat laporan (status ${res.status}).`);
@@ -186,7 +191,7 @@ export default function MokaSalesPage() {
           <h1>Penjualan Moka</h1>
           <p>Rekap harian "P. Moka" dari laporan kasir (Google Sheets) — dibaca langsung dari sumbernya.</p>
         </div>
-        <button className="secondary-button" onClick={loadReport} disabled={loading}>
+        <button className="secondary-button" onClick={() => loadReport(true)} disabled={loading} title="Tarik data terbaru langsung dari spreadsheet (lewati cache)">
           <Icon name="trend" size={15} /> {loading ? "Memuat..." : "Refresh"}
         </button>
       </div>
