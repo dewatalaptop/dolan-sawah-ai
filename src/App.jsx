@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
@@ -12,7 +12,12 @@ import {
 import { db, auth } from "./firebase";
 import "./App.css";
 import { Icon, StatCard, DataTable } from "./uiKit";
-import MokaSalesPage from "./MokaSalesPage";
+
+// Lazy: halaman terpisah yang tidak perlu ikut termuat sebelum menu "Moka"
+// benar-benar dibuka (lihat juga excelEngine/reportEngine di bawah -- sama-sama
+// bagian dari pembenahan ukuran bundle awal, lihat catatan besar soal performa
+// di dekat komponen App()).
+const MokaSalesPage = lazy(() => import("./MokaSalesPage"));
 
 import {
   COLLECTIONS,
@@ -43,13 +48,19 @@ import { saveRecipe, updateRecipe, deleteRecipe, calculateUsageFromSales } from 
 
 import { getPriceHistory, savePrice, getCurrentPrice, comparePrices } from "./priceEngine";
 
-import { processExcelFile } from "./excelEngine";
+// processExcelFile (excelEngine) dan buildReportWorkbook/downloadReportWorkbook/
+// buildFullBackupWorkbook (reportEngine) SENGAJA tidak diimpor statis di sini --
+// keduanya memuat library `xlsx` yang berat (SheetJS) padahal hanya dipakai saat
+// tombol Import Excel / Download Laporan / Download Backup benar-benar ditekan,
+// bukan saat halaman pertama kali dibuka. Diimpor dinamis (`await import(...)`)
+// tepat di titik pemakaiannya (lihat handleFileSelected/handleDownloadReport/
+// handleDownloadBackup) supaya `xlsx` jadi chunk terpisah yang dimuat sesuai
+// kebutuhan, bukan ikut membengkakkan bundle awal yang harus diunduh semua
+// orang di setiap buka aplikasi.
 
 import { parseWhatsAppExport } from "./whatsappImportEngine";
 
 import { findSimilarName, findPrefixCandidate } from "./similarityEngine";
-
-import { buildReportWorkbook, downloadReportWorkbook, buildFullBackupWorkbook } from "./reportEngine";
 
 import { analyzeIngredientPairs, buildAgentInitialMessages, runAgentLoop } from "./aiEngine";
 
@@ -4147,6 +4158,7 @@ export default function App() {
     if (!file) return;
     setImportBusy(true);
     try {
+      const { processExcelFile } = await import("./excelEngine");
       const result = await processExcelFile(file);
       setImportResult(result);
     } catch (error) {
@@ -6024,6 +6036,7 @@ export default function App() {
     }
     setReportBusy(true);
     try {
+      const { buildReportWorkbook, downloadReportWorkbook } = await import("./reportEngine");
       const workbook = buildReportWorkbook({
         rawData: filterDataByOutlet(rawData, reportOutlet),
         startDate: reportStart,
@@ -6048,6 +6061,7 @@ export default function App() {
   async function handleDownloadBackup() {
     setBackupBusy(true);
     try {
+      const { buildFullBackupWorkbook, downloadReportWorkbook } = await import("./reportEngine");
       const workbook = buildFullBackupWorkbook({
         rawData,
         priceHistory,
@@ -6196,7 +6210,19 @@ export default function App() {
       case "pembelian": return renderPembelian();
       case "barang-datang": return renderBarangDatang();
       case "penjualan": return renderPenjualan();
-      case "moka": return <MokaSalesPage />;
+      case "moka":
+        return (
+          <Suspense
+            fallback={
+              <div className="empty-state">
+                <div className="ds-spinner" style={{ marginBottom: 10 }} />
+                <div className="empty-title">Memuat halaman...</div>
+              </div>
+            }
+          >
+            <MokaSalesPage />
+          </Suspense>
+        );
       case "stok": return renderStok();
       case "penyesuaian": return renderPenyesuaian();
       case "kebutuhan": return renderKebutuhan();
@@ -6505,7 +6531,7 @@ export default function App() {
         )}
 
         {activeMenu === "chat" ? (
-          <section className="chat-page">
+          <section className="chat-page view-transition">
             <div className="chat-context-bar">
               <span>Outlet untuk entri data baru:</span>
               <div className="outlet-switch small">
@@ -6763,7 +6789,7 @@ export default function App() {
             <div className="input-hint">Enter untuk mengirim • Shift + Enter untuk baris baru</div>
           </section>
         ) : (
-          <div className="content-area">{renderContent()}</div>
+          <div className="content-area view-transition" key={activeMenu}>{renderContent()}</div>
         )}
       </main>
 

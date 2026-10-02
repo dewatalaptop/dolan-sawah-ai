@@ -6,9 +6,19 @@
 // publik. Client cuma bawa apiKey dummy "proxy", diabaikan servernya.
 // Pindah dari z.ai (GLM) karena lambat/sering 429 di free tier, dan
 // karena z.ai mengharuskan key asli ditaruh client-side.
+//
+// Request/response dibuat lewat fetch polos (bukan paket npm `openai`) --
+// yang dibutuhkan dari SDK itu cuma bentuk body/response OpenAI-compatible
+// standar (`{model, messages, tools, tool_choice}` -> `{choices:[{message}]}`),
+// dan `chatCompletions` di server memperlakukan SEMUA path yang sama persis
+// (lihat functions/index.js), jadi mengganti transport-nya tidak mengubah
+// perilaku sama sekali. Paket `openai` itu sendiri berat (ditulis untuk
+// Node, penuh fitur yang tidak pernah dipakai di sini seperti streaming/
+// upload file/dll) dan jadi penyumbang terbesar ukuran bundle awal --
+// dihapus dari client supaya aplikasi lebih cepat dimuat, tanpa mengurangi
+// satu fitur AI pun.
 // ============================================================
 
-import OpenAI from "openai";
 import { toLocalISODate } from "./dateUtils";
 
 const MODEL_NAME = import.meta.env.VITE_GEMINI_MODEL || "gemini-3.6-flash";
@@ -16,7 +26,20 @@ const BASE_URL =
   import.meta.env.VITE_AI_PROXY_URL ||
   "https://asia-southeast2-dolan-sawah-ai-2026.cloudfunctions.net/chatCompletions/";
 
-const client = new OpenAI({ apiKey: "proxy", baseURL: BASE_URL, dangerouslyAllowBrowser: true });
+async function createChatCompletion(payload) {
+  const res = await fetch(BASE_URL, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload)
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) {
+    throw new Error(data?.error?.message || data?.error || `AI proxy gagal (status ${res.status}).`);
+  }
+  return data;
+}
+
+const client = { chat: { completions: { create: createChatCompletion } } };
 
 const SYSTEM_PROMPT =
   "Anda adalah asisten AI operasional untuk Dolan Sawah Group, yang menaungi 3 outlet " +
