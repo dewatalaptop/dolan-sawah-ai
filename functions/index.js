@@ -690,6 +690,24 @@ async function fetchMokaSheetMeta(spreadsheetId) {
   while ((m = re.exec(html)) !== null) {
     if (!seen.has(m[1])) seen.set(m[1], m[2]);
   }
+  // Spreadsheet NYATA selalu punya minimal 1 sheet -- nol match berarti
+  // respons ini BUKAN bootstrap editor asli. Ditemukan nyata 2026-10-03
+  // (spreadsheet Oktober dolan-sawah-ai): Google kadang mengembalikan status
+  // 200 tapi isinya cuma shell loading generik (judul halaman "Memuat
+  // Google Spreadsheet", body "File tidak dapat dibuka. Coba muat ulang
+  // halaman.") -- reproducible berkali-kali berturut-turut, BUKAN prompt
+  // sign-in/minta akses (jadi kemungkinan besar bukan soal izin share, lebih
+  // ke gagal render sementara di sisi Google untuk fetch anonim). Lempar
+  // error eksplisit di sini supaya computeMokaReport bisa menandai
+  // spreadsheet ini "gagal" di respons API alih-alih diam-diam hilang dari
+  // laporan tanpa penjelasan apa pun.
+  if (!seen.size) {
+    throw new Error(
+      "Spreadsheet gagal dimuat dari Google (responsnya bukan halaman editor yang sebenarnya -- " +
+        "kemungkinan gagal render sementara di sisi Google untuk akses anonim, bukan masalah izin " +
+        "share; coba lagi nanti atau buka filenya langsung untuk cek)"
+    );
+  }
   return Array.from(seen, ([gid, title]) => ({ gid, title }));
 }
 
@@ -769,22 +787,33 @@ async function verifyFirebaseAuth(req) {
 async function computeMokaReport() {
   const spreadsheets = await getMokaSpreadsheetList();
 
-  // Satu spreadsheet yang gagal diakses (dihapus, izin share dicabut, dll)
-  // tidak boleh menjatuhkan seluruh laporan -- lewati & catat saja.
+  // Satu spreadsheet yang gagal diakses (dihapus, izin share dicabut, gagal
+  // render sementara di sisi Google, dll) tidak boleh menjatuhkan seluruh
+  // laporan -- tapi juga TIDAK BOLEH diam-diam hilang tanpa jejak (bug nyata
+  // ditemukan 2026-10-03: bulan Oktober gagal dimuat dan UI cuma menunjukkan
+  // September seolah Oktober tidak pernah ada, tanpa ada tanda apa pun soal
+  // kenapa). Errornya dicatat per-spreadsheet dan diikutkan ke respons API.
+  const spreadsheetErrors = new Map();
   const perSpreadsheet = await Promise.all(
     spreadsheets.map(async (sp) => {
       try {
         return await classifySpreadsheetSheets(sp);
       } catch (err) {
         logger.warn(`computeMokaReport: gagal baca spreadsheet "${sp.label}" (${sp.id}):`, err.message);
+        spreadsheetErrors.set(sp.id, err.message);
         return [];
       }
     })
   );
   const classified = perSpreadsheet.flat();
+  const spreadsheetsWithStatus = spreadsheets.map((sp) => ({
+    ...sp,
+    ok: !spreadsheetErrors.has(sp.id),
+    error: spreadsheetErrors.get(sp.id) || null
+  }));
 
   if (!classified.length) {
-    return { updatedAt: new Date().toISOString(), days: [], grandTotal: 0, shiftLabels: MOKA_SHIFT_LABELS, spreadsheets };
+    return { updatedAt: new Date().toISOString(), days: [], grandTotal: 0, shiftLabels: MOKA_SHIFT_LABELS, spreadsheets: spreadsheetsWithStatus };
   }
 
   // Konkurensi 10 (naik dari 6) -- batas aman yang sudah dicoba langsung
@@ -829,7 +858,7 @@ async function computeMokaReport() {
     grandTotal,
     shiftOrder: MOKA_SHIFT_ORDER,
     shiftLabels: MOKA_SHIFT_LABELS,
-    spreadsheets
+    spreadsheets: spreadsheetsWithStatus
   };
 }
 

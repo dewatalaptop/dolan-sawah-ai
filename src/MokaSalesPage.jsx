@@ -331,39 +331,61 @@ export default function MokaSalesPage() {
               key={sp.id}
               style={{
                 display: "flex",
-                alignItems: "center",
-                justifyContent: "space-between",
-                gap: 10,
+                flexDirection: "column",
+                gap: 6,
                 padding: "8px 12px",
                 borderRadius: 8,
-                border: "1px solid var(--border)",
+                border: `1px solid ${sp.ok === false ? "var(--red-100)" : "var(--border)"}`,
+                background: sp.ok === false ? "var(--red-050, #fdf2f1)" : "transparent",
                 fontSize: 13
               }}
             >
-              <div style={{ display: "flex", alignItems: "center", gap: 8, minWidth: 0 }}>
-                <span style={{ fontWeight: 650, color: "var(--ink)" }}>{sp.label}</span>
-                <span
-                  style={{
-                    fontSize: 10.5,
-                    fontWeight: 650,
-                    padding: "2px 7px",
-                    borderRadius: 999,
-                    background: sp.source === "seed" ? "var(--border-soft)" : "var(--green-050)",
-                    color: sp.source === "seed" ? "var(--ink-faint)" : "var(--green-700, #1f7a4c)"
-                  }}
-                >
-                  {sp.source === "seed" ? "bawaan" : "terdaftar"}
-                </span>
+              <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 10 }}>
+                <div style={{ display: "flex", alignItems: "center", gap: 8, minWidth: 0 }}>
+                  <span style={{ fontWeight: 650, color: "var(--ink)" }}>{sp.label}</span>
+                  <span
+                    style={{
+                      fontSize: 10.5,
+                      fontWeight: 650,
+                      padding: "2px 7px",
+                      borderRadius: 999,
+                      background: sp.source === "seed" ? "var(--border-soft)" : "var(--green-050)",
+                      color: sp.source === "seed" ? "var(--ink-faint)" : "var(--green-700, #1f7a4c)"
+                    }}
+                  >
+                    {sp.source === "seed" ? "bawaan" : "terdaftar"}
+                  </span>
+                  {sp.ok === false && (
+                    <span
+                      style={{
+                        fontSize: 10.5,
+                        fontWeight: 650,
+                        padding: "2px 7px",
+                        borderRadius: 999,
+                        background: "var(--red-100)",
+                        color: "var(--red-600, #c0392b)"
+                      }}
+                    >
+                      ⚠ Gagal dimuat
+                    </span>
+                  )}
+                </div>
+                {sp.source !== "seed" && (
+                  <button
+                    className="secondary-button"
+                    onClick={() => handleRemove(sp.id)}
+                    disabled={removingId === sp.id}
+                    style={{ padding: "4px 10px", fontSize: 12 }}
+                  >
+                    {removingId === sp.id ? "Menghapus..." : "Hapus"}
+                  </button>
+                )}
               </div>
-              {sp.source !== "seed" && (
-                <button
-                  className="secondary-button"
-                  onClick={() => handleRemove(sp.id)}
-                  disabled={removingId === sp.id}
-                  style={{ padding: "4px 10px", fontSize: 12 }}
-                >
-                  {removingId === sp.id ? "Menghapus..." : "Hapus"}
-                </button>
+              {sp.ok === false && (
+                <div style={{ fontSize: 12, color: "var(--red-600, #c0392b)" }}>
+                  {sp.error || "Gagal diakses."} Data bulan ini tidak ikut muncul di rekap di atas sampai ini teratasi — coba
+                  tekan Refresh, atau buka file-nya langsung di Google Sheets untuk memastikan masih bisa dibuka.
+                </div>
               )}
             </div>
           ))}
