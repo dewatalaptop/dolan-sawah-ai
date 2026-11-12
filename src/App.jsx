@@ -18,6 +18,7 @@ import { Icon, StatCard, DataTable } from "./uiKit";
 // bagian dari pembenahan ukuran bundle awal, lihat catatan besar soal performa
 // di dekat komponen App()).
 const MokaSalesPage = lazy(() => import("./MokaSalesPage"));
+const LossPage = lazy(() => import("./LossPage"));
 
 import {
   COLLECTIONS,
@@ -162,6 +163,7 @@ const MENU = [
   { section: "ANALISIS" },
   { id: "kebutuhan", label: "Kebutuhan Bahan", icon: "leaf" },
   { id: "variance", label: "Variance & Waste", icon: "trend" },
+  { id: "beli-pakai", label: "Beli vs Pakai", icon: "box" },
   { id: "harga", label: "Harga Bahan", icon: "tag" },
   { id: "resep", label: "Resep", icon: "book" },
   { id: "import", label: "Import Excel", icon: "upload" },
@@ -6221,6 +6223,19 @@ export default function App() {
             }
           >
             <MokaSalesPage />
+          </Suspense>
+        );
+      case "beli-pakai":
+        return (
+          <Suspense
+            fallback={
+              <div className="empty-state">
+                <div className="ds-spinner" style={{ marginBottom: 10 }} />
+                <div className="empty-title">Memuat halaman...</div>
+              </div>
+            }
+          >
+            <LossPage />
           </Suspense>
         );
       case "stok": return renderStok();

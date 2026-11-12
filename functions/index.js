@@ -1024,3 +1024,15 @@ exports.removeMokaSpreadsheet = onRequest(
     res.status(200).json({ ok: true, spreadsheets: await getMokaSpreadsheetList() });
   }
 );
+
+// ============================================================
+// Dolan Order -> receiving (per outlet) + cermin katalog, tiap 15 menit. Logika di dolanOrderSync.js.
+// ============================================================
+const { runSync: runDolanOrderSync } = require("./dolanOrderSync");
+exports.syncDolanOrder = onSchedule(
+  { schedule: "every 15 minutes", region: "asia-southeast2", timeoutSeconds: 180 },
+  async () => {
+    const s = await runDolanOrderSync(ownDb);
+    logger.info("syncDolanOrder", s);
+  }
+);
